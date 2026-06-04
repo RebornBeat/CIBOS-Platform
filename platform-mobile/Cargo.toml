@@ -1,0 +1,15 @@
+[package]
+name = "platform-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS mobile platform — touch gesture recognition over the shared input model"
+
+[lib]
+name = "platform_mobile"
+path = "src/lib.rs"
+
+[dependencies]
+cibos-input = { workspace = true }
+platform-gui = { workspace = true }

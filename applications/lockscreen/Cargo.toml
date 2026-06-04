@@ -1,0 +1,21 @@
+[package]
+name = "lockscreen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lockscreen — a mobile PIN lock screen gating the device behind authentication"
+
+[lib]
+name = "lockscreen"
+path = "src/lib.rs"
+
+[dependencies]
+accounts = { workspace = true }
+platform-mobile = { workspace = true }
+platform-gui = { workspace = true }
+cibos-input = { workspace = true }
+shared = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+shared = { workspace = true, features = ["std", "pqc-sphincs"] }

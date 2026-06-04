@@ -1,0 +1,16 @@
+[package]
+name = "kvstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS kvstore application"
+
+[lib]
+name = "kvstore"
+path = "src/lib.rs"
+
+[dependencies]
+shared = { workspace = true, features = ["std"] }
+cibos-sdk = { workspace = true }
+platform-cli = { workspace = true }

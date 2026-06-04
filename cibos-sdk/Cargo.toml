@@ -1,0 +1,36 @@
+[package]
+name = "cibos-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS SDK — the std-side application API surface and host development runtime"
+
+[lib]
+name = "cibos_sdk"
+path = "src/lib.rs"
+
+# Application-facing scheduling features. These gate the SDK surface
+# (`Lane::create_with_weight`, `Lane::update_weight`); the kernel honors the
+# resulting weights at runtime only under the Compute profile, matching the
+# documented "Compute profile only" rule. `dynamic-weights` requires
+# `per-lane-weights`.
+[features]
+per-lane-weights = []
+dynamic-weights = ["per-lane-weights"]
+
+# Host-transport memory accounting. When enabled, the SDK installs a counting
+# global allocator (wrapping the system allocator) whose live and peak byte
+# totals back `container::memory_usage`. Off by default: it imposes a process-wide
+# global allocator, so it is opt-in and a binary enabling it must not define its
+# own `#[global_allocator]`. In the production transport the kernel tracks this
+# natively; this feature is the host stand-in.
+host-memory-tracking = []
+
+# The SDK is the std boundary: it and everything above it link the standard
+# library. It does NOT use tokio — concurrency is the CIBOS HIP-native runtime.
+[dependencies]
+shared = { workspace = true, features = ["std"] }
+cibos-async-runtime = { workspace = true, features = ["std"] }
+cibos-kernel = { workspace = true, features = ["std"] }
+cibos-macros = { workspace = true }

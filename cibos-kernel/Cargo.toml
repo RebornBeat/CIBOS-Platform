@@ -1,0 +1,60 @@
+[package]
+name = "cibos-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS kernel — HIP scheduler, isolation boundaries, channels, and KernelInterface"
+
+[lib]
+name = "cibos_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+shared = { workspace = true }
+cibos-async-runtime = { workspace = true }
+
+[features]
+# no_std + alloc by default; the kernel provides its own allocator in the
+# binary phase. `std` is for the host test suite, which drives the real
+# scheduler against the real runtime executor.
+default = []
+std = ["shared/std", "cibos-async-runtime/std"]
+
+# ── Operational profile bundles (ADR-007) ──────────────────────────────────
+# Each bundle selects the kernel-side feature set for one operational profile,
+# so the binary contains only that profile's mechanisms. The build wrapper pairs
+# each with the matching CIBIOS firmware profile and the platform-crate features
+# (gui/network/sensor/… live in the platform binaries, which the kernel image
+# does not pull in). build.rs permits at most one bundle and rejects illegal
+# flag combinations.
+profile-maximum-isolation = ["rtro", "cryptographic-ipc", "audit-logging"]
+profile-balanced          = ["anti-starvation", "cryptographic-ipc"]
+profile-performance       = ["anti-starvation", "full-fairness", "audit-logging"]
+profile-compute           = ["lightweight-handshake", "per-lane-weights"]
+
+# ── Scheduling / selector behavior (kernel-owned) ───────────────────────────
+# These gate selector/scheduler behavior. Each is implemented behind its flag as
+# that behavior is built; declaring them now fixes the vocabulary the bundles
+# and build.rs validation reference. "requires" relationships are encoded as
+# Cargo feature dependencies (enabling the dependent pulls its prerequisite);
+# "conflict" relationships are enforced in build.rs.
+anti-starvation = []                                    # Ready-Pool wait-time fairness backstop
+full-fairness = []                                      # proportional execution-time fairness (conflicts per-lane-weights)
+per-lane-weights = []                                   # application-assigned lane weights
+dynamic-weights = ["per-lane-weights"]                  # runtime weight updates (requires per-lane-weights)
+weight-aging = []                                       # gradual priority increase by age
+signal-coalescence = []                                 # batch resource signals
+signal-coalescence-threshold = ["signal-coalescence"]   # backstop deadline (requires signal-coalescence)
+class-resource-pools = []                               # per-class memory pools
+class-core-affinity = []                                # per-class execution-context routing
+deadline-scheduling = []                                # optional ReadyEvent deadline (advanced)
+
+# ── Security features (kernel-owned) ────────────────────────────────────────
+# IPC mode is cryptographic XOR lightweight (build.rs enforces). The post-quantum
+# backends are wired when the no_std verifier lands (see SECURITY-NOTES.md);
+# these flags select the channel security path.
+rtro = []                  # real-time resource obfuscation (conflicts lightweight-handshake)
+cryptographic-ipc = []     # per-message signed/verified IPC (conflicts lightweight-handshake)
+lightweight-handshake = [] # once-at-creation channel identity
+audit-logging = []         # audit log subsystem

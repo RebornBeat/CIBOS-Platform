@@ -1,0 +1,15 @@
+[package]
+name = "vane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Vane — the CIBOS content-serving daemon"
+
+[lib]
+name = "vane"
+path = "src/lib.rs"
+
+[dependencies]
+cibos-sdk = { workspace = true }
+web-protocol = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS storage — Live (RAM-only, no-trace) and Persistent (partition-backed) volumes"
+
+[lib]
+name = "storage"
+path = "src/lib.rs"
+
+[dependencies]
+cibos-sdk = { workspace = true }

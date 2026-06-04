@@ -1,0 +1,67 @@
+[package]
+name = "cibios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBIOS — Complete Isolation Basic Input/Output System (firmware)"
+
+# This crate is both a library (the host-testable firmware logic) and a binary
+# (the bare-metal firmware image). Tests and logic live in the lib; the binary
+# is a thin `no_main` entry that only links meaningfully on bare-metal targets.
+[lib]
+name = "cibios"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cibios"
+path = "src/main.rs"
+
+[dependencies]
+# Foundation crate. No default features: firmware is no_std and pulls in crypto
+# only when the handoff-cryptographic feature selects it.
+shared = { workspace = true }
+
+[features]
+# Default firmware build: no std, no signature verification compiled in. This
+# corresponds to the Lightweight firmware profile (physical-trust handoff).
+default = []
+
+# Host-side testing support. Enables std in shared so the logic library can be
+# unit-tested on the development host. Never enabled for a real firmware image.
+std = ["shared/std"]
+
+# --- Firmware profile: handoff mode (at most one; see build.rs) ---
+
+# Standard firmware: SPHINCS+ verification of the CIBOS image before handoff.
+# NOTE: the pqcrypto backend is host-only (it requires libc), so this feature is
+# exercised in host tests and tooling, not yet in the bare firmware. A bare-metal
+# signed boot needs a no_std PQC verifier; see SECURITY-NOTES.md.
+handoff-cryptographic = ["shared/pqc-sphincs"]
+
+# Lightweight firmware: physical-trust handoff, no signature verification. This
+# is the explicit selector for the Lightweight profile; it carries no code of its
+# own (Lightweight is simply the absence of the verifier) but makes the build
+# intent explicit and is checked against `handoff-cryptographic` in build.rs so
+# the two handoff modes can never both be compiled in.
+handoff-lightweight = []
+
+# --- SMT policy (orthogonal to handoff mode) ---
+
+# Force simultaneous multithreading on at boot. SMT is otherwise off under
+# Standard firmware and on under Lightweight; this override exists because the
+# Performance operational profile runs on Standard firmware yet wants SMT, and
+# firmware configures SMT before the kernel image is loaded, so the intent must
+# be known at firmware build time.
+smt-enabled = []
+
+# --- Firmware profile bundles (paired to operational profiles by the builder) ---
+
+# Standard firmware (pairs with Maximum Isolation, Balanced, Performance).
+profile-standard = ["handoff-cryptographic"]
+# Lightweight firmware (pairs with Compute).
+profile-lightweight = ["handoff-lightweight"]
+
+# Convenience for host tests that exercise the cryptographic path: std + the
+# signer side of SPHINCS+ (so tests can produce a signed image to verify).
+test-crypto = ["std", "handoff-cryptographic"]

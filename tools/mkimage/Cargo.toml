@@ -1,0 +1,15 @@
+[package]
+name = "mkimage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host tool that wraps a flat kernel binary into a CIBOS image (.cimg) and verifies it"
+
+[[bin]]
+name = "mkimage"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true, features = ["std", "pqc-sphincs"] }
+cibios = { workspace = true, features = ["std", "handoff-cryptographic"] }

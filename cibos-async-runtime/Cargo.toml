@@ -1,0 +1,21 @@
+[package]
+name = "cibos-async-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS HIP-native async runtime — Catch-and-Release executor over KernelInterface"
+
+[lib]
+name = "cibos_async_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+shared = { workspace = true }
+
+[features]
+# no_std + alloc by default. The runtime needs an allocator (it boxes futures)
+# but never std; the kernel provides the global allocator. `std` is for the
+# host test suite only.
+default = []
+std = ["shared/std"]

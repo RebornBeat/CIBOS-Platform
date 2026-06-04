@@ -1,0 +1,19 @@
+[package]
+name = "notepad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Notepad — a keyboard-driven GUI text field for the CIBOS GUI platform"
+
+[lib]
+name = "notepad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gui-demo"
+path = "src/gui_demo.rs"
+
+[dependencies]
+platform-gui = { workspace = true }
+cibos-input = { workspace = true }

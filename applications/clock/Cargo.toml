@@ -1,0 +1,11 @@
+[package]
+name = "clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Clock — a stopwatch/lap timer over the monotonic clock"
+
+[lib]
+name = "clock"
+path = "src/lib.rs"

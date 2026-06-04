@@ -1,0 +1,15 @@
+[package]
+name = "platform-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS GUI platform — virtual cell-grid display and event-driven app runner"
+
+[lib]
+name = "platform_gui"
+path = "src/lib.rs"
+
+[dependencies]
+cibos-input = { workspace = true }
+cibos-sdk = { workspace = true }

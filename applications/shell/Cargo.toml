@@ -1,0 +1,25 @@
+[package]
+name = "shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS shell — an interactive command interpreter on the CLI platform"
+
+[lib]
+name = "shell"
+path = "src/lib.rs"
+
+# A runnable system shell composing the shell library with bundled utilities
+# (the package manager), driven by the host console.
+[[bin]]
+name = "cibos-shell"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true, features = ["std"] }
+cibos-sdk = { workspace = true }
+platform-cli = { workspace = true }
+package-manager = { workspace = true }
+kvstore = { workspace = true }
+editor = { workspace = true }

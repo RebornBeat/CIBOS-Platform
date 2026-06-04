@@ -1,0 +1,16 @@
+[package]
+name = "calc-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS calculator service — request/reply IPC between isolated tasks over channels"
+
+[lib]
+name = "calc_service"
+path = "src/lib.rs"
+
+[dependencies]
+shared = { workspace = true, features = ["std"] }
+cibos-sdk = { workspace = true }
+platform-cli = { workspace = true }

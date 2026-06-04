@@ -1,0 +1,50 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared no_std types, protocols, and crypto traits for the CIBIOS/CIBOS/HIP system"
+
+[lib]
+# Pure library, usable from both no_std (firmware/kernel) and std (sdk/apps) crates.
+path = "src/lib.rs"
+
+[dependencies]
+bitflags = { workspace = true }
+heapless = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+
+# --- Optional cryptographic backends, feature-gated ---
+# The crypto layer in this crate is defined as TRAITS. Concrete algorithm
+# implementations are only compiled when a feature requests them. This lets
+# the no-crypto / classical / post-quantum deployment paths described in the
+# Convergent Architecture white paper all coexist behind one type system.
+pqcrypto-sphincsplus = { version = "0.7", default-features = false, optional = true }
+pqcrypto-mlkem = { version = "0.1", default-features = false, optional = true }
+pqcrypto-mldsa = { version = "0.1", default-features = false, optional = true }
+pqcrypto-traits = { version = "0.3", default-features = false, optional = true }
+
+[features]
+# Default is the pure, dependency-light core: types, protocols, crypto TRAITS,
+# and the software hashing already pulled in via sha2/sha3. No PQC backends,
+# no std. Everything compiles on a bare no_std target by default.
+default = []
+
+# Pull in the std library. Enabled by std-world consumers (cibos-sdk, platforms,
+# applications). Leaving this OFF is what keeps firmware/kernel builds no_std.
+std = []
+
+# Post-quantum signature backend for boot/firmware verification (root of trust).
+# SPHINCS+ is hash-based — the "old math" choice for the trust anchor.
+pqc-sphincs = ["dep:pqcrypto-sphincsplus", "dep:pqcrypto-traits"]
+
+# Post-quantum key encapsulation for channel/IPC confidentiality (ML-KEM / Kyber).
+pqc-mlkem = ["dep:pqcrypto-mlkem", "dep:pqcrypto-traits"]
+
+# Post-quantum signatures for channel/IPC authenticity (ML-DSA / Dilithium).
+pqc-mldsa = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+
+# Convenience grouping: full post-quantum suite.
+pqc-full = ["pqc-sphincs", "pqc-mlkem", "pqc-mldsa"]

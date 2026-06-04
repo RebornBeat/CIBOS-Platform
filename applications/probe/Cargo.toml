@@ -1,0 +1,16 @@
+[package]
+name = "probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS probe — Gate scanner and Warden firewall tool over the Lattice"
+
+[lib]
+name = "probe"
+path = "src/lib.rs"
+
+[dependencies]
+shared = { workspace = true, features = ["std"] }
+cibos-sdk = { workspace = true }
+platform-cli = { workspace = true }

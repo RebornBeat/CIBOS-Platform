@@ -1,0 +1,39 @@
+[package]
+name = "kernel-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS bootable kernel image — no_std/no_main entry, allocator, and boot from the CIBIOS handoff"
+
+# The output ELF is named `cibos-kernel` (the kernel image). The package is
+# `kernel-image` so it does not clash with the `cibos-kernel` library it links.
+[[bin]]
+name = "cibos-kernel"
+path = "src/main.rs"
+
+[dependencies]
+# All no_std: the kernel image links no std-world crate.
+shared = { workspace = true, default-features = false }
+cibos-async-runtime = { workspace = true }
+cibos-kernel = { workspace = true }
+linked_list_allocator = { version = "0.10", default-features = false }
+
+[features]
+# Default build targets REAL HARDWARE: the image expects CIBIOS to pass a real
+# handoff pointer in the first-argument register (the bare-metal boot pair).
+# This is the production posture — bare metal first.
+#
+# `self-boot` is an explicit opt-in for QEMU validation (`-kernel`): it
+# synthesizes a handoff instead of reading one from CIBIOS, so the kernel can be
+# booted standalone without the firmware. Build with `--features self-boot`.
+default = []
+self-boot = []
+
+# Operational profile bundles: forward to the kernel library's bundle so the
+# bootable image is built as exactly one profile (ADR-007). The build wrapper
+# pairs each with the matching CIBIOS firmware build. Orthogonal to `self-boot`.
+profile-maximum-isolation = ["cibos-kernel/profile-maximum-isolation"]
+profile-balanced          = ["cibos-kernel/profile-balanced"]
+profile-performance       = ["cibos-kernel/profile-performance"]
+profile-compute           = ["cibos-kernel/profile-compute"]

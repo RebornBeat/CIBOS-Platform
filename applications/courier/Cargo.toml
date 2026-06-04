@@ -1,0 +1,15 @@
+[package]
+name = "courier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Courier — CIBOS messaging over the Lattice"
+
+[lib]
+name = "courier"
+path = "src/lib.rs"
+
+[dependencies]
+cibos-sdk = { workspace = true }
+platform-cli = { workspace = true }

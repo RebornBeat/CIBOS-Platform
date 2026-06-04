@@ -1,0 +1,11 @@
+[package]
+name = "web-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hail — the CIBOS request/response protocol over Lattice Links"
+
+[lib]
+name = "web_protocol"
+path = "src/lib.rs"

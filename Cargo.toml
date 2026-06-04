@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+
+# Members are added as each crate is created so the workspace resolves
+# cleanly at every step of development. The full target set is:
+#   shared, cibios, cibos-async-runtime, cibos-kernel, cibos-sdk,
+#   platform-cli, platform-gui, platform-mobile, applications/*
+members = [
+    "shared",
+    "cibios",
+    "cibos-async-runtime",
+    "cibos-kernel",
+    "cibos-sdk",
+    "cibos-macros",
+    "platform-cli",
+    "cibos-input",
+    "platform-gui",
+    "platform-mobile",
+    "platform-server",
+    "applications/package-manager",
+    "applications/shell",
+    "applications/kvstore",
+    "applications/editor",
+    "applications/calc-service",
+    "applications/probe",
+    "applications/lens",
+    "applications/notepad",
+    "applications/trove",
+    "applications/courier",
+    "applications/calendar",
+    "applications/clock",
+    "applications/contacts",
+    "applications/postbox",
+    "accounts",
+    "login",
+    "storage",
+    "applications/lockscreen",
+    "applications/vane",
+    "applications/web-protocol",
+    "kernel-image",
+    "tools/mkimage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["RebornBeat"]
+
+[workspace.dependencies]
+# --- Internal crates (path-resolved across the workspace) ---
+shared = { path = "shared", default-features = false }
+cibios = { path = "cibios" }
+cibos-async-runtime = { path = "cibos-async-runtime" }
+cibos-kernel = { path = "cibos-kernel" }
+cibos-sdk = { path = "cibos-sdk" }
+cibos-macros = { path = "cibos-macros" }
+platform-cli = { path = "platform-cli" }
+cibos-input = { path = "cibos-input" }
+platform-gui = { path = "platform-gui" }
+platform-mobile = { path = "platform-mobile" }
+platform-server = { path = "platform-server" }
+package-manager = { path = "applications/package-manager" }
+kvstore = { path = "applications/kvstore" }
+editor = { path = "applications/editor" }
+probe = { path = "applications/probe" }
+accounts = { path = "accounts" }
+login = { path = "login" }
+web-protocol = { path = "applications/web-protocol" }
+vane = { path = "applications/vane" }
+lens = { path = "applications/lens" }
+
+# --- no_std-compatible foundational dependencies ---
+# Usable below the std boundary (shared, cibios, async-runtime, kernel).
+bitflags = { version = "2.6", default-features = false }
+heapless = { version = "0.8", default-features = false }
+
+# Hashing (no_std). Used for handoff image hashing and integrity checks.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+sha3 = { version = "0.10", default-features = false }
+
+# --- std-world dependencies (cibos-sdk and above only) ---
+# NOTE: concurrency is provided by the HIP-native `cibos-async-runtime` crate,
+# NOT tokio. Tokio is deliberately absent (global task queues use locks, which
+# the HIP model forbids). Do not add it back.
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
