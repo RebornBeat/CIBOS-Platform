@@ -169,11 +169,15 @@ pub fn locate_image() -> Option<&'static [u8]> {
 }
 
 pub unsafe fn jump_to_kernel(entry: u64, handoff_ptr: u64) -> ! {
+    // The kernel's `_start` expects the handoff pointer in x0 (AAPCS64 arg0).
+    // Pin it to x0 explicitly and let the branch target use any other register,
+    // so the allocator cannot alias `{entry}` onto x0 and have the handoff load
+    // clobber the branch target (see the x86_64 note for the failure this
+    // prevents).
     asm!(
-        "mov x0, {handoff}",
         "br {entry}",
-        handoff = in(reg) handoff_ptr,
         entry = in(reg) entry,
+        in("x0") handoff_ptr,
         options(noreturn),
     );
 }

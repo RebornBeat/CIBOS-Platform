@@ -14,7 +14,10 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
-/// Initialize COM1 to 38400 8N1.
+/// Initialize COM1 to 38400 8N1, then clear and home the VGA text console.
+/// Named `init_serial` for the stable arch interface; on x86 it brings up both
+/// the serial line and the on-screen VGA text console so a booted kernel is
+/// visible on a monitor as well as a serial capture.
 pub fn init_serial() {
     unsafe {
         outb(COM1 + 1, 0x00);
@@ -25,14 +28,18 @@ pub fn init_serial() {
         outb(COM1 + 2, 0xC7);
         outb(COM1 + 4, 0x0B);
     }
+    super::vga::init();
 }
 
-/// Write one byte to COM1, waiting for the transmit holding register to empty.
+/// Write one byte to both the serial console (COM1) and the VGA text console.
+/// Serial first (it is the primary capture target during bring-up), then the
+/// on-screen console.
 pub fn putc(b: u8) {
     unsafe {
         while inb(COM1 + 5) & 0x20 == 0 {}
         outb(COM1, b);
     }
+    super::vga::putc(b);
 }
 
 /// Halt the processor permanently.

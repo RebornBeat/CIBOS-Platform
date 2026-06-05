@@ -305,6 +305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mkbootimage"
+version = "0.1.0"
+dependencies = [
+ "shared",
+]
+
+[[package]]
 name = "mkimage"
 version = "0.1.0"
 dependencies = [

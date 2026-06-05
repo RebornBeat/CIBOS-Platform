@@ -15,10 +15,21 @@ pub mod arch;
 
 // Pull in the architecture boot entry. Each defines `_start`, sets up the
 // stack, clears BSS, and calls `cibios_entry`.
-#[cfg(target_arch = "x86_64")]
+//
+// On x86/x86_64 the entry differs by boot source: the multiboot entry starts in
+// 32-bit protected mode and performs the long-mode transition itself (QEMU
+// `-kernel`); the bootloader entry is reached already in the final CPU mode by
+// the from-scratch CIBOS bootloader, which leaves the `BootHandoff` pointer in
+// the first-argument register. ARM/RISC-V always boot via the platform device
+// tree, so their entry does not vary.
+#[cfg(all(target_arch = "x86_64", feature = "firmware-multiboot"))]
 global_asm!(include_str!("boot/x86_64.s"));
-#[cfg(target_arch = "x86")]
+#[cfg(all(target_arch = "x86_64", feature = "firmware-bootloader"))]
+global_asm!(include_str!("boot/x86_64_bootloader.s"));
+#[cfg(all(target_arch = "x86", feature = "firmware-multiboot"))]
 global_asm!(include_str!("boot/x86.s"));
+#[cfg(all(target_arch = "x86", feature = "firmware-bootloader"))]
+global_asm!(include_str!("boot/x86_bootloader.s"));
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot/aarch64.s"));
 #[cfg(target_arch = "riscv64")]

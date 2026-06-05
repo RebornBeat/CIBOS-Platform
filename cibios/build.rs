@@ -40,4 +40,35 @@ fn validate_features() {
              firmware with `--no-default-features` and exactly one handoff mode."
         );
     }
+
+    // A firmware image is entered exactly one way on x86-family hardware: by a
+    // multiboot loader (QEMU bring-up) or by the from-scratch CIBOS bootloader
+    // (bare metal / USB). The two boot entries are different assembly and
+    // different image-acquisition logic, so compiling both into one image is
+    // contradictory. (On aarch64/riscv64 both flags are inert — those targets
+    // always boot via the platform device tree.)
+    let multiboot = std::env::var_os("CARGO_FEATURE_FIRMWARE_MULTIBOOT").is_some();
+    let bootloader = std::env::var_os("CARGO_FEATURE_FIRMWARE_BOOTLOADER").is_some();
+    if multiboot && bootloader {
+        panic!(
+            "CIBIOS feature conflict: `firmware-multiboot` and \
+             `firmware-bootloader` are mutually exclusive (a firmware image has \
+             exactly one boot entry). Build the bare-metal path with \
+             `--no-default-features --features firmware-bootloader[,handoff-...]`."
+        );
+    }
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let bare = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "none";
+    if bare
+        && matches!(arch.as_str(), "x86_64" | "x86")
+        && !multiboot
+        && !bootloader
+    {
+        panic!(
+            "CIBIOS x86/x86_64 firmware needs a boot entry: enable exactly one of \
+             `firmware-multiboot` (QEMU `-kernel`) or `firmware-bootloader` \
+             (bare metal). The default features include `firmware-multiboot`; if \
+             you built with `--no-default-features`, add one explicitly."
+        );
+    }
 }

@@ -85,6 +85,11 @@ pub use crypto::{
     SignatureAlgorithm, SignatureVerifier,
 };
 
+pub use protocols::boot::{
+    BootHandoff, BootLayoutDescriptor, BootMemoryRegion, BootRegionType, BLD_MAGIC, BLD_VERSION,
+    BOOT_HANDOFF_MAGIC, BOOT_HANDOFF_VERSION,
+};
+
 pub use protocols::handoff::{DecodedHandoff, HandoffData, HANDOFF_MAGIC, HANDOFF_VERSION};
 
 pub use protocols::ipc::{ChannelDirection, ChannelTerms, KernelInterface, WaitResource};

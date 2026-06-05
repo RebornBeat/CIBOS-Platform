@@ -1,9 +1,14 @@
-//! Architecture-specific serial output and halt for the kernel image.
+//! Architecture-specific console output and halt for the kernel image.
 //!
 //! Compiled only for `target_os = "none"`. Each backend provides `init_serial`,
-//! `putc`, and `halt`. Serial targets the QEMU `virt`/PC defaults so the kernel
-//! can prove liveness over the console.
+//! `putc`, and `halt`. On x86_64 the console is dual: COM1 serial (the bring-up
+//! capture target) and the VGA text console (on-screen output via `vga`). On
+//! aarch64/riscv64 the console targets the QEMU `virt` serial defaults so the
+//! kernel can prove liveness; an on-screen framebuffer console for those is a
+//! later step.
 
+#[cfg(target_arch = "x86_64")]
+mod vga;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]

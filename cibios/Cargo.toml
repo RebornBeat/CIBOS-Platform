@@ -25,7 +25,25 @@ shared = { workspace = true }
 [features]
 # Default firmware build: no std, no signature verification compiled in. This
 # corresponds to the Lightweight firmware profile (physical-trust handoff).
-default = []
+#
+# `firmware-multiboot` is on by default: the x86/x86_64 firmware is entered by a
+# multiboot1 loader (QEMU `-kernel`) and reads its memory map and CIBOS image
+# from multiboot structures. This is the QEMU bring-up path and the prior
+# behavior. ARM/RISC-V are unaffected by this flag — they always boot via the
+# platform device tree (FDT) regardless.
+default = ["firmware-multiboot"]
+
+# x86/x86_64 boot source: entered by a multiboot1 loader (QEMU `-kernel`); the
+# memory map and CIBOS image come from multiboot structures. Mutually exclusive
+# with `firmware-bootloader` (see build.rs). No effect on aarch64/riscv64.
+firmware-multiboot = []
+
+# x86/x86_64 boot source: entered by the from-scratch CIBOS BIOS bootloader
+# (no GRUB, no multiboot) in 64-bit long mode with a `BootHandoff` pointer in
+# `rdi` (x86_64) / on the stack (x86). The memory map and CIBOS image come from
+# that handoff. This is the bare-metal/USB production path. Mutually exclusive
+# with `firmware-multiboot`. No effect on aarch64/riscv64.
+firmware-bootloader = []
 
 # Host-side testing support. Enables std in shared so the logic library can be
 # unit-tested on the development host. Never enabled for a real firmware image.

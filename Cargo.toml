@@ -39,6 +39,7 @@ members = [
     "applications/web-protocol",
     "kernel-image",
     "tools/mkimage",
+    "tools/mkbootimage",
 ]
 
 [workspace.package]

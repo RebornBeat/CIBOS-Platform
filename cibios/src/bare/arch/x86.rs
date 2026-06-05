@@ -8,6 +8,7 @@
 use super::{DetectOutcome, DetectResult};
 use cibios::detection::DetectedHardware;
 use cibios::error::FirmwareError;
+#[cfg(feature = "firmware-multiboot")]
 use cibios::multiboot;
 use core::arch::asm;
 use shared::types::hardware::{
@@ -17,10 +18,18 @@ use shared::{HardwarePlatform, ProcessorArchitecture};
 
 const COM1: u16 = 0x3F8;
 
+#[cfg(feature = "firmware-multiboot")]
 extern "C" {
     /// Multiboot information structure pointer, saved by the boot entry from
     /// `ebx` (32-bit). Zero if not booted via multiboot.
     static multiboot_info_ptr: u32;
+}
+
+#[cfg(feature = "firmware-bootloader")]
+extern "C" {
+    /// `BootHandoff` pointer, saved by the bootloader boot entry. The 32-bit
+    /// bootloader path receives the handoff pointer and stores it here.
+    static boot_handoff_ptr: u32;
 }
 
 unsafe fn outb(port: u16, val: u8) {
@@ -64,6 +73,7 @@ pub fn halt() -> ! {
 }
 
 /// Locate the CIBOS image passed as the first multiboot module.
+#[cfg(feature = "firmware-multiboot")]
 pub fn locate_image() -> Option<&'static [u8]> {
     // SAFETY: saved by the boot entry from `ebx`.
     let info_ptr = unsafe { core::ptr::read(core::ptr::addr_of!(multiboot_info_ptr)) };
@@ -90,6 +100,48 @@ pub fn locate_image() -> Option<&'static [u8]> {
     // SAFETY: the loader placed the module body in `[start, end)`.
     let bytes = unsafe { core::slice::from_raw_parts(module.start as *const u8, len) };
     Some(bytes)
+}
+
+/// Locate the CIBOS image the from-scratch bootloader loaded.
+///
+/// The bootloader placed the `.cimg` blob in identity-mapped RAM and recorded
+/// `(addr, size)` in the [`BootHandoff`] it passed. We validate the handoff and
+/// return the blob bytes; CIBIOS then parses, verifies, and places the image
+/// exactly as on any other path.
+#[cfg(feature = "firmware-bootloader")]
+pub fn locate_image() -> Option<&'static [u8]> {
+    let handoff = boot_handoff()?;
+    if handoff.cibos_image_addr == 0 || handoff.cibos_image_size == 0 {
+        return None;
+    }
+    // SAFETY: the bootloader loaded the `.cimg` into `[addr, addr+size)` in
+    // identity-mapped RAM and left it there for firmware to read. On 32-bit the
+    // addresses fit in the 4 GiB physical space the loader set up.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            handoff.cibos_image_addr as usize as *const u8,
+            handoff.cibos_image_size as usize,
+        )
+    };
+    Some(bytes)
+}
+
+/// Read and validate the `BootHandoff` the bootloader passed.
+#[cfg(feature = "firmware-bootloader")]
+fn boot_handoff() -> Option<&'static shared::BootHandoff> {
+    // SAFETY: the bootloader stored the handoff pointer here; it points at a
+    // valid, aligned `BootHandoff` in identity-mapped RAM that outlives boot.
+    let ptr = unsafe { core::ptr::read(core::ptr::addr_of!(boot_handoff_ptr)) };
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` is a valid, aligned `BootHandoff` per the boot contract.
+    let handoff = unsafe { &*(ptr as usize as *const shared::BootHandoff) };
+    if handoff.is_valid() {
+        Some(handoff)
+    } else {
+        None
+    }
 }
 
 /// Gather entropy for the kernel CSPRNG seed: `RDTSC` jitter, plus `RDRAND` when
@@ -169,7 +221,7 @@ pub fn detect() -> DetectOutcome {
         security |= SecurityCapabilities::HARDWARE_RNG;
     }
 
-    let (memory_base, total_memory) = read_multiboot_memory()?;
+    let (memory_base, total_memory) = read_memory_map()?;
 
     let hardware = DetectedHardware {
         architecture: ProcessorArchitecture::X86,
@@ -191,8 +243,10 @@ pub fn detect() -> DetectOutcome {
     })
 }
 
-/// Read the multiboot memory map, returning `(base, total)`.
-fn read_multiboot_memory() -> Result<(u64, u64), FirmwareError> {
+/// Read the primary usable-RAM `(base, total)` from the multiboot information
+/// structure pointed to by `multiboot_info_ptr`.
+#[cfg(feature = "firmware-multiboot")]
+fn read_memory_map() -> Result<(u64, u64), FirmwareError> {
     let info_addr = unsafe { core::ptr::read(core::ptr::addr_of!(multiboot_info_ptr)) };
     if info_addr == 0 {
         return Err(FirmwareError::BootFailure {
@@ -213,6 +267,7 @@ fn read_multiboot_memory() -> Result<(u64, u64), FirmwareError> {
     Ok((mem.memory_base, mem.total_memory))
 }
 
+#[cfg(feature = "firmware-multiboot")]
 unsafe fn read_u32_le(p: *const u8) -> u32 {
     u32::from_le_bytes([
         core::ptr::read(p),
@@ -220,6 +275,50 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
         core::ptr::read(p.add(2)),
         core::ptr::read(p.add(3)),
     ])
+}
+
+/// Read the primary usable-RAM `(base, total)` from the [`BootHandoff`] E820
+/// map the bootloader passed.
+///
+/// Same semantics as the multiboot parser: `total` sums all usable regions;
+/// `base` is the first usable region at or above 1 MiB.
+#[cfg(feature = "firmware-bootloader")]
+fn read_memory_map() -> Result<(u64, u64), FirmwareError> {
+    let handoff = boot_handoff().ok_or(FirmwareError::BootFailure {
+        phase: "boot handoff missing or invalid",
+    })?;
+    if handoff.memory_regions_ptr == 0 || handoff.memory_region_count == 0 {
+        return Err(FirmwareError::BootFailure {
+            phase: "boot handoff memory map empty",
+        });
+    }
+    // SAFETY: the bootloader left `memory_region_count` `BootMemoryRegion`
+    // values at `memory_regions_ptr` in identity-mapped RAM.
+    let regions = unsafe {
+        core::slice::from_raw_parts(
+            handoff.memory_regions_ptr as usize as *const shared::BootMemoryRegion,
+            handoff.memory_region_count as usize,
+        )
+    };
+
+    let mut total: u64 = 0;
+    let mut base: u64 = 0;
+    let mut base_set = false;
+    for region in regions {
+        if region.is_usable() {
+            total = total.saturating_add(region.length);
+            if !base_set && region.base >= 0x10_0000 {
+                base = region.base;
+                base_set = true;
+            }
+        }
+    }
+    if !base_set {
+        return Err(FirmwareError::BootFailure {
+            phase: "boot handoff has no usable RAM above 1 MiB",
+        });
+    }
+    Ok((base, total))
 }
 
 /// Transfer control to the loaded kernel at `entry`, passing the physical
@@ -231,11 +330,14 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
 /// `entry` must be the verified kernel entry point and `handoff_ptr` must point
 /// to a valid handoff structure that outlives the call. Never returns.
 pub unsafe fn jump_to_kernel(entry: u64, handoff_ptr: u64) -> ! {
+    // The 32-bit kernel entry reads the handoff pointer from EAX. Pin it there
+    // explicitly and let the jump target use any other register, so the
+    // allocator cannot place `{entry}` in EAX and have the handoff load clobber
+    // the jump target (see the x86_64 note for the failure this prevents).
     asm!(
-        "mov eax, {handoff}",
         "jmp {entry}",
-        handoff = in(reg) handoff_ptr as u32,
         entry = in(reg) entry as u32,
+        in("eax") handoff_ptr as u32,
         options(noreturn),
     );
 }
