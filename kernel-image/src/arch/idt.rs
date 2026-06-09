@@ -121,6 +121,20 @@ pub unsafe fn init() {
     let handler = syscall_trap_entry as *const () as u64;
     IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3, 0);
 
+    // Keyboard IRQ: the PIC is remapped so IRQ1 arrives at vector 0x21. A DPL=0
+    // interrupt gate (ring 3 cannot invoke it directly; only the hardware line
+    // does). The handler runs on the current stack via the legacy rsp0 path.
+    extern "C" {
+        fn keyboard_irq_entry();
+    }
+    const VECTOR_KEYBOARD: usize = 0x21;
+    IDT[VECTOR_KEYBOARD].set_handler(
+        keyboard_irq_entry as *const () as u64,
+        cs,
+        GATE_INT64_DPL0,
+        0,
+    );
+
     let ptr = IdtPointer {
         limit: (size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,

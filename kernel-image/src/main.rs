@@ -18,6 +18,8 @@ mod arch;
 mod boot;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod loader;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod keyboard;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

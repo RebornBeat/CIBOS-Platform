@@ -5,6 +5,7 @@
 //! kernel/runtime interface and channel vocabulary, and the [`authentication`]
 //! exchange envelopes.
 
+pub mod app_image;
 pub mod authentication;
 pub mod boot;
 pub mod handoff;

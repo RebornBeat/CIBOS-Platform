@@ -134,6 +134,121 @@ pub unsafe fn run_user_payload(
     );
 }
 
+/// Map every segment of a parsed application image into `space` with each
+/// segment's own permissions, copying the file bytes in and zero-filling the
+/// `mem_size - file_size` tail (e.g. `.bss`). Returns the image entry virtual
+/// address on success; the caller enters ring 3 there.
+///
+/// Each segment is mapped page-by-page from fresh zeroed frames, so a segment
+/// whose `vaddr`/`file_size` are not page-aligned is handled correctly: bytes
+/// are written at the right intra-page offset and the surrounding bytes stay
+/// zero. Segments must not overlap a page already mapped in `space` (the
+/// underlying `map` rejects a double mapping), which a well-formed image with
+/// page-disjoint segments satisfies.
+///
+/// # Safety
+///
+/// `space` must be a valid address space whose tables are reachable through
+/// `phys_to_ptr` (the active identity map), and `frames` must hand out frames
+/// that `phys_to_ptr` maps to writable `FRAME_SIZE` regions. The image's
+/// segment permissions are trusted to describe ring-3-safe code/data; the
+/// caller is responsible for having validated the image (`AppImage::parse`).
+pub unsafe fn load_app_image(
+    space: &AddressSpace,
+    frames: &FrameAllocator,
+    image: &shared::AppImage,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<u64, &'static str> {
+    use shared::AppSegment;
+
+    let perms_of = |seg: &AppSegment| Permissions {
+        read: seg.readable(),
+        write: seg.writable(),
+        execute: seg.executable(),
+        user: true,
+    };
+
+    for i in 0..image.segment_count() {
+        let seg = image.segment(i).map_err(|_| "bad segment descriptor")?;
+        let body = image.segment_body(&seg).map_err(|_| "bad segment body")?;
+        let perms = perms_of(&seg);
+
+        // Page-aligned span covering [vaddr, vaddr + mem_size).
+        let seg_start = seg.vaddr;
+        let seg_end = seg
+            .vaddr
+            .checked_add(seg.mem_size)
+            .ok_or("segment end overflow")?;
+        let first_page = seg_start & !(FRAME_SIZE - 1);
+        // Number of pages spanned (ceil of the unaligned end minus aligned start).
+        let span = seg_end - first_page;
+        let page_count = span.div_ceil(FRAME_SIZE);
+
+        for p in 0..page_count {
+            let page_virt = first_page + p * FRAME_SIZE;
+
+            // Fresh zeroed frame for this page (zero-fill covers .bss tails and
+            // any sub-page padding around the copied bytes).
+            let frame = frames
+                .allocate_zeroed(phys_to_ptr)
+                .map_err(|_| "no frame for app segment")?;
+
+            // Copy the portion of the segment's file bytes that lands in this
+            // page, if any. The file bytes occupy [seg_start, seg_start+file_size)
+            // in virtual space; intersect that with this page.
+            let file_end = seg_start + seg.file_size;
+            let page_lo = page_virt;
+            let page_hi = page_virt + FRAME_SIZE;
+            let copy_lo = core::cmp::max(seg_start, page_lo);
+            let copy_hi = core::cmp::min(file_end, page_hi);
+            if copy_hi > copy_lo {
+                let dst = phys_to_ptr(frame.addr());
+                let dst_off = (copy_lo - page_lo) as usize;
+                let src_off = (copy_lo - seg_start) as usize;
+                let n = (copy_hi - copy_lo) as usize;
+                core::ptr::copy_nonoverlapping(body.as_ptr().add(src_off), dst.add(dst_off), n);
+            }
+
+            space
+                .map::<X86PageTable>(page_virt, frame, perms, frames, phys_to_ptr)
+                .map_err(|_| "map app segment page failed")?;
+        }
+    }
+
+    Ok(image.entry())
+}
+
+/// Map a user stack of `pages` pages into `space` (user read/write) at
+/// `stack_base`, returning the initial (top-of-stack, 16-byte-aligned) pointer.
+///
+/// # Safety
+///
+/// As [`load_app_image`].
+pub unsafe fn map_user_stack(
+    space: &AddressSpace,
+    frames: &FrameAllocator,
+    stack_base: u64,
+    pages: u64,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<u64, &'static str> {
+    for p in 0..pages {
+        let frame = frames
+            .allocate_zeroed(phys_to_ptr)
+            .map_err(|_| "no frame for user stack")?;
+        space
+            .map::<X86PageTable>(
+                stack_base + p * FRAME_SIZE,
+                frame,
+                Permissions::user_rw(),
+                frames,
+                phys_to_ptr,
+            )
+            .map_err(|_| "map user stack page failed")?;
+    }
+    // Top of the stack (grows down), 16-byte aligned.
+    Ok((stack_base + pages * FRAME_SIZE) & !0xF)
+}
+
 /// Like [`run_user_payload`], but returns the user's exit code when the payload
 /// calls `exit` (instead of diverging). Uses the kernel-context save/restore
 /// entry so control comes back to the kernel — the basis for a real process

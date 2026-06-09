@@ -45,7 +45,38 @@ syscall_trap_entry:
 
     iretq
 
-// ---- CPU exception stub ----------------------------------------------------
+// ---- Hardware IRQ stub: keyboard (IRQ1 -> remapped vector 0x21) ------------
+// A hardware interrupt can fire between any two instructions of the interrupted
+// code, so unlike the syscall path we must preserve every register the Rust
+// handler might clobber (all the C-clobbered/volatile registers). We save them,
+// call the handler (which reads the scancode, decodes, enqueues, and EOIs),
+// restore, and iretq.
+.section .text
+.global keyboard_irq_entry
+keyboard_irq_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    call cibos_keyboard_irq
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
+
 // A common handler for CPU exceptions (vectors 0..31). Each per-vector entry
 // pushes its vector number, then jumps here. We pass the vector and the faulting
 // RIP (from the interrupt frame) to a Rust reporter that prints and halts.

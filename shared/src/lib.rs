@@ -40,7 +40,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 extern crate alloc;
 
 pub mod crypto;
@@ -84,6 +84,13 @@ pub use crypto::{
     sha256, sha3_256, sha3_512, sha512, Digest256, Digest512, KemAlgorithm, KeyEncapsulation,
     SignatureAlgorithm, SignatureVerifier,
 };
+
+pub use protocols::app_image::{
+    AppImage, AppImageError, AppImageHeader, AppSegment, APP_MAGIC, APP_VERSION, MAX_SEGMENTS,
+    SEG_FLAG_EXEC, SEG_FLAG_READ, SEG_FLAG_WRITE,
+};
+#[cfg(feature = "std")]
+pub use protocols::app_image::AppImageBuilder;
 
 pub use protocols::boot::{
     BootHandoff, BootLayoutDescriptor, BootMemoryRegion, BootRegionType, BLD_MAGIC, BLD_VERSION,

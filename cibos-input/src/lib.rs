@@ -12,6 +12,11 @@
 #![warn(missing_docs)]
 #![no_std]
 
+pub mod keyqueue;
+pub mod scancode;
+pub use keyqueue::KeyQueue;
+pub use scancode::ScancodeDecoder;
+
 /// A key on the keyboard. Printable keys carry their character; the rest are
 /// named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -444,13 +444,20 @@ fn run_ring3_demo(
     unsafe {
         crate::arch::gdt::init();
         crate::arch::idt::init();
-        // Mask the legacy PIC: entering ring 3 sets RFLAGS.IF, enabling
-        // interrupts for the first time. The PIC is at BIOS defaults (IRQ0 ->
-        // vector 0x08), so an unmasked timer tick would be delivered as a
-        // spurious "double fault" at the user RIP. The kernel has no timer/IRQ
-        // driver yet, so mask all lines until it does.
-        crate::arch::mask_pic();
-        kprintln!("CIBOS kernel: GDT/TSS + IDT installed, PIC masked (ring-3 ready)");
+        // Remap the legacy PIC so hardware IRQs land at vectors 0x20..0x2F
+        // (clear of the CPU exception vectors), then unmask only the keyboard
+        // line (IRQ1). The timer (IRQ0) stays masked — the kernel has no timer
+        // driver yet — so entering ring 3 with RFLAGS.IF set is safe: the only
+        // interrupt that can fire is the keyboard, which has a handler at 0x21.
+        crate::arch::remap_pic();
+        crate::arch::enable_keyboard_irq();
+        kprintln!("CIBOS kernel: GDT/TSS + IDT installed, PIC remapped, keyboard IRQ enabled");
+
+        // Prove real hardware input reaches the kernel: enable interrupts and
+        // wait briefly for a keystroke (the IRQ1 handler decodes the scancode
+        // and enqueues a KeyEvent). In QEMU a key can be injected via the
+        // monitor `sendkey`; on real hardware, a physical keypress.
+        demonstrate_keyboard_input();
 
         let start = core::ptr::addr_of!(user_payload_start);
         let end = core::ptr::addr_of!(user_payload_end);
@@ -469,6 +476,65 @@ fn run_ring3_demo(
             ),
             Err(e) => kprintln!("CIBOS kernel: ring-3 launch failed: {e}"),
         }
+    }
+}
+
+/// Enable interrupts and poll the keyboard queue briefly to prove that a real
+/// hardware keystroke reaches the kernel through the IRQ1 → scancode-decode →
+/// key-queue path. Reports the first key seen (or that none arrived within the
+/// window), then disables interrupts again so the subsequent ring-3 transition
+/// runs in the known-good (keyboard-only-IRQ) environment it expects.
+///
+/// # Safety
+///
+/// The IDT and remapped PIC must already be initialised with the keyboard line
+/// unmasked and a handler at vector 0x21.
+#[cfg(target_arch = "x86_64")]
+unsafe fn demonstrate_keyboard_input() {
+    use core::arch::asm;
+
+    // Enable interrupts (set IF). From here a keyboard IRQ can fire.
+    asm!("sti", options(nomem, nostack));
+
+    // Busy-poll the queue for a bounded number of iterations. We deliberately do
+    // NOT `hlt` here: only the keyboard line is unmasked (no timer), so a `hlt`
+    // with no keypress would sleep forever and hang a headless boot. A bounded
+    // busy loop guarantees boot always proceeds while still giving a real
+    // keypress (which fires the IRQ that fills the queue) time to land.
+    let mut waited: u64 = 0;
+    const MAX_WAIT: u64 = 2_000_000_000;
+    let mut seen = None;
+    while waited < MAX_WAIT {
+        if let Some(ev) = crate::keyboard::poll_key() {
+            seen = Some(ev);
+            break;
+        }
+        core::hint::spin_loop();
+        waited += 1;
+    }
+
+    // Disable interrupts again before returning to the ring-3 path.
+    asm!("cli", options(nomem, nostack));
+
+    match seen {
+        Some(ev) => match ev.key {
+            cibos_input::Key::Char(c) => kprintln!(
+                "CIBOS kernel: keyboard online — first keystroke decoded: '{c}' \
+                 ({} scancode(s) seen)",
+                crate::keyboard::scancodes_seen()
+            ),
+            other => kprintln!(
+                "CIBOS kernel: keyboard online — first key decoded: {:?} \
+                 ({} scancode(s) seen)",
+                other,
+                crate::keyboard::scancodes_seen()
+            ),
+        },
+        None => kprintln!(
+            "CIBOS kernel: keyboard armed — no keystroke within window \
+             ({} scancode(s) seen)",
+            crate::keyboard::scancodes_seen()
+        ),
     }
 }
 

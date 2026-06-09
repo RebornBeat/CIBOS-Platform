@@ -249,6 +249,7 @@ name = "kernel-image"
 version = "0.1.0"
 dependencies = [
  "cibos-async-runtime",
+ "cibos-input",
  "cibos-kernel",
  "linked_list_allocator",
  "shared",

@@ -42,26 +42,84 @@ pub fn putc(b: u8) {
     super::vga::putc(b);
 }
 
-/// Mask every IRQ line on the legacy 8259 PIC pair.
+/// Remap the legacy 8259 PIC pair so hardware IRQs are delivered to interrupt
+/// vectors `0x20..=0x2F` instead of the BIOS-default `0x08..=0x0F` (which
+/// collide with CPU exception vectors), then mask every line.
 ///
-/// At BIOS defaults the master PIC delivers IRQ0 (the periodic timer) to CPU
-/// interrupt vector 0x08 — which collides with the CPU's #DF exception vector.
-/// The kernel runs with interrupts disabled, so this is harmless until the first
-/// time `IF` is set (e.g. entering ring 3 via `iretq` with RFLAGS.IF=1): the
-/// timer then fires into vector 0x08 and looks exactly like a double fault.
-///
-/// Until the kernel has a real timer/APIC driver (which would remap and handle
-/// these), the correct thing is to mask all PIC lines so no spurious legacy IRQ
-/// is delivered. Writing 0xFF to each PIC's data port masks all eight of its
-/// lines.
-pub fn mask_pic() {
+/// This is the correct fix for the IRQ0↔#DF collision that [`mask_pic`] worked
+/// around: after remapping, individual lines can be unmasked safely (their
+/// vectors no longer alias exceptions). The standard ICW1..ICW4 init sequence is
+/// followed; after it, OCW1 masks all lines until the kernel unmasks the ones it
+/// services.
+pub fn remap_pic() {
+    const PIC1_CMD: u16 = 0x20;
     const PIC1_DATA: u16 = 0x21;
+    const PIC2_CMD: u16 = 0xA0;
     const PIC2_DATA: u16 = 0xA1;
-    // SAFETY: standard 8259 PIC programming on fixed I/O ports.
+    const ICW1_INIT: u8 = 0x11; // init + ICW4 present
+    const ICW4_8086: u8 = 0x01; // 8086/88 mode
+    const MASTER_OFFSET: u8 = 0x20; // IRQ0..7 -> 0x20..0x27
+    const SLAVE_OFFSET: u8 = 0x28; // IRQ8..15 -> 0x28..0x2F
+
+    // SAFETY: standard 8259 programming on fixed I/O ports during bring-up.
     unsafe {
+        // ICW1: begin init (both PICs).
+        outb(PIC1_CMD, ICW1_INIT);
+        outb(PIC2_CMD, ICW1_INIT);
+        // ICW2: vector offsets.
+        outb(PIC1_DATA, MASTER_OFFSET);
+        outb(PIC2_DATA, SLAVE_OFFSET);
+        // ICW3: tell master the slave is on IRQ2 (bit 2); tell slave its id (2).
+        outb(PIC1_DATA, 0x04);
+        outb(PIC2_DATA, 0x02);
+        // ICW4: 8086 mode.
+        outb(PIC1_DATA, ICW4_8086);
+        outb(PIC2_DATA, ICW4_8086);
+        // OCW1: mask all lines for now.
         outb(PIC1_DATA, 0xFF);
         outb(PIC2_DATA, 0xFF);
     }
+}
+
+/// Unmask the keyboard line (IRQ1) on the master PIC, leaving all other lines
+/// masked. Call after [`remap_pic`] and after the IDT has a handler at vector
+/// `0x21`. Also unmasks the cascade line (IRQ2) so a future slave-PIC line can
+/// reach the CPU; the keyboard itself is on the master.
+pub fn enable_keyboard_irq() {
+    const PIC1_DATA: u16 = 0x21;
+    // Mask = 1 means disabled. Clear bit 1 (IRQ1, keyboard) and bit 2 (cascade).
+    // 0b1111_1001 = 0xF9.
+    // SAFETY: PIC data-port write during bring-up.
+    unsafe {
+        outb(PIC1_DATA, 0xF9);
+    }
+}
+
+/// Signal end-of-interrupt to the PIC for a vector in the remapped range
+/// `0x20..=0x2F`. For lines on the slave (vector >= 0x28) both PICs must be
+/// acknowledged.
+///
+/// # Safety
+///
+/// Call exactly once at the end of servicing a hardware IRQ.
+pub unsafe fn pic_eoi(vector: u8) {
+    const PIC1_CMD: u16 = 0x20;
+    const PIC2_CMD: u16 = 0xA0;
+    const EOI: u8 = 0x20;
+    if vector >= 0x28 {
+        outb(PIC2_CMD, EOI);
+    }
+    outb(PIC1_CMD, EOI);
+}
+
+/// Read one byte from the PS/2 keyboard controller data port (0x60).
+///
+/// # Safety
+///
+/// Should be read in response to a keyboard IRQ (data is ready); reading at
+/// other times returns whatever the controller last latched.
+pub unsafe fn read_keyboard_data() -> u8 {
+    inb(0x60)
 }
 
 /// Halt the processor permanently.
