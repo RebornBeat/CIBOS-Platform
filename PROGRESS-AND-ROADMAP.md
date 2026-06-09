@@ -165,25 +165,46 @@ alignment review plus this session's progress.
      mechanism). New `shared/src/protocols/syscall.rs` (the ABI: numbers,
      register convention, error codes; 2 tests), `cibos-kernel/src/syscall.rs`
      (portable dispatcher over a `SyscallEnv`; 7 tests — `Log`/`Exit`/`Yield`/
-     `Now`, with user-pointer bounds checking), `kernel-image/src/arch/idt.rs` +
-     `arch/syscall_entry.s` (x86_64 IDT + `int 0x80` trap stub). At boot the
-     kernel installs the IDT and issues a `log` syscall through the trap gate;
-     the handler prints the user buffer and returns 0 (`syscall transport
-     verified — log() trap returned 0`). So trap → save → dispatch → service →
-     return → resume works on real hardware.
-   - **Still to do for a loaded app:** (a) load an application image into a
-     container's `AddressSpace` (map its code/data/stack pages with user perms);
-     (b) ring-3 user/supervisor separation — a TSS, ring-3 GDT selectors, and
-     `iretq` into user code — so the app runs unprivileged and its traps carry
-     its real `BoundaryId` (the dispatcher already takes the boundary and
-     translates user pointers; `copy_from_user` will go through
-     `AddressSpaceManager` instead of the identity read used in the bring-up
-     demo); (c) grow the ABI to marshal the rest of the SDK `System` surface
-     (channels, spawn, sleep) as the transport carries more.
+   - **Ring-3 user-mode execution + minimal loader DONE and runtime-verified.**
+     `kernel-image/src/arch/gdt.rs` (kernel GDT with ring-3 code/data selectors +
+     a TSS with rsp0 and an IST fault stack), `arch/enter_user.s` (`iretq` into
+     ring 3), `arch/user_payload.s` (a position-independent unprivileged payload),
+     `arch/idt.rs` + `arch/syscall_entry.s` (now also CPU-exception handlers for
+     vectors 0–19 on an IST), and `loader.rs` (`run_user_payload`: map a user
+     code page + stack into an `AddressSpace` with user perms, drop to ring 3).
+     At boot the kernel enables EFER.NXE, builds its tables, drops to ring 3, and
+     the unprivileged payload prints via an `int 0x80` `log` syscall, then
+     `exit(0)` cleanly halts: `[ring3] hello from an unprivileged user payload
+     via int 0x80` → `user payload exited with code 0`.
+     - *Debugging note for the future timer work:* the legacy 8259 PIC is at BIOS
+       defaults (IRQ0 → vector 0x08), so the first time `iretq` sets RFLAGS.IF a
+       timer tick is delivered as a spurious "double fault." The kernel masks the
+       PIC (`arch::mask_pic`) before entering ring 3 since it has no timer/IRQ
+       driver yet; a real timer/APIC subsystem must remap and handle these.
+   - **Process model — context save/restore DONE and runtime-verified.** Added
+     `enter_user_context`/`return_to_kernel` (`arch/enter_user.s`): a
+     setjmp/longjmp-style pair across the privilege boundary. The kernel saves
+     its callee-saved registers + RSP before `iretq`, and a user `exit` syscall
+     restores that context so control unwinds back to the kernel instead of
+     halting. `loader::run_user_payload_returning` uses it; the demo now shows
+     `[ring3] hello … → user payload returned to kernel with exit code 0 → boot
+     complete`. The full vertical slice works: boot → kernel → MMU → isolation →
+     ring-3 user process → syscall → exit → return to kernel → completion.
+   - **Still to do for a *full* process model:** (a) load an external application
+     image (parse format, map segments with per-segment perms, relocate) — reuses
+     the loader's map+entry path, only the byte source changes; (b) run each app
+     in its *own* `AddressSpace` (installed via CR3 on entry) so traps carry its
+     real `BoundaryId` and `copy_from_user` goes through `AddressSpaceManager`
+     rather than the identity read; (c) preemptive multitasking — a timer/APIC
+     driver (which must remap the PIC, currently masked) plus per-task context
+     save so the scheduler can switch between several ring-3 tasks; (d) grow the
+     ABI to marshal the rest of the SDK `System` surface (channels, spawn,
+     sleep).
 
-4. **Syscall transport** *(kernel⇄app boundary)* — **mechanism DONE** (see item
-   3). Remaining is breadth: more syscall numbers as `System` operations move
-   onto the transport, and the ring-3 privilege transition.
+4. **Syscall transport** *(kernel⇄app boundary)* — **mechanism DONE**, now
+   exercised from real ring-3 code (see item 3). Remaining is breadth: more
+   syscall numbers as `System` operations move onto the transport, and per-task
+   context save/restore for preemptive multitasking.
 
 5. **Documented behavioral flags — implement (declared but inert)**
    - The profile bundles exist and select flags, but most flags gate no behavior

@@ -31,6 +31,10 @@ global_asm!(include_str!("boot/x86_64_selfboot.s"));
 global_asm!(include_str!("boot/x86_64_handoff.s"));
 #[cfg(target_arch = "x86_64")]
 global_asm!(include_str!("arch/syscall_entry.s"));
+#[cfg(target_arch = "x86_64")]
+global_asm!(include_str!("arch/enter_user.s"));
+#[cfg(target_arch = "x86_64")]
+global_asm!(include_str!("arch/user_payload.s"));
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot/aarch64.s"));
 #[cfg(target_arch = "riscv64")]
@@ -81,7 +85,7 @@ fn init_heap() {
 // Serial console.
 // ---------------------------------------------------------------------------
 
-struct Console;
+pub struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -157,12 +161,10 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // tables through the portable model + arch encoder and install them.
             // Surviving the CR3 switch proves the tables we built are valid
             // hardware tables, not just accounting.
+            // bring_up_mmu now also installs the GDT/IDT and drops to ring 3 to
+            // run an unprivileged user payload that syscalls via int 0x80,
+            // exercising the full user/kernel boundary on real hardware.
             bring_up_mmu(&handoff);
-
-            // Demonstrate the syscall transport: install the IDT and issue a
-            // `log` syscall through the `int 0x80` trap gate, proving the
-            // user→kernel→user round trip works on real hardware.
-            demonstrate_syscall();
 
             kprintln!("CIBOS kernel: boot complete");
         }
@@ -290,6 +292,11 @@ fn bring_up_mmu(handoff: &HandoffData) {
     // hands out (all within mapped physical RAM), and we install the result only
     // after fully mapping the memory the kernel is currently executing from.
     unsafe {
+        // The W^X mappings below set the NX bit on non-executable pages. NX is a
+        // reserved bit until EFER.NXE is enabled (the bootloader sets LME but not
+        // NXE), so enable it before building any table that uses NX.
+        crate::arch::paging::enable_nxe();
+
         let space = match AddressSpace::new(&frames, &phys_to_ptr) {
             Ok(s) => s,
             Err(e) => {
@@ -334,83 +341,135 @@ fn bring_up_mmu(handoff: &HandoffData) {
             crate::arch::paging::current_root()
         );
 
-        // Demonstrate per-container isolation on the proven mechanism: hand the
-        // remaining frames to an AddressSpaceManager, give two distinct
-        // boundaries their own address spaces, map a page into the first, and
-        // confirm that same virtual address is absent in the second. This is the
-        // hardware-isolation property — "Container A cannot reach Container B's
-        // memory" — exercised on real page tables at boot.
-        demonstrate_container_isolation(frames);
+        // Demonstrate per-container isolation on the proven mechanism: two
+        // distinct boundaries get their own page tables; a page mapped in one is
+        // physically absent in the other. Uses a borrowed frame allocator so the
+        // allocator remains available for the ring-3 payload below.
+        demonstrate_container_isolation(&frames, &phys_to_ptr);
 
-        // Intentionally leak the address space: it is the kernel's live page
-        // table for the rest of this boot. (No teardown path here by design.)
-        core::mem::forget(space);
+        // Drop to ring 3 and run an unprivileged user payload that reaches the
+        // kernel only via int 0x80 syscalls — the full user/kernel boundary.
+        run_ring3_demo(&space, &frames, &phys_to_ptr);
+
+        // `space` and `frames` back the live page tables (CR3) for the rest of
+        // this boot. Neither type implements `Drop` and the page-table frames
+        // live in physical RAM independent of these handles, so simply letting
+        // them fall out of scope here leaves the live mappings intact.
     }
 }
 
-/// Build two per-boundary address spaces and prove they are isolated, on the
-/// live MMU. Diagnostic/bring-up demonstration of the [`AddressSpaceManager`].
+/// Show two boundaries with independent address spaces on the live MMU, using a
+/// borrowed frame allocator. Diagnostic demonstration of per-container isolation.
 #[cfg(target_arch = "x86_64")]
-fn demonstrate_container_isolation(frames: cibos_kernel::FrameAllocator) {
-    use cibos_kernel::paging::Permissions;
-    use cibos_kernel::AddressSpaceManager;
-    use shared::BoundaryId;
+fn demonstrate_container_isolation(
+    frames: &cibos_kernel::FrameAllocator,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) {
+    use cibos_kernel::paging::{AddressSpace, Permissions};
 
-    let phys_to_ptr = |phys: u64| phys as *mut u8;
-    let mgr = AddressSpaceManager::new(frames);
-
-    let a = BoundaryId::new(1);
-    let b = BoundaryId::new(2);
-    // A user virtual address well clear of the kernel's identity-mapped range.
     const USER_VIRT: u64 = 0x0000_4000_0000_0000; // 64 TiB
 
-    // SAFETY: the identity map installed above is valid for every frame the
-    // allocator hands out; these spaces are built but not installed (the kernel
-    // keeps running on its own space), so this only reads/writes table frames.
+    // SAFETY: the identity map is valid for every frame the allocator hands out;
+    // these spaces are built but not installed (the kernel keeps running on its
+    // own space), so this only reads/writes table frames.
     unsafe {
-        if let Err(e) = mgr.create_space(a, &phys_to_ptr) {
-            kprintln!("CIBOS kernel: isolation demo skipped (space A): {e}");
-            return;
-        }
-        if let Err(e) = mgr.create_space(b, &phys_to_ptr) {
-            kprintln!("CIBOS kernel: isolation demo skipped (space B): {e}");
-            return;
-        }
-        if let Err(e) = mgr.map_new_pages::<crate::arch::paging::X86PageTable>(
-            a,
+        let a = match AddressSpace::new(frames, phys_to_ptr) {
+            Ok(s) => s,
+            Err(e) => {
+                kprintln!("CIBOS kernel: isolation demo skipped (space A): {e}");
+                return;
+            }
+        };
+        let b = match AddressSpace::new(frames, phys_to_ptr) {
+            Ok(s) => s,
+            Err(e) => {
+                kprintln!("CIBOS kernel: isolation demo skipped (space B): {e}");
+                return;
+            }
+        };
+        if let Err(e) = a.map::<crate::arch::paging::X86PageTable>(
             USER_VIRT,
-            1,
+            match frames.allocate() {
+                Ok(f) => f,
+                Err(_) => {
+                    kprintln!("CIBOS kernel: isolation demo skipped (no frame)");
+                    return;
+                }
+            },
             Permissions::user_rw(),
-            &phys_to_ptr,
+            frames,
+            phys_to_ptr,
         ) {
             kprintln!("CIBOS kernel: isolation demo map failed: {e}");
             return;
         }
-
-        let in_a = mgr
-            .translate::<crate::arch::paging::X86PageTable>(a, USER_VIRT, &phys_to_ptr)
+        let in_a = a
+            .translate::<crate::arch::paging::X86PageTable>(USER_VIRT, phys_to_ptr)
             .is_some();
-        let in_b = mgr
-            .translate::<crate::arch::paging::X86PageTable>(b, USER_VIRT, &phys_to_ptr)
+        let in_b = b
+            .translate::<crate::arch::paging::X86PageTable>(USER_VIRT, phys_to_ptr)
             .is_some();
-
-        match (in_a, in_b) {
-            (true, false) => kprintln!(
-                "CIBOS kernel: container isolation verified — page mapped in boundary {} \
-                 is absent in boundary {} (separate page tables, roots {:#x} / {:#x})",
-                a.raw(),
-                b.raw(),
-                mgr.root_of(a).map(|f| f.addr()).unwrap_or(0),
-                mgr.root_of(b).map(|f| f.addr()).unwrap_or(0),
-            ),
-            other => kprintln!(
-                "CIBOS kernel: container isolation CHECK FAILED (in_a, in_b) = {other:?}"
-            ),
+        if in_a && !in_b {
+            kprintln!(
+                "CIBOS kernel: container isolation verified — page in space A (root {:#x}) \
+                 is absent in space B (root {:#x})",
+                a.root().addr(),
+                b.root().addr()
+            );
+        } else {
+            kprintln!("CIBOS kernel: container isolation CHECK FAILED ({in_a}, {in_b})");
         }
+        // These demo spaces are discarded; their page-table frames stay
+        // allocated for the rest of boot (no teardown path in this
+        // demonstration, and the types are Drop-free so they need no cleanup).
+        let _ = (a, b);
+    }
+}
+
+/// Install the GDT/TSS and the IDT, then drop to ring 3 to run the user payload.
+/// The payload logs a message and calls `exit`, both via `int 0x80`.
+#[cfg(target_arch = "x86_64")]
+fn run_ring3_demo(
+    space: &cibos_kernel::paging::AddressSpace,
+    frames: &cibos_kernel::FrameAllocator,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) {
+    extern "C" {
+        static user_payload_start: u8;
+        static user_payload_end: u8;
     }
 
-    // Keep the manager alive for the rest of boot.
-    core::mem::forget(mgr);
+    // SAFETY: single-threaded bring-up; installs the kernel GDT/TSS and IDT once,
+    // before any ring transition or trap.
+    unsafe {
+        crate::arch::gdt::init();
+        crate::arch::idt::init();
+        // Mask the legacy PIC: entering ring 3 sets RFLAGS.IF, enabling
+        // interrupts for the first time. The PIC is at BIOS defaults (IRQ0 ->
+        // vector 0x08), so an unmasked timer tick would be delivered as a
+        // spurious "double fault" at the user RIP. The kernel has no timer/IRQ
+        // driver yet, so mask all lines until it does.
+        crate::arch::mask_pic();
+        kprintln!("CIBOS kernel: GDT/TSS + IDT installed, PIC masked (ring-3 ready)");
+
+        let start = core::ptr::addr_of!(user_payload_start);
+        let end = core::ptr::addr_of!(user_payload_end);
+        let len = end as usize - start as usize;
+        let code = core::slice::from_raw_parts(start, len);
+
+        kprintln!(
+            "CIBOS kernel: entering ring 3 to run a {len}-byte user payload at {:#x}",
+            crate::loader::USER_CODE_VIRT
+        );
+        match crate::loader::run_user_payload_returning(space, frames, code, phys_to_ptr) {
+            // The payload logs, then `exit(code)` unwinds back here via the
+            // saved kernel context — proving the kernel regains control.
+            Ok(code) => kprintln!(
+                "CIBOS kernel: user payload returned to kernel with exit code {code}"
+            ),
+            Err(e) => kprintln!("CIBOS kernel: ring-3 launch failed: {e}"),
+        }
+    }
 }
 
 /// On non-x86_64 targets the page-table encoder and CR3 install are not yet
@@ -419,49 +478,6 @@ fn demonstrate_container_isolation(frames: cibos_kernel::FrameAllocator) {
 #[cfg(not(target_arch = "x86_64"))]
 fn bring_up_mmu(_handoff: &HandoffData) {
     kprintln!("CIBOS kernel: MMU bring-up skipped (arch backend pending)");
-}
-
-/// Install the IDT and exercise the syscall trap path: issue a `log` syscall
-/// via `int 0x80` and confirm it returns success. Bring-up demonstration of the
-/// syscall transport.
-#[cfg(target_arch = "x86_64")]
-fn demonstrate_syscall() {
-    use core::arch::asm;
-    use shared::protocols::syscall::Syscall;
-
-    // SAFETY: single-threaded bring-up; installs the kernel IDT once.
-    unsafe {
-        crate::arch::idt::init();
-    }
-    kprintln!("CIBOS kernel: IDT installed, syscall gate at vector 0x80");
-
-    // Issue a `log` syscall the way an application would: number in rax, args in
-    // rdi/rsi, `int 0x80`, result in rax.
-    let msg = b"  [syscall] hello from a log() trap\n";
-    let ret: i64;
-    // SAFETY: the IDT is installed and the buffer is a valid kernel pointer; the
-    // trap stub preserves all registers except rax.
-    unsafe {
-        asm!(
-            "int 0x80",
-            inout("rax") Syscall::Log.number() => ret,
-            in("rdi") msg.as_ptr() as u64,
-            in("rsi") msg.len() as u64,
-            in("rdx") 0u64,
-            clobber_abi("C"),
-        );
-    }
-    if ret == 0 {
-        kprintln!("CIBOS kernel: syscall transport verified — log() trap returned 0");
-    } else {
-        kprintln!("CIBOS kernel: syscall transport CHECK FAILED — log() returned {ret}");
-    }
-}
-
-/// On non-x86_64 targets the syscall trap entry is not yet implemented.
-#[cfg(not(target_arch = "x86_64"))]
-fn demonstrate_syscall() {
-    kprintln!("CIBOS kernel: syscall transport skipped (arch trap entry pending)");
 }
 
 /// The kernel's [`SyscallEnv`]: how the portable syscall dispatcher reaches
@@ -532,8 +548,15 @@ pub fn handle_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     match dispatch_syscall(&req, &KernelSyscallEnv) {
         SyscallOutcome::Return(v) => v,
         SyscallOutcome::Yield => 0,
-        // No ring-3 task to tear down yet; report the exit code as the return.
-        SyscallOutcome::Exit(code) => code as i64,
+        // Return control to the kernel at the matching `enter_user_context`
+        // call site, with the exit code as that call's return value. This is the
+        // basis for a process model: `exit` unwinds to the kernel (and, later,
+        // to the scheduler) rather than halting.
+        SyscallOutcome::Exit(code) => {
+            // SAFETY: reached only from a syscall issued by the ring-3 task that
+            // `enter_user_context` launched, so a saved kernel context is live.
+            unsafe { crate::loader::return_to_kernel(code as i64) }
+        }
     }
 }
 

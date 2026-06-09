@@ -40,12 +40,13 @@ impl IdtEntry {
         }
     }
 
-    fn set_handler(&mut self, handler: u64, selector: u16, type_attr: u8) {
+    fn set_handler(&mut self, handler: u64, selector: u16, type_attr: u8, ist: u8) {
         self.offset_low = (handler & 0xFFFF) as u16;
         self.offset_mid = ((handler >> 16) & 0xFFFF) as u16;
         self.offset_high = ((handler >> 32) & 0xFFFF_FFFF) as u32;
         self.selector = selector;
-        self.ist = 0;
+        // IST index occupies the low 3 bits of this byte (0 = use rsp0/legacy).
+        self.ist = ist & 0x7;
         self.type_attr = type_attr;
         self.zero = 0;
     }
@@ -80,14 +81,63 @@ pub unsafe fn init() {
     let cs: u16;
     asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
 
-    let handler = syscall_trap_entry as usize as u64;
-    IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3);
+    // Install CPU-exception handlers (vectors 0..=19, skipping 15 which is
+    // reserved) so faults are reported instead of triple-faulting through empty
+    // gates. DPL=0 interrupt gates.
+    const GATE_INT64_DPL0: u8 = 0x8E;
+    macro_rules! set_fault {
+        ($vec:literal, $sym:ident) => {{
+            extern "C" {
+                fn $sym();
+            }
+            IDT[$vec].set_handler(
+                $sym as *const () as u64,
+                cs,
+                GATE_INT64_DPL0,
+                crate::arch::gdt::FAULT_IST_INDEX,
+            );
+        }};
+    }
+    set_fault!(0, cibos_fault_0);
+    set_fault!(1, cibos_fault_1);
+    set_fault!(2, cibos_fault_2);
+    set_fault!(3, cibos_fault_3);
+    set_fault!(4, cibos_fault_4);
+    set_fault!(5, cibos_fault_5);
+    set_fault!(6, cibos_fault_6);
+    set_fault!(7, cibos_fault_7);
+    set_fault!(8, cibos_fault_8);
+    set_fault!(9, cibos_fault_9);
+    set_fault!(10, cibos_fault_10);
+    set_fault!(11, cibos_fault_11);
+    set_fault!(12, cibos_fault_12);
+    set_fault!(13, cibos_fault_13);
+    set_fault!(14, cibos_fault_14);
+    set_fault!(16, cibos_fault_16);
+    set_fault!(17, cibos_fault_17);
+    set_fault!(18, cibos_fault_18);
+    set_fault!(19, cibos_fault_19);
+
+    let handler = syscall_trap_entry as *const () as u64;
+    IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3, 0);
 
     let ptr = IdtPointer {
         limit: (size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
     };
     asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+}
+
+/// Reporter called by the assembly fault stub: print the vector and faulting
+/// RIP, then the stub halts. `#[no_mangle]` so the asm can `call` it.
+#[no_mangle]
+pub extern "C" fn cibos_fault_report(vector: u64, error_code: u64, rip: u64) {
+    use core::fmt::Write;
+    let mut console = crate::boot::Console;
+    let _ = writeln!(
+        console,
+        "CIBOS kernel: [FAULT] vector {vector} err={error_code:#x} at RIP {rip:#x} — halting"
+    );
 }
 
 extern "C" {

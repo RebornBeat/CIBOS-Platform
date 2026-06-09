@@ -16,6 +16,8 @@ extern crate alloc;
 mod arch;
 #[cfg(target_os = "none")]
 mod boot;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod loader;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

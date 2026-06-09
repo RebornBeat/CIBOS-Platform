@@ -61,10 +61,32 @@ impl PageTableEncoder for X86PageTable {
 ///
 /// `root` must point at a valid, fully-populated PML4 that maps at least all
 /// memory the kernel is currently executing from and its stack; otherwise the
-/// next instruction fetch faults. The NX bit must be enabled in EFER (it is,
-/// under the bootloader/long-mode setup) for the leaf NX bits to take effect.
+/// next instruction fetch faults. For leaf NX bits to be honored rather than
+/// faulting as reserved bits, [`enable_nxe`] must have been called first.
 pub unsafe fn install(root: PhysFrame) {
     asm!("mov cr3, {}", in(reg) root.addr(), options(nostack, preserves_flags));
+}
+
+/// Enable EFER.NXE (no-execute enable, bit 11) so the NX bit (bit 63) in
+/// page-table entries is honored. Until this is set, NX is a *reserved* bit and
+/// any entry with it set faults the page walk; the bootloader enables LME but
+/// not NXE, so the kernel must do this before installing tables that use NX
+/// (the W^X user/stack pages depend on it).
+///
+/// # Safety
+///
+/// Modifies the EFER MSR; call once during single-threaded bring-up before
+/// installing page tables that set NX.
+pub unsafe fn enable_nxe() {
+    const IA32_EFER: u32 = 0xC000_0080;
+    const NXE: u64 = 1 << 11;
+    let (mut lo, hi): (u32, u32);
+    asm!("rdmsr", in("ecx") IA32_EFER, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    let efer = (u64::from(hi) << 32) | u64::from(lo);
+    let efer = efer | NXE;
+    lo = efer as u32;
+    let hi = (efer >> 32) as u32;
+    asm!("wrmsr", in("ecx") IA32_EFER, in("eax") lo, in("edx") hi, options(nomem, nostack, preserves_flags));
 }
 
 /// Read the currently active page-table root from `CR3` (its physical address).
