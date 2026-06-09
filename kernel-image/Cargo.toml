@@ -20,6 +20,12 @@ cibos-kernel = { workspace = true }
 cibos-input = { workspace = true }
 linked_list_allocator = { version = "0.10", default-features = false }
 
+[build-dependencies]
+# Used by build.rs to wrap the sample app's flat binary into a .capp image via
+# the same AppImageBuilder the device parses, so the embedded image can never
+# drift from the format. std feature: build scripts run on the host.
+shared = { workspace = true, features = ["std"] }
+
 [features]
 # Default build targets REAL HARDWARE: the image expects CIBIOS to pass a real
 # handoff pointer in the first-argument register (the bare-metal boot pair).

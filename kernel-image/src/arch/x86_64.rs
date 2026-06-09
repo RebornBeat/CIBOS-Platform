@@ -81,17 +81,46 @@ pub fn remap_pic() {
     }
 }
 
-/// Unmask the keyboard line (IRQ1) on the master PIC, leaving all other lines
-/// masked. Call after [`remap_pic`] and after the IDT has a handler at vector
-/// `0x21`. Also unmasks the cascade line (IRQ2) so a future slave-PIC line can
-/// reach the CPU; the keyboard itself is on the master.
-pub fn enable_keyboard_irq() {
-    const PIC1_DATA: u16 = 0x21;
-    // Mask = 1 means disabled. Clear bit 1 (IRQ1, keyboard) and bit 2 (cascade).
-    // 0b1111_1001 = 0xF9.
-    // SAFETY: PIC data-port write during bring-up.
+/// Unmask a single IRQ line on the 8259 PIC pair (read-modify-write of the
+/// interrupt mask register). `line` 0..=7 is on the master (port 0x21), 8..=15
+/// on the slave (port 0xA1). Call after [`remap_pic`] and after the IDT has a
+/// handler for the corresponding vector (`0x20 + line`). A masked bit is 1, so
+/// unmasking clears the bit.
+pub fn unmask_irq(line: u8) {
+    // SAFETY: PIC data-port read/modify/write during bring-up.
     unsafe {
-        outb(PIC1_DATA, 0xF9);
+        if line < 8 {
+            let cur = inb(0x21);
+            outb(0x21, cur & !(1u8 << line));
+        } else {
+            let cur = inb(0xA1);
+            outb(0xA1, cur & !(1u8 << (line - 8)));
+        }
+    }
+}
+
+/// Program PIT channel 0 (the system timer) as a periodic rate generator at
+/// `hz` ticks per second, so IRQ0 fires `hz` times a second. After
+/// [`remap_pic`], IRQ0 is delivered to vector `0x20`; the caller must install a
+/// handler there and `unmask_irq(0)` to receive ticks.
+///
+/// The PIT input clock is ~1.193182 MHz; the 16-bit divisor is
+/// `1193182 / hz` (clamped to the representable range). Mode 2 (rate generator)
+/// gives an even periodic tick suitable for a scheduler/timeout source.
+pub fn init_pit(hz: u32) {
+    const PIT_CH0: u16 = 0x40;
+    const PIT_CMD: u16 = 0x43;
+    const PIT_INPUT_HZ: u32 = 1_193_182;
+    // Command: channel 0, access lo/hi byte, mode 2 (rate generator), binary.
+    const CMD_CH0_MODE2: u8 = 0b0011_0100;
+
+    let hz = hz.clamp(19, PIT_INPUT_HZ); // <19 Hz overflows the 16-bit divisor
+    let divisor = (PIT_INPUT_HZ / hz) as u16;
+    // SAFETY: standard PIT programming on fixed I/O ports during bring-up.
+    unsafe {
+        outb(PIT_CMD, CMD_CH0_MODE2);
+        outb(PIT_CH0, (divisor & 0xFF) as u8); // low byte
+        outb(PIT_CH0, (divisor >> 8) as u8); // high byte
     }
 }
 

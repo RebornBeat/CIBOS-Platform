@@ -63,7 +63,7 @@ pub unsafe fn return_to_kernel(code: i64) -> ! {
 /// must `exit` (which the kernel handles) or run forever.
 ///
 /// This diverging entry suits a task that never returns to the kernel (e.g. a
-/// top-level init that owns the machine). [`run_user_payload_returning`] is the
+/// top-level init that owns the machine). [`run_app_image`] is the
 /// variant used by the current demo and the basis for the process model, where
 /// `exit` unwinds back to the kernel. Kept as a documented alternative.
 ///
@@ -249,59 +249,33 @@ pub unsafe fn map_user_stack(
     Ok((stack_base + pages * FRAME_SIZE) & !0xF)
 }
 
-/// Like [`run_user_payload`], but returns the user's exit code when the payload
-/// calls `exit` (instead of diverging). Uses the kernel-context save/restore
-/// entry so control comes back to the kernel — the basis for a real process
-/// model where `exit` returns to the scheduler.
+/// Load a parsed application image into `space`, map a user stack, install the
+/// space, and enter ring 3 at the image's entry point. Returns the user's exit
+/// code when it calls `exit`.
+///
+/// This is the external-image counterpart to [`run_user_payload`]: the
+/// program comes from a `.capp` (its segments and entry are described by the
+/// image) rather than a single embedded code blob, so each segment lands with
+/// its own permissions. The user stack is mapped at [`USER_STACK_VIRT`].
 ///
 /// # Safety
 ///
-/// As [`run_user_payload`]. Additionally, only one `enter_user_context` may be
-/// live at a time (the saved context is a single static), which holds for the
-/// current single-task bring-up.
-pub unsafe fn run_user_payload_returning(
+/// As [`load_app_image`]. Only one `enter_user_context` may be live at a time
+/// (the kernel-context save/restore is a single slot).
+pub unsafe fn run_app_image(
     space: &AddressSpace,
     frames: &FrameAllocator,
-    code: &[u8],
+    image: &shared::AppImage,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) -> Result<i64, &'static str> {
-    if code.len() as u64 > FRAME_SIZE {
-        return Err("user payload exceeds one page");
-    }
-
-    let code_frame = frames.allocate().map_err(|_| "no frame for user code")?;
-    let code_ptr = phys_to_ptr(code_frame.addr());
-    core::ptr::write_bytes(code_ptr, 0, FRAME_SIZE as usize);
-    core::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
-    space
-        .map::<X86PageTable>(
-            USER_CODE_VIRT,
-            code_frame,
-            Permissions::user_rx(),
-            frames,
-            phys_to_ptr,
-        )
-        .map_err(|_| "map user code failed")?;
-
-    let stack_frame = frames.allocate().map_err(|_| "no frame for user stack")?;
-    let stack_ptr = phys_to_ptr(stack_frame.addr());
-    core::ptr::write_bytes(stack_ptr, 0, FRAME_SIZE as usize);
-    space
-        .map::<X86PageTable>(
-            USER_STACK_VIRT,
-            stack_frame,
-            Permissions::user_rw(),
-            frames,
-            phys_to_ptr,
-        )
-        .map_err(|_| "map user stack failed")?;
+    let entry = load_app_image(space, frames, image, phys_to_ptr)?;
+    // One page of user stack, mapped just below the conventional stack address.
+    let stack_top = map_user_stack(space, frames, USER_STACK_VIRT, 1, phys_to_ptr)?;
 
     crate::arch::paging::install(space.root());
-    let user_stack_top = (USER_STACK_VIRT + FRAME_SIZE) & !0xF;
-
     let code = enter_user_context(
-        USER_CODE_VIRT,
-        user_stack_top,
+        entry,
+        stack_top,
         gdt::USER_CODE as u64,
         gdt::USER_DATA as u64,
     );

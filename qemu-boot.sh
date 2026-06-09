@@ -38,18 +38,22 @@ timeout "$((SECS + 6))" qemu-system-x86_64 \
   -display none -serial stdio -no-reboot \
   -monitor "unix:$WORK/mon.sock,server,nowait" > "$WORK/serial.txt" 2>"$WORK/err.txt" &
 QP=$!
-# If a key was requested, inject it during the kernel's keyboard-poll window
-# (a few seconds into boot) to exercise the IRQ1 -> scancode -> queue path.
+# If a key was requested, inject it repeatedly across a window that overlaps the
+# kernel's keyboard wait. That wait happens after boot + the timer self-check
+# (several seconds in), so we inject steadily from ~4s through ~10s to be robust
+# to boot-timing variance. The keyboard IRQ enqueues each press; the kernel's
+# bounded wait catches it.
 if [ -n "$KEY" ]; then
-  sleep 5
-  if [ -S "$WORK/mon.sock" ]; then
-    printf 'sendkey %s\n' "$KEY" \
-      | timeout 3 socat - "UNIX-CONNECT:$WORK/mon.sock" >/dev/null 2>&1 || true
-  fi
-  sleep "$((SECS > 5 ? SECS - 5 : 1))"
-else
-  sleep "$SECS"
+  ( sleep 4
+    for _ in $(seq 1 24); do
+      if [ -S "$WORK/mon.sock" ]; then
+        printf 'sendkey %s\n' "$KEY" \
+          | timeout 2 socat - "UNIX-CONNECT:$WORK/mon.sock" >/dev/null 2>&1 || true
+      fi
+      sleep 0.3
+    done ) &
 fi
+sleep "$SECS"
 if [ -S "$WORK/mon.sock" ]; then
   printf 'pmemsave 0xB8000 4000 "%s/vga.bin"\n' "$WORK" \
     | timeout 5 socat - "UNIX-CONNECT:$WORK/mon.sock" >/dev/null 2>&1 || true

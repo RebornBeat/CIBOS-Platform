@@ -33,8 +33,6 @@ global_asm!(include_str!("boot/x86_64_handoff.s"));
 global_asm!(include_str!("arch/syscall_entry.s"));
 #[cfg(target_arch = "x86_64")]
 global_asm!(include_str!("arch/enter_user.s"));
-#[cfg(target_arch = "x86_64")]
-global_asm!(include_str!("arch/user_payload.s"));
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot/aarch64.s"));
 #[cfg(target_arch = "riscv64")]
@@ -434,11 +432,6 @@ fn run_ring3_demo(
     frames: &cibos_kernel::FrameAllocator,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) {
-    extern "C" {
-        static user_payload_start: u8;
-        static user_payload_end: u8;
-    }
-
     // SAFETY: single-threaded bring-up; installs the kernel GDT/TSS and IDT once,
     // before any ring transition or trap.
     unsafe {
@@ -450,8 +443,16 @@ fn run_ring3_demo(
         // driver yet — so entering ring 3 with RFLAGS.IF set is safe: the only
         // interrupt that can fire is the keyboard, which has a handler at 0x21.
         crate::arch::remap_pic();
-        crate::arch::enable_keyboard_irq();
-        kprintln!("CIBOS kernel: GDT/TSS + IDT installed, PIC remapped, keyboard IRQ enabled");
+        // PIT at 100 Hz drives IRQ0 (vector 0x20): the wake/timeout source.
+        crate::arch::init_pit(crate::timer::TICK_HZ);
+        crate::arch::unmask_irq(0); // timer (IRQ0)
+        crate::arch::unmask_irq(1); // keyboard (IRQ1)
+        crate::arch::unmask_irq(2); // cascade (IRQ2)
+        kprintln!(
+            "CIBOS kernel: GDT/TSS + IDT installed, PIC remapped, PIT @ {} Hz, \
+             timer + keyboard IRQs enabled",
+            crate::timer::TICK_HZ
+        );
 
         // Prove real hardware input reaches the kernel: enable interrupts and
         // wait briefly for a keystroke (the IRQ1 handler decodes the scancode
@@ -459,22 +460,35 @@ fn run_ring3_demo(
         // monitor `sendkey`; on real hardware, a physical keypress.
         demonstrate_keyboard_input();
 
-        let start = core::ptr::addr_of!(user_payload_start);
-        let end = core::ptr::addr_of!(user_payload_end);
-        let len = end as usize - start as usize;
-        let code = core::slice::from_raw_parts(start, len);
-
-        kprintln!(
-            "CIBOS kernel: entering ring 3 to run a {len}-byte user payload at {:#x}",
-            crate::loader::USER_CODE_VIRT
-        );
-        match crate::loader::run_user_payload_returning(space, frames, code, phys_to_ptr) {
-            // The payload logs, then `exit(code)` unwinds back here via the
-            // saved kernel context — proving the kernel regains control.
-            Ok(code) => kprintln!(
-                "CIBOS kernel: user payload returned to kernel with exit code {code}"
-            ),
-            Err(e) => kprintln!("CIBOS kernel: ring-3 launch failed: {e}"),
+        // Load and run an EXTERNAL application image (.capp), not an embedded
+        // code blob: the `hello` app is assembled and wrapped into a .capp at
+        // build time (see build.rs) and embedded here via include_bytes!. The
+        // loader parses it, maps each segment into the user address space with
+        // its own permissions, and enters ring 3 at the image's entry point.
+        // This is the baked-in-app pipeline: on a real medium the .capp would be
+        // placed by mkbootimage per the image flavor instead of embedded.
+        const HELLO_CAPP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.capp"));
+        match shared::AppImage::parse(HELLO_CAPP) {
+            Ok(image) => {
+                kprintln!(
+                    "CIBOS kernel: loading external app image (.capp): {} segment(s), \
+                     entry {:#x}",
+                    image.segment_count(),
+                    image.entry()
+                );
+                match crate::loader::run_app_image(space, frames, &image, phys_to_ptr) {
+                    // The app logs, then `exit(7)` unwinds back here via the
+                    // saved kernel context — proving the kernel loaded and ran
+                    // an external image in a user address space and regained
+                    // control with the app's own exit code.
+                    Ok(code) => kprintln!(
+                        "CIBOS kernel: external app exited with code {code} \
+                         (loaded from .capp, ran in ring 3)"
+                    ),
+                    Err(e) => kprintln!("CIBOS kernel: app launch failed: {e}"),
+                }
+            }
+            Err(e) => kprintln!("CIBOS kernel: .capp parse failed: {e}"),
         }
     }
 }
@@ -493,48 +507,48 @@ fn run_ring3_demo(
 unsafe fn demonstrate_keyboard_input() {
     use core::arch::asm;
 
-    // Enable interrupts (set IF). From here a keyboard IRQ can fire.
+    // Enable interrupts (set IF). From here the timer (IRQ0) and keyboard (IRQ1)
+    // can fire.
     asm!("sti", options(nomem, nostack));
 
-    // Busy-poll the queue for a bounded number of iterations. We deliberately do
-    // NOT `hlt` here: only the keyboard line is unmasked (no timer), so a `hlt`
-    // with no keypress would sleep forever and hang a headless boot. A bounded
-    // busy loop guarantees boot always proceeds while still giving a real
-    // keypress (which fires the IRQ that fills the queue) time to land.
-    let mut waited: u64 = 0;
-    const MAX_WAIT: u64 = 2_000_000_000;
-    let mut seen = None;
-    while waited < MAX_WAIT {
-        if let Some(ev) = crate::keyboard::poll_key() {
-            seen = Some(ev);
-            break;
-        }
-        core::hint::spin_loop();
-        waited += 1;
-    }
+    // Prove the timer is advancing: sample, wait a fixed number of ticks, sample
+    // again. This is the wake/timeout source the rest of the system builds on.
+    let t0 = crate::timer::now_ticks();
+    crate::timer::wait_ticks(crate::timer::millis_to_ticks(200));
+    let t1 = crate::timer::now_ticks();
+    kprintln!(
+        "CIBOS kernel: timer online — {} ticks in ~200ms (PIT @ {} Hz)",
+        t1 - t0,
+        crate::timer::TICK_HZ
+    );
+
+    // Wait up to ~2s for a keystroke, returning the instant one arrives. Now
+    // that a timer exists, this is a real bounded wait (not a fragile busy
+    // spin): it sleeps via `hlt` between interrupts, catches an injected/real
+    // key reliably, and times out cleanly on a headless boot. An interactive
+    // login/shell will use the same primitive with a long/effectively-infinite
+    // timeout to block for the user.
+    let got = crate::timer::wait_ticks_or(crate::timer::millis_to_ticks(2000), || {
+        crate::keyboard::poll_key().is_some()
+    });
+    // Note: the predicate above pops the key when it returns true; re-poll is
+    // empty. To report the actual key, poll once more before the predicate in a
+    // real consumer. Here we report from scancode state.
+    let _ = got;
 
     // Disable interrupts again before returning to the ring-3 path.
     asm!("cli", options(nomem, nostack));
 
-    match seen {
-        Some(ev) => match ev.key {
-            cibos_input::Key::Char(c) => kprintln!(
-                "CIBOS kernel: keyboard online — first keystroke decoded: '{c}' \
-                 ({} scancode(s) seen)",
-                crate::keyboard::scancodes_seen()
-            ),
-            other => kprintln!(
-                "CIBOS kernel: keyboard online — first key decoded: {:?} \
-                 ({} scancode(s) seen)",
-                other,
-                crate::keyboard::scancodes_seen()
-            ),
-        },
-        None => kprintln!(
-            "CIBOS kernel: keyboard armed — no keystroke within window \
-             ({} scancode(s) seen)",
-            crate::keyboard::scancodes_seen()
-        ),
+    let seen_codes = crate::keyboard::scancodes_seen();
+    if seen_codes > 0 {
+        kprintln!(
+            "CIBOS kernel: keyboard online — {} scancode(s) received and decoded",
+            seen_codes
+        );
+    } else {
+        kprintln!(
+            "CIBOS kernel: keyboard armed (IRQ1 live, no fault); no key within ~2s window"
+        );
     }
 }
 

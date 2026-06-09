@@ -20,6 +20,8 @@ mod boot;
 mod loader;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod keyboard;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod timer;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

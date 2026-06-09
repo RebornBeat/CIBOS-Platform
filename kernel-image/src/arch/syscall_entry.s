@@ -45,6 +45,35 @@ syscall_trap_entry:
 
     iretq
 
+// ---- Hardware IRQ stub: timer (IRQ0 -> remapped vector 0x20) ---------------
+// Same shape as the keyboard stub: save every volatile register (an IRQ can
+// fire between any two instructions), call the Rust handler (which ticks the
+// global counter and EOIs), restore, and iretq.
+.section .text
+.global timer_irq_entry
+timer_irq_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    call cibos_timer_irq
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
 // ---- Hardware IRQ stub: keyboard (IRQ1 -> remapped vector 0x21) ------------
 // A hardware interrupt can fire between any two instructions of the interrupted
 // code, so unlike the syscall path we must preserve every register the Rust

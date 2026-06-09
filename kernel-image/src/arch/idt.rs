@@ -121,6 +121,14 @@ pub unsafe fn init() {
     let handler = syscall_trap_entry as *const () as u64;
     IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3, 0);
 
+    // Timer IRQ: the PIT (channel 0) fires IRQ0, remapped to vector 0x20. DPL=0
+    // interrupt gate, legacy rsp0 stack.
+    extern "C" {
+        fn timer_irq_entry();
+    }
+    const VECTOR_TIMER: usize = 0x20;
+    IDT[VECTOR_TIMER].set_handler(timer_irq_entry as *const () as u64, cs, GATE_INT64_DPL0, 0);
+
     // Keyboard IRQ: the PIC is remapped so IRQ1 arrives at vector 0x21. A DPL=0
     // interrupt gate (ring 3 cannot invoke it directly; only the hardware line
     // does). The handler runs on the current stack via the legacy rsp0 path.

@@ -19,7 +19,7 @@ mod x86_64;
 pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    enable_keyboard_irq, halt, init_serial, pic_eoi, putc, read_keyboard_data, remap_pic,
+    halt, init_pit, init_serial, pic_eoi, putc, read_keyboard_data, remap_pic, unmask_irq,
 };
 
 #[cfg(target_arch = "aarch64")]
