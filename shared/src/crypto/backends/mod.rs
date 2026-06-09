@@ -15,6 +15,9 @@
 #[cfg(feature = "pqc-sphincs")]
 pub mod sphincs;
 
+#[cfg(feature = "pqc-sphincs-portable")]
+pub mod sphincs_portable;
+
 #[cfg(feature = "pqc-mldsa")]
 pub mod mldsa;
 

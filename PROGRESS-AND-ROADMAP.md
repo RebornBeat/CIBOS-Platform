@@ -131,25 +131,59 @@ alignment review plus this session's progress.
      refuses). See `SECURITY-NOTES.md`.
 
 2. **MMU / hardware-enforced isolation** *(the core HIP premise)*
-   - Today: isolation is **accounting only** — the kernel tracks ownership and
-     resource use, but there are no page tables, no `cr3`/`satp`/`ttbr`
-     programming. "Container A cannot read Container B" is not yet physically
-     enforced.
-   - Needed: per-container page tables / address spaces, set up by CIBIOS before
-     CIBOS runs and maintained by the kernel; the boundary model from HIP made
-     real in hardware. (Review item T1.)
+   - **Mechanism DONE and runtime-verified.** Built three layers:
+     `cibos-kernel/src/frame.rs` (portable bitmap physical frame allocator, 6
+     tests), `cibos-kernel/src/paging.rs` (portable 4-level page-table model with
+     a `PageTableEncoder` trait the arch supplies; 7 tests including
+     `two_spaces_are_independent` — the core isolation property), and
+     `kernel-image/src/arch/paging.rs` (x86_64 entry encoder + `CR3` install).
+   - The booted kernel now builds its own page tables through this model and the
+     x86_64 encoder, identity-maps physical RAM, and **switches `CR3` to its own
+     tables, continuing to execute** — runtime proof in QEMU that the portable
+     model produces valid hardware tables (`MMU online — running on kernel-built
+     page tables`). aarch64/riscv64 build with a no-op bring-up (arch encoder
+     pending; the portable model is shared).
+   - **Remaining for full isolation:** *(per-container address spaces now DONE
+     and runtime-verified.)* `cibos-kernel/src/address_space.rs` provides an
+     `AddressSpaceManager` giving each `BoundaryId` its own `AddressSpace` /
+     page-table tree, with create/map/translate/destroy and data-frame
+     reclamation on teardown (5 host tests, including `boundaries_are_isolated`).
+     At boot the kernel builds two distinct boundaries on the live MMU and
+     confirms a page mapped in boundary 1 is **physically absent** from boundary
+     2 (`container isolation verified — … separate page tables`). So
+     "Container A cannot read Container B" is now hardware-enforced per boundary.
+   - **Still to do here:** wire `AddressSpaceManager` into the `Kernel` struct so
+     container create/destroy in `ContainerRegistry` automatically create/destroy
+     the matching address space (today the manager is exercised in the boot
+     demonstration and fully unit-tested, but not yet a held `Kernel` field);
+     reclaim page-table-node frames on teardown (data frames already reclaimed);
+     and add an aarch64 `PageTableEncoder` (TTBR0/long-format descriptors) to
+     bring the same enforcement to ARM (the portable manager is already shared).
 
 3. **Application loader on the booted kernel** *(currently nothing runs as an app)*
-   - Today: the booted kernel runs an internal init lane and idles; there is a
-     host-simulation SDK but no on-kernel app execution.
-   - Needed: load/start a real application image inside an isolated container on
-     the booted kernel; the bridge from the SDK model to actual on-kernel
-     processes. (Review item, "on-kernel execution" / Phase 3.)
+   - **Syscall transport DONE and runtime-verified** (the kernel⇄app boundary
+     mechanism). New `shared/src/protocols/syscall.rs` (the ABI: numbers,
+     register convention, error codes; 2 tests), `cibos-kernel/src/syscall.rs`
+     (portable dispatcher over a `SyscallEnv`; 7 tests — `Log`/`Exit`/`Yield`/
+     `Now`, with user-pointer bounds checking), `kernel-image/src/arch/idt.rs` +
+     `arch/syscall_entry.s` (x86_64 IDT + `int 0x80` trap stub). At boot the
+     kernel installs the IDT and issues a `log` syscall through the trap gate;
+     the handler prints the user buffer and returns 0 (`syscall transport
+     verified — log() trap returned 0`). So trap → save → dispatch → service →
+     return → resume works on real hardware.
+   - **Still to do for a loaded app:** (a) load an application image into a
+     container's `AddressSpace` (map its code/data/stack pages with user perms);
+     (b) ring-3 user/supervisor separation — a TSS, ring-3 GDT selectors, and
+     `iretq` into user code — so the app runs unprivileged and its traps carry
+     its real `BoundaryId` (the dispatcher already takes the boundary and
+     translates user pointers; `copy_from_user` will go through
+     `AddressSpaceManager` instead of the identity read used in the bring-up
+     demo); (c) grow the ABI to marshal the rest of the SDK `System` surface
+     (channels, spawn, sleep) as the transport carries more.
 
-4. **Syscall transport** *(kernel⇄app boundary)*
-   - Needed: the real syscall/trap mechanism connecting applications to the
-     kernel core (the channel/lane/IPC vocabulary exists as types; the actual
-     trap transport on hardware does not).
+4. **Syscall transport** *(kernel⇄app boundary)* — **mechanism DONE** (see item
+   3). Remaining is breadth: more syscall numbers as `System` operations move
+   onto the transport, and the ring-3 privilege transition.
 
 5. **Documented behavioral flags — implement (declared but inert)**
    - The profile bundles exist and select flags, but most flags gate no behavior

@@ -40,6 +40,12 @@ std = []
 # SPHINCS+ is hash-based — the "old math" choice for the trust anchor.
 pqc-sphincs = ["dep:pqcrypto-sphincsplus", "dep:pqcrypto-traits"]
 
+# Pure-Rust, no_std, verification-only SPHINCS+ (sphincs-sha2-128f-simple).
+# Depends only on `sha2` (already present), so it compiles into the bare-metal
+# firmware where `pqc-sphincs` (which needs libc via pqcrypto-internals) cannot.
+# Byte-compatible with `pqc-sphincs`; used by the Standard firmware profile.
+pqc-sphincs-portable = []
+
 # Post-quantum key encapsulation for channel/IPC confidentiality (ML-KEM / Kyber).
 pqc-mlkem = ["dep:pqcrypto-mlkem", "dep:pqcrypto-traits"]
 

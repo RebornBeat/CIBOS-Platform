@@ -9,3 +9,4 @@ pub mod authentication;
 pub mod boot;
 pub mod handoff;
 pub mod ipc;
+pub mod syscall;

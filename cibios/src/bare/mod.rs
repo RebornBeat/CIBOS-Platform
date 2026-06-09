@@ -126,15 +126,33 @@ fn run() {
     match arch::locate_image() {
         Some(image) => {
             kprintln!("CIBOS image found ({} bytes); booting", image.len());
-            // Lightweight firmware needs no trusted key; Standard would pass the
-            // compiled-in SPHINCS+ root here.
-            boot_image(image, &detect, &[]);
+            // Standard firmware verifies the image against the compiled-in
+            // SPHINCS+ root public key; Lightweight needs no key.
+            boot_image(image, &detect, trusted_root_key());
             kprintln!("[FATAL] boot_image returned; halting");
         }
         None => {
             kprintln!("no CIBOS image source for this target; CIBIOS idle");
         }
     }
+}
+
+/// The SPHINCS+ root public key the Standard firmware verifies images against.
+///
+/// Compiled into the firmware image from `keys/trusted_root.pub` so the trust
+/// anchor travels with the firmware and cannot be supplied at runtime. The
+/// Lightweight firmware does not verify signatures and uses an empty key.
+#[cfg(feature = "handoff-cryptographic")]
+fn trusted_root_key() -> &'static [u8] {
+    // 32-byte SPHINCS+ (sphincs-sha2-128f-simple) public key.
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../keys/trusted_root.pub"))
+}
+
+/// Lightweight firmware performs no signature verification, so there is no
+/// trusted key to supply.
+#[cfg(not(feature = "handoff-cryptographic"))]
+fn trusted_root_key() -> &'static [u8] {
+    &[]
 }
 
 /// Verify a CIBOS image, place its components, build the handoff, and transfer

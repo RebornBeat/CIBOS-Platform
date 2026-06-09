@@ -39,7 +39,37 @@ implementation.
 
 `keys/*.key` are secret keys — never commit them. Regenerate with `keygen`.
 
-## Known limitation: SPHINCS+ does not yet run *in the firmware*
+## In-firmware verification — RESOLVED (portable no_std verifier)
+
+The Standard-profile signature check now runs **in the bare-metal firmware**. A
+pure-Rust, `no_std`, verification-only SPHINCS+ implementation
+(`shared/src/crypto/backends/sphincs_portable.rs`, feature
+`pqc-sphincs-portable`) was ported faithfully from the PQClean `clean` reference
+for `sphincs-sha2-128f-simple`. It depends only on `sha2` (already a `no_std`
+dependency), so it compiles on `*-unknown-none` where the libc-bound
+`pqcrypto-sphincsplus` could not.
+
+* **Byte-compatible** with the host signer: a cross-implementation test signs
+  with `pqcrypto` and verifies with the portable code (`cargo test -p shared
+  --features "std,pqc-sphincs,pqc-sphincs-portable"`), and the firmware's own
+  `standard_verifies_real_sphincs_signature` test does the same end to end.
+* **`handoff-cryptographic`** now pulls `shared/pqc-sphincs-portable` (not
+  `pqc-sphincs`), so Standard firmware links bare on x86_64/aarch64/riscv64.
+* The firmware embeds the trusted root public key at build time
+  (`include_bytes!("../keys/trusted_root.pub")`) and verifies the CIBOS image
+  against it before handoff.
+* **Runtime-verified in QEMU:** the `balanced` and `maximum-isolation` signed
+  images boot with `firmware profile: Standard` and `image verified (signature
+  checked)`, reaching `CIBOS kernel: boot complete`. A tampered signed image is
+  **rejected** at boot (`image verification failed`), so the security property
+  holds on emulated hardware.
+
+The host signer (`pqcrypto`, `pqc-sphincs`) remains the build-time tooling that
+produces signatures; only verification needed to move into the firmware, and it
+has. `mkimage sign` now also accepts a profile-stamp argument so signed images
+carry the correct operational profile.
+
+## (Historical) Known limitation: SPHINCS+ did not run in the firmware
 
 The Standard-profile signature check is fully functional in host tooling and
 host tests (`cargo test -p cibios --features test-crypto`), but it cannot yet be

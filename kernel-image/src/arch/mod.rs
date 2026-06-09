@@ -10,7 +10,11 @@
 #[cfg(target_arch = "x86_64")]
 mod vga;
 #[cfg(target_arch = "x86_64")]
+pub mod idt;
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
+#[cfg(target_arch = "x86_64")]
+pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{halt, init_serial, putc};
 

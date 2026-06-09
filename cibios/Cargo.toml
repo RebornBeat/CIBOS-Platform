@@ -55,7 +55,7 @@ std = ["shared/std"]
 # NOTE: the pqcrypto backend is host-only (it requires libc), so this feature is
 # exercised in host tests and tooling, not yet in the bare firmware. A bare-metal
 # signed boot needs a no_std PQC verifier; see SECURITY-NOTES.md.
-handoff-cryptographic = ["shared/pqc-sphincs"]
+handoff-cryptographic = ["shared/pqc-sphincs-portable"]
 
 # Lightweight firmware: physical-trust handoff, no signature verification. This
 # is the explicit selector for the Lightweight profile; it carries no code of its
@@ -82,4 +82,7 @@ profile-lightweight = ["handoff-lightweight"]
 
 # Convenience for host tests that exercise the cryptographic path: std + the
 # signer side of SPHINCS+ (so tests can produce a signed image to verify).
-test-crypto = ["std", "handoff-cryptographic"]
+# Convenience for host tests that exercise the cryptographic path: std + the
+# Standard handoff (portable verifier) + the host SPHINCS+ signer (pqc-sphincs)
+# so tests can both sign (host-only) and verify (portable) an image.
+test-crypto = ["std", "handoff-cryptographic", "shared/pqc-sphincs"]

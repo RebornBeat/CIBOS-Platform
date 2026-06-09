@@ -104,12 +104,12 @@ fn verify_signature(
     view: &ImageView<'_>,
     trusted_root_key: &[u8],
 ) -> Result<(), FirmwareError> {
-    use shared::crypto::backends::sphincs::SphincsPlusVerifier;
+    use shared::crypto::backends::sphincs_portable::SphincsPlusPortableVerifier;
     use shared::{SharedError, SignatureVerifier};
 
     let signed = view.signed_region()?;
     let signature = view.signature()?;
-    SphincsPlusVerifier::verify(trusted_root_key, signed, signature)
+    SphincsPlusPortableVerifier::verify(trusted_root_key, signed, signature)
         .map_err(|e| FirmwareError::from(SharedError::from(e)))
 }
 

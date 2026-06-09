@@ -28,6 +28,12 @@ pub enum KernelError {
         /// The resource whose limit was hit.
         resource: &'static str,
     },
+    /// An operation was attempted against an invalid or inconsistent state
+    /// (e.g. mapping an already-mapped page, or an unaligned address).
+    InvalidState {
+        /// What was wrong.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for KernelError {
@@ -40,6 +46,9 @@ impl fmt::Display for KernelError {
             KernelError::UnknownChannel => write!(f, "unknown channel"),
             KernelError::LimitExceeded { resource } => {
                 write!(f, "resource limit exceeded: {resource}")
+            }
+            KernelError::InvalidState { reason } => {
+                write!(f, "invalid state: {reason}")
             }
         }
     }

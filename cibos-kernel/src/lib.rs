@@ -27,23 +27,31 @@
 
 extern crate alloc;
 
+pub mod address_space;
 pub mod channel;
 pub mod container;
 pub mod entropy;
 pub mod error;
+pub mod frame;
 pub mod kernel;
 pub mod memory;
+pub mod paging;
 pub mod scheduler;
+pub mod syscall;
 pub mod selector;
 pub mod sync;
 
+pub use address_space::AddressSpaceManager;
 pub use channel::{Channel, ChannelRegistry, RecvStep, SendStep};
 pub use container::ContainerRegistry;
 pub use error::{KernelError, KernelResult};
+pub use frame::{FrameAllocator, PhysFrame, FRAME_SIZE};
 pub use kernel::Kernel;
 pub use memory::MemoryManager;
+pub use paging::{AddressSpace, PageTableEncoder, Permissions};
 pub use scheduler::Scheduler;
 pub use selector::{select, WeightedLane};
+pub use syscall::{dispatch as dispatch_syscall, SyscallEnv, SyscallOutcome, SyscallRequest};
 
 /// The operational profile this kernel binary was *compiled* for, as selected by
 /// exactly one `profile-*` feature bundle, or `None` when built without one

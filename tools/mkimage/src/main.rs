@@ -165,8 +165,8 @@ fn cmd_keygen(args: &[String]) -> ExitCode {
 }
 
 fn cmd_sign(args: &[String]) -> ExitCode {
-    if args.len() != 8 {
-        eprintln!("sign: expected <arch> <entry_hex> <load_hex> <kernel.bin> <key_file> <out.cimg>");
+    if args.len() != 8 && args.len() != 9 {
+        eprintln!("sign: expected <arch> <entry_hex> <load_hex> <kernel.bin> <key_file> <out.cimg> [profile]");
         return ExitCode::FAILURE;
     }
     let Some(arch) = arch_from_str(&args[2]) else {
@@ -192,11 +192,27 @@ fn cmd_sign(args: &[String]) -> ExitCode {
         }
     };
 
+    // Profile to stamp into the image header. Defaults to Balanced; the
+    // profile-aware caller passes it explicitly so the image, the handoff the
+    // firmware derives, and the kernel's compiled profile all agree (the kernel
+    // halts on a mismatch). The profile arg is the 8th positional (index 8),
+    // after the output path, mirroring `build`.
+    let profile = match args.get(8) {
+        Some(p) => match profile_from_str(p) {
+            Some(pr) => pr,
+            None => {
+                eprintln!("sign: unknown profile {p}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => CibosProfile::Balanced,
+    };
+
     // Reserve the SPHINCS+ signature length in the header, build the signed
     // region, sign exactly those bytes, then append the detached signature.
     let params = ImageParams {
         architecture: arch.as_u32(),
-        cibos_profile: CibosProfile::Balanced as u32,
+        cibos_profile: profile as u32,
         entry_point: entry,
         load_base: load,
         signature_algorithm: SignatureAlgorithm::SphincsPlus.as_u32(),

@@ -55,20 +55,27 @@ case "$PROFILE" in
   *) echo "unknown profile: $PROFILE"; exit 1 ;;
 esac
 
-# Operational -> firmware feature mapping, and whether a bare image is buildable.
+# Operational -> firmware feature mapping. All four profiles now produce a
+# complete bare image: the portable (no_std) SPHINCS+ verifier lets Standard
+# firmware link bare, so maximum-isolation/balanced (signed) work too.
+#   SIGNED=1 means the CIBOS image must be signed with the dev key and the
+#   firmware embeds the trusted root public key to verify it at boot.
 case "$PROFILE" in
-  compute)     FW_FEATURES="firmware-bootloader,profile-lightweight";             BARE=1 ;;
-  performance) FW_FEATURES="firmware-bootloader,profile-lightweight,smt-enabled"; BARE=1 ;;
-  maximum-isolation|balanced) FW_FEATURES="firmware-bootloader,std,profile-standard"; BARE=0 ;;
+  compute)           FW_FEATURES="firmware-bootloader,profile-lightweight";             SIGNED=0 ;;
+  performance)       FW_FEATURES="firmware-bootloader,profile-lightweight,smt-enabled"; SIGNED=0 ;;
+  balanced)          FW_FEATURES="firmware-bootloader,profile-standard";            SIGNED=1 ;;
+  maximum-isolation) FW_FEATURES="firmware-bootloader,profile-standard";            SIGNED=1 ;;
 esac
 
-if [ "$BARE" = "0" ]; then
-  echo "ERROR: profile '$PROFILE' requires Standard (signed) firmware, which does"
-  echo "       not link bare yet (the no_std SPHINCS+ verifier is pending; see"
-  echo "       SECURITY-NOTES.md). A flashable bare .img for this profile is not"
-  echo "       available until then. Use 'compute' or 'performance' for a bare"
-  echo "       image now, or build-profile.sh for the host-verified Standard path."
-  exit 2
+# Standard profiles need a signing keypair. Generate a dev keypair on demand if
+# one is not already present (the public half is embedded into the firmware at
+# build time via keys/trusted_root.pub).
+if [ "$SIGNED" = "1" ]; then
+  if [ ! -f "$HERE/keys/trusted_root.pub" ] || [ ! -f "$HERE/keys/dev_signing.key" ]; then
+    echo "== generating dev signing keypair (keys/) =="
+    mkdir -p "$HERE/keys"
+    cargo run -q -p mkimage -- keygen "$HERE/keys/trusted_root.pub" "$HERE/keys/dev_signing.key"
+  fi
 fi
 
 LLVM_OC=$(find "$(rustc --print sysroot)" -name llvm-objcopy | head -1)
@@ -116,11 +123,20 @@ for a in $ARCHES; do
   echo "== $PROFILE / $a : CIBOS kernel image =="
   # Build the kernel image stamped with the operational profile, objcopy to a
   # flat binary, and wrap into a .cimg via the firmware's own image builder.
+  # Standard profiles SIGN the image with the dev key; Lightweight build it
+  # unsigned. The profile stamp must match the kernel's compiled profile (the
+  # kernel halts on a mismatch).
   cargo build -p kernel-image --no-default-features --features "profile-$PROFILE" --target "$T"
   KBIN="target/$T/debug/cibos-kernel"
   "$LLVM_OC" -O binary "$KBIN" "$HERE/images/kernel-$PROFILE-$a.bin"
-  cargo run -q -p mkimage -- build "$MKARCH" "$KE" "$KE" \
-    "$HERE/images/kernel-$PROFILE-$a.bin" "$HERE/images/cibos-$PROFILE-$a.cimg" "$PROFILE"
+  if [ "$SIGNED" = "1" ]; then
+    cargo run -q -p mkimage -- sign "$MKARCH" "$KE" "$KE" \
+      "$HERE/images/kernel-$PROFILE-$a.bin" "$HERE/keys/dev_signing.key" \
+      "$HERE/images/cibos-$PROFILE-$a.cimg" "$PROFILE"
+  else
+    cargo run -q -p mkimage -- build "$MKARCH" "$KE" "$KE" \
+      "$HERE/images/kernel-$PROFILE-$a.bin" "$HERE/images/cibos-$PROFILE-$a.cimg" "$PROFILE"
+  fi
 
   echo "== $PROFILE / $a : CIBIOS firmware (firmware-bootloader) =="
   cargo build -p cibios --no-default-features --features "$FW_FEATURES" --target "$T"
