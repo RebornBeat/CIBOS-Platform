@@ -509,7 +509,7 @@ fn demonstrate_storage() {
     use cibos_kernel::block::{BlockDevice, BLOCK_SIZE};
 
     // SAFETY: single-threaded bring-up; probes the fixed primary-bus ATA ports.
-    let disk = unsafe { crate::arch::ata::AtaDisk::probe() };
+    let disk = unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Master) };
     let Some(disk) = disk else {
         kprintln!("CIBOS kernel: storage — no ATA disk on the primary bus (skipping)");
         return;
@@ -578,6 +578,47 @@ fn demonstrate_storage() {
                 );
             }
             Err(e) => kprintln!("CIBOS kernel: storage self-test failed: {:?}", e),
+        }
+    }
+
+    // Optional on-disk filesystem demo (feature `storage-selftest`). Operates on
+    // the primary SLAVE — a second, dedicated data disk — so the boot medium is
+    // never formatted. Proves CIBOSFS over the real ATA driver: format, create a
+    // directory + file, read it back, then remount and confirm it persisted.
+    #[cfg(feature = "storage-selftest")]
+    {
+        use cibos_kernel::fs::Fs;
+        // SAFETY: single-threaded bring-up; probes the primary slave.
+        match unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Slave) } {
+            Some(data) => {
+                kprintln!(
+                    "CIBOS kernel: data disk (slave) online — {} sectors",
+                    data.sectors()
+                );
+                let r = (|| -> Result<(), cibos_kernel::fs::FsError> {
+                    let mut fs = Fs::format(data, 64)?;
+                    fs.mkdir(b"/etc")?;
+                    fs.write_file(b"/etc/hello", b"CIBOSFS persisted this")?;
+                    let read = fs.read_file(b"/etc/hello")?;
+                    let ok_live = read == b"CIBOSFS persisted this";
+                    // Remount and re-read to prove it is on the medium, not RAM.
+                    let dev = fs.into_device();
+                    let fs2 = Fs::mount(dev)?;
+                    let read2 = fs2.read_file(b"/etc/hello")?;
+                    let ok_persist = read2 == b"CIBOSFS persisted this";
+                    kprintln!(
+                        "CIBOS kernel: CIBOSFS — wrote /etc/hello, read-back {}, \
+                         remount-persist {}",
+                        if ok_live { "OK" } else { "FAIL" },
+                        if ok_persist { "OK" } else { "FAIL" }
+                    );
+                    Ok(())
+                })();
+                if let Err(e) = r {
+                    kprintln!("CIBOS kernel: CIBOSFS demo failed: {:?}", e);
+                }
+            }
+            None => kprintln!("CIBOS kernel: no data disk on the primary slave (skipping FS demo)"),
         }
     }
 }

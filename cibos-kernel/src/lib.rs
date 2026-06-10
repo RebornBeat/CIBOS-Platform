@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod address_space;
 pub mod block;
 pub mod channel;
+pub mod fs;
 pub mod container;
 pub mod entropy;
 pub mod error;

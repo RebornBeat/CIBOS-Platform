@@ -41,31 +41,53 @@ const CMD_WRITE_SECTORS: u8 = 0x30;
 const CMD_CACHE_FLUSH: u8 = 0xE7;
 const CMD_IDENTIFY: u8 = 0xEC;
 
-// Drive-select base for LBA mode, master device (bit 6 = LBA, bits 7/5 set per
-// the legacy spec): 0xE0 | (lba >> 24).
+// Drive-select base for LBA mode (bit 6 = LBA, bits 7/5 set per the legacy
+// spec); bit 4 selects master (0) vs slave (1): master 0xE0, slave 0xF0.
 const DRIVE_LBA_MASTER: u8 = 0xE0;
+const DRIVE_LBA_SLAVE: u8 = 0xF0;
+
+/// Which device on the primary ATA bus to address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Slave is used by the storage-selftest FS demo (a data disk)
+pub enum Device {
+    /// Primary master (the typical boot disk).
+    Master,
+    /// Primary slave (a second attached disk).
+    Slave,
+}
+
+impl Device {
+    fn select_base(self) -> u8 {
+        match self {
+            Device::Master => DRIVE_LBA_MASTER,
+            Device::Slave => DRIVE_LBA_SLAVE,
+        }
+    }
+}
 
 // Bounded poll iterations before declaring a timeout. Generous; each iteration
 // is a port read.
 const POLL_LIMIT: u32 = 10_000_000;
 
-/// A handle to the master device on the primary ATA bus.
+/// A handle to a device on the primary ATA bus.
 pub struct AtaDisk {
     lock: SpinLock<()>,
     sectors: u64,
+    select: u8,
 }
 
 impl AtaDisk {
-    /// Probe the primary-bus master with IDENTIFY. Returns a disk handle and its
-    /// sector count, or `None` if no ATA device responds (e.g. the boot medium
-    /// is presented through a non-IDE controller).
+    /// Probe `device` on the primary bus with IDENTIFY. Returns a disk handle
+    /// and its sector count, or `None` if no ATA device responds there.
     ///
     /// # Safety
     ///
-    /// Touches fixed ATA I/O ports; call once during single-threaded bring-up.
-    pub unsafe fn probe() -> Option<AtaDisk> {
-        // Select master, LBA mode, and issue IDENTIFY with LBA/count zeroed.
-        outb(DRIVE, DRIVE_LBA_MASTER);
+    /// Touches fixed ATA I/O ports; call once per device during single-threaded
+    /// bring-up.
+    pub unsafe fn probe(device: Device) -> Option<AtaDisk> {
+        let select = device.select_base();
+        // Select the device, LBA mode, and issue IDENTIFY with LBA/count zeroed.
+        outb(DRIVE, select);
         io_wait();
         outb(SECCOUNT, 0);
         outb(LBA_LO, 0);
@@ -107,6 +129,7 @@ impl AtaDisk {
         Some(AtaDisk {
             lock: SpinLock::new(()),
             sectors,
+            select,
         })
     }
 
@@ -123,7 +146,7 @@ impl AtaDisk {
     ///
     /// Caller holds the bus lock.
     unsafe fn setup(&self, lba: u64, count: u8) {
-        outb(DRIVE, DRIVE_LBA_MASTER | (((lba >> 24) & 0x0F) as u8));
+        outb(DRIVE, self.select | (((lba >> 24) & 0x0F) as u8));
         outb(FEATURES, 0);
         outb(SECCOUNT, count);
         outb(LBA_LO, (lba & 0xFF) as u8);
