@@ -164,6 +164,12 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // exercising the full user/kernel boundary on real hardware.
             bring_up_mmu(&handoff);
 
+            // Bring up real block storage: probe the primary ATA bus and read
+            // back the boot medium to prove block I/O works against actual
+            // hardware (the disk we booted from).
+            #[cfg(target_arch = "x86_64")]
+            demonstrate_storage();
+
             kprintln!("CIBOS kernel: boot complete");
         }
         Err(_) => {
@@ -489,6 +495,89 @@ fn run_ring3_demo(
                 }
             }
             Err(e) => kprintln!("CIBOS kernel: .capp parse failed: {e}"),
+        }
+    }
+}
+
+/// Probe the primary ATA bus and read back the boot medium to prove real block
+/// I/O. Reads LBA 0 (the MBR — must end in the 0x55AA boot signature) and LBA 1
+/// (the Boot Layout Descriptor — must carry the `CIBOSBL1` magic the image tool
+/// wrote). Reading the genuine on-disk structures we booted from, through the
+/// ATA driver, is the end-to-end storage proof.
+#[cfg(target_arch = "x86_64")]
+fn demonstrate_storage() {
+    use cibos_kernel::block::{BlockDevice, BLOCK_SIZE};
+
+    // SAFETY: single-threaded bring-up; probes the fixed primary-bus ATA ports.
+    let disk = unsafe { crate::arch::ata::AtaDisk::probe() };
+    let Some(disk) = disk else {
+        kprintln!("CIBOS kernel: storage — no ATA disk on the primary bus (skipping)");
+        return;
+    };
+    kprintln!(
+        "CIBOS kernel: ATA disk online — {} sectors ({} MiB)",
+        disk.sectors(),
+        disk.sectors() * BLOCK_SIZE as u64 / (1024 * 1024)
+    );
+
+    let mut sector = [0u8; BLOCK_SIZE];
+
+    // LBA 0: the MBR. Last two bytes must be the 0x55, 0xAA boot signature.
+    match disk.read_blocks(0, 1, &mut sector) {
+        Ok(()) => {
+            let sig_ok = sector[510] == 0x55 && sector[511] == 0xAA;
+            kprintln!(
+                "CIBOS kernel: read LBA 0 (MBR) — boot signature {}",
+                if sig_ok { "OK (0x55AA)" } else { "MISSING" }
+            );
+        }
+        Err(e) => kprintln!("CIBOS kernel: LBA 0 read failed: {:?}", e),
+    }
+
+    // LBA 1: the Boot Layout Descriptor. First eight bytes are the BLD magic.
+    match disk.read_blocks(1, 1, &mut sector) {
+        Ok(()) => {
+            let magic = u64::from_le_bytes(sector[0..8].try_into().unwrap());
+            let ok = magic == shared::BLD_MAGIC;
+            kprintln!(
+                "CIBOS kernel: read LBA 1 (descriptor) — magic {}",
+                if ok { "OK (CIBOSBL1)" } else { "mismatch" }
+            );
+        }
+        Err(e) => kprintln!("CIBOS kernel: LBA 1 read failed: {:?}", e),
+    }
+
+    // Optional write-path verification (feature `storage-selftest`). Targets the
+    // disk's LAST sector and is non-destructive: it saves the current contents,
+    // writes a known pattern, reads it back to confirm the round-trip, then
+    // restores the original bytes. This proves write_blocks against real
+    // hardware without altering any meaningful data.
+    #[cfg(feature = "storage-selftest")]
+    {
+        let last = disk.block_count() - 1;
+        let mut saved = [0u8; BLOCK_SIZE];
+        let mut pattern = [0u8; BLOCK_SIZE];
+        let mut readback = [0u8; BLOCK_SIZE];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        let r = disk
+            .read_blocks(last, 1, &mut saved)
+            .and_then(|()| disk.write_blocks(last, 1, &pattern))
+            .and_then(|()| disk.read_blocks(last, 1, &mut readback));
+        match r {
+            Ok(()) => {
+                let matched = readback == pattern;
+                // Restore the original contents regardless of the comparison.
+                let restored = disk.write_blocks(last, 1, &saved).is_ok();
+                kprintln!(
+                    "CIBOS kernel: storage self-test — wrote+read LBA {} : {} (restore {})",
+                    last,
+                    if matched { "round-trip OK" } else { "MISMATCH" },
+                    if restored { "OK" } else { "FAILED" }
+                );
+            }
+            Err(e) => kprintln!("CIBOS kernel: storage self-test failed: {:?}", e),
         }
     }
 }

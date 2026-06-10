@@ -126,7 +126,7 @@ for a in $ARCHES; do
   # Standard profiles SIGN the image with the dev key; Lightweight build it
   # unsigned. The profile stamp must match the kernel's compiled profile (the
   # kernel halts on a mismatch).
-  cargo build -p kernel-image --no-default-features --features "profile-$PROFILE" --target "$T"
+  cargo build -p kernel-image --no-default-features --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}" --target "$T"
   KBIN="target/$T/debug/cibos-kernel"
   "$LLVM_OC" -O binary "$KBIN" "$HERE/images/kernel-$PROFILE-$a.bin"
   if [ "$SIGNED" = "1" ]; then

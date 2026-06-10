@@ -37,6 +37,13 @@ shared = { workspace = true, features = ["std"] }
 default = []
 self-boot = []
 
+# Storage self-test (off by default). When enabled, the boot-time storage
+# demonstration additionally performs a NON-DESTRUCTIVE write/read round-trip on
+# the disk's last sector (save -> write pattern -> read back -> restore) to
+# verify the ATA write path. Default boots stay read-only — a shipping OS does
+# not scribble on the disk every boot — so this is opt-in for validation.
+storage-selftest = []
+
 # Operational profile bundles: forward to the kernel library's bundle so the
 # bootable image is built as exactly one profile (ADR-007). The build wrapper
 # pairs each with the matching CIBIOS firmware build. Orthogonal to `self-boot`.

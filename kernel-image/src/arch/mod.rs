@@ -14,12 +14,15 @@ pub mod gdt;
 #[cfg(target_arch = "x86_64")]
 pub mod idt;
 #[cfg(target_arch = "x86_64")]
+pub mod ata;
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    halt, init_pit, init_serial, pic_eoi, putc, read_keyboard_data, remap_pic, unmask_irq,
+    halt, inb_port, init_pit, init_serial, inw, outb_port, outw, pic_eoi, putc, read_keyboard_data,
+    remap_pic, unmask_irq,
 };
 
 #[cfg(target_arch = "aarch64")]

@@ -14,6 +14,46 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Write a 16-bit word to a port (the ATA data register is 16-bit).
+///
+/// # Safety
+///
+/// `port` must be a valid I/O port for a word write.
+pub unsafe fn outw(port: u16, val: u16) {
+    asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack, preserves_flags));
+}
+
+/// Read a 16-bit word from a port (the ATA data register is 16-bit).
+///
+/// # Safety
+///
+/// `port` must be a valid I/O port for a word read.
+pub unsafe fn inw(port: u16) -> u16 {
+    let val: u16;
+    asm!("in ax, dx", out("ax") val, in("dx") port, options(nomem, nostack, preserves_flags));
+    val
+}
+
+/// Write a byte to an I/O port. Exposed for drivers (e.g. ATA) outside this
+/// module.
+///
+/// # Safety
+///
+/// `port` must be a valid I/O port for a byte write.
+pub unsafe fn outb_port(port: u16, val: u8) {
+    outb(port, val);
+}
+
+/// Read a byte from an I/O port. Exposed for drivers (e.g. ATA) outside this
+/// module.
+///
+/// # Safety
+///
+/// `port` must be a valid I/O port for a byte read.
+pub unsafe fn inb_port(port: u16) -> u8 {
+    inb(port)
+}
+
 /// Initialize COM1 to 38400 8N1, then clear and home the VGA text console.
 /// Named `init_serial` for the stable arch interface; on x86 it brings up both
 /// the serial line and the on-screen VGA text console so a booted kernel is
