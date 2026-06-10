@@ -14,11 +14,18 @@
 //! address space's memory stays in one audited place and every access is
 //! bounds-checked against that boundary's mappings.
 
-use shared::protocols::syscall::{Syscall, SyscallError};
+use shared::protocols::syscall::{FsRwArgs, Syscall, SyscallError, FS_RW_ARGS_LEN};
 use shared::BoundaryId;
 
 /// Maximum bytes a single `log` may emit, to bound kernel work per call.
 pub const MAX_LOG_LEN: usize = 4096;
+
+/// Maximum path length the filesystem syscalls accept, to bound kernel work.
+pub const MAX_PATH_LEN: usize = 1024;
+
+/// Maximum bytes a single `fs_read`/`fs_write` may transfer, to bound kernel
+/// buffering per call.
+pub const MAX_FS_IO_LEN: usize = 64 * 1024;
 
 /// A decoded syscall request: the number and up to three argument words, plus
 /// the boundary that issued it.
@@ -67,6 +74,39 @@ pub trait SyscallEnv {
 
     /// Monotonic nanoseconds since boot (for `now`).
     fn now_nanos(&self) -> u64;
+
+    /// Copy `bytes` into the user buffer at virtual address `ptr` (in
+    /// `boundary`'s space). Returns `Err(BadAddress)` if the range is not fully
+    /// mapped and writable in that boundary.
+    fn copy_to_user(
+        &self,
+        boundary: BoundaryId,
+        ptr: u64,
+        bytes: &[u8],
+    ) -> Result<(), SyscallError>;
+
+    /// Read the whole file at `path` into a kernel buffer. `Ok(None)` if the
+    /// path does not exist; `Err` for other failures. The default rejects all
+    /// access (a kernel without a mounted filesystem); the real environment
+    /// overrides these four.
+    fn fs_read(&self, _path: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Create/overwrite the file at `path` with `data`. `Ok(())` on success.
+    fn fs_write(&self, _path: &[u8], _data: &[u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Create a directory at `path`.
+    fn fs_mkdir(&self, _path: &[u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Whether `path` exists.
+    fn fs_exists(&self, _path: &[u8]) -> Result<bool, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
 }
 
 /// Handle one syscall request against `env`, returning the outcome.
@@ -104,6 +144,107 @@ pub fn dispatch<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome 
             let ns = env.now_nanos();
             SyscallOutcome::Return((ns & (i64::MAX as u64)) as i64)
         }
+        Syscall::FsRead => fs_read(req, env),
+        Syscall::FsWrite => fs_write(req, env),
+        Syscall::FsMkdir => {
+            match read_path(req.boundary, req.arg0, req.arg1 as usize, env) {
+                Ok(path) => match env.fs_mkdir(&path) {
+                    Ok(()) => SyscallOutcome::Return(0),
+                    Err(e) => SyscallOutcome::Return(e.as_return()),
+                },
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::FsExists => {
+            match read_path(req.boundary, req.arg0, req.arg1 as usize, env) {
+                Ok(path) => match env.fs_exists(&path) {
+                    Ok(true) => SyscallOutcome::Return(1),
+                    Ok(false) => SyscallOutcome::Return(0),
+                    Err(e) => SyscallOutcome::Return(e.as_return()),
+                },
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+    }
+}
+
+/// Copy a bounded path from user memory into a kernel `Vec`.
+fn read_path<E: SyscallEnv>(
+    boundary: BoundaryId,
+    ptr: u64,
+    len: usize,
+    env: &E,
+) -> Result<alloc::vec::Vec<u8>, SyscallError> {
+    if len == 0 || len > MAX_PATH_LEN {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let mut buf = alloc::vec![0u8; len];
+    env.copy_from_user(boundary, ptr, len, &mut buf)?;
+    Ok(buf)
+}
+
+/// Decode the `FsRwArgs` block from user memory at `ptr`.
+fn read_rw_args<E: SyscallEnv>(
+    boundary: BoundaryId,
+    ptr: u64,
+    env: &E,
+) -> Result<FsRwArgs, SyscallError> {
+    let mut raw = [0u8; FS_RW_ARGS_LEN];
+    env.copy_from_user(boundary, ptr, FS_RW_ARGS_LEN, &mut raw)?;
+    Ok(FsRwArgs::from_bytes(&raw))
+}
+
+/// `fs_read`: read the file named by the path in the arg block into the user
+/// buffer in the arg block; return bytes read or a negative error.
+fn fs_read<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let args = match read_rw_args(req.boundary, req.arg0, env) {
+        Ok(a) => a,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    if args.buf_len as usize > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    let path = match read_path(req.boundary, args.path_ptr, args.path_len as usize, env) {
+        Ok(p) => p,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    let data = match env.fs_read(&path) {
+        Ok(Some(d)) => d,
+        Ok(None) => return SyscallOutcome::Return(SyscallError::NotFound.as_return()),
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    // Copy up to buf_len bytes back to the user; return the count.
+    let n = core::cmp::min(data.len(), args.buf_len as usize);
+    if let Err(e) = env.copy_to_user(req.boundary, args.buf_ptr, &data[..n]) {
+        return SyscallOutcome::Return(e.as_return());
+    }
+    SyscallOutcome::Return(n as i64)
+}
+
+/// `fs_write`: create/overwrite the file named by the path in the arg block with
+/// the data buffer in the arg block; return bytes written or a negative error.
+fn fs_write<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let args = match read_rw_args(req.boundary, req.arg0, env) {
+        Ok(a) => a,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    let dlen = args.buf_len as usize;
+    if dlen > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    let path = match read_path(req.boundary, args.path_ptr, args.path_len as usize, env) {
+        Ok(p) => p,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    let mut data = alloc::vec![0u8; dlen];
+    if dlen > 0 {
+        if let Err(e) = env.copy_from_user(req.boundary, args.buf_ptr, dlen, &mut data) {
+            return SyscallOutcome::Return(e.as_return());
+        }
+    }
+    match env.fs_write(&path, &data) {
+        Ok(()) => SyscallOutcome::Return(dlen as i64),
+        Err(e) => SyscallOutcome::Return(e.as_return()),
     }
 }
 
@@ -115,9 +256,12 @@ mod tests {
     struct MockEnv {
         // A single mapped region [base, base+data.len()) in the test boundary.
         base: u64,
-        data: alloc::vec::Vec<u8>,
+        data: RefCell<alloc::vec::Vec<u8>>,
         written: RefCell<alloc::vec::Vec<u8>>,
         clock: u64,
+        // A tiny in-memory filesystem: path -> contents; dirs tracked as a set.
+        files: RefCell<alloc::collections::BTreeMap<alloc::vec::Vec<u8>, alloc::vec::Vec<u8>>>,
+        dirs: RefCell<alloc::collections::BTreeSet<alloc::vec::Vec<u8>>>,
     }
 
     impl SyscallEnv for MockEnv {
@@ -128,14 +272,15 @@ mod tests {
             len: usize,
             out: &mut [u8],
         ) -> Result<(), SyscallError> {
+            let data = self.data.borrow();
             let start = ptr
                 .checked_sub(self.base)
                 .ok_or(SyscallError::BadAddress)? as usize;
             let end = start.checked_add(len).ok_or(SyscallError::InvalidArgument)?;
-            if end > self.data.len() {
+            if end > data.len() {
                 return Err(SyscallError::BadAddress);
             }
-            out[..len].copy_from_slice(&self.data[start..end]);
+            out[..len].copy_from_slice(&data[start..end]);
             Ok(())
         }
         fn console_write(&self, bytes: &[u8]) {
@@ -144,15 +289,55 @@ mod tests {
         fn now_nanos(&self) -> u64 {
             self.clock
         }
+        fn copy_to_user(
+            &self,
+            _boundary: BoundaryId,
+            ptr: u64,
+            bytes: &[u8],
+        ) -> Result<(), SyscallError> {
+            let mut data = self.data.borrow_mut();
+            let start = ptr
+                .checked_sub(self.base)
+                .ok_or(SyscallError::BadAddress)? as usize;
+            let end = start.checked_add(bytes.len()).ok_or(SyscallError::InvalidArgument)?;
+            if end > data.len() {
+                return Err(SyscallError::BadAddress);
+            }
+            data[start..end].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn fs_read(&self, path: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, SyscallError> {
+            Ok(self.files.borrow().get(path).cloned())
+        }
+        fn fs_write(&self, path: &[u8], data: &[u8]) -> Result<(), SyscallError> {
+            self.files.borrow_mut().insert(path.to_vec(), data.to_vec());
+            Ok(())
+        }
+        fn fs_mkdir(&self, path: &[u8]) -> Result<(), SyscallError> {
+            self.dirs.borrow_mut().insert(path.to_vec());
+            Ok(())
+        }
+        fn fs_exists(&self, path: &[u8]) -> Result<bool, SyscallError> {
+            Ok(self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path))
+        }
     }
 
     fn env_with(text: &str) -> MockEnv {
         MockEnv {
             base: 0x4000_0000,
-            data: text.as_bytes().to_vec(),
+            data: RefCell::new(text.as_bytes().to_vec()),
             written: RefCell::new(alloc::vec::Vec::new()),
             clock: 123_456_789,
+            files: RefCell::new(alloc::collections::BTreeMap::new()),
+            dirs: RefCell::new(alloc::collections::BTreeSet::new()),
         }
+    }
+
+    /// Build an env whose user memory is exactly `bytes` at `base`.
+    fn env_bytes(bytes: &[u8]) -> MockEnv {
+        let e = env_with("");
+        *e.data.borrow_mut() = bytes.to_vec();
+        e
     }
 
     fn req(number: u64, a0: u64, a1: u64) -> SyscallRequest {
@@ -224,5 +409,140 @@ mod tests {
         let env = env_with("");
         let r = req(Syscall::Now.number(), 0, 0);
         assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(123_456_789));
+    }
+
+    #[test]
+    fn fs_write_then_read_through_syscalls() {
+        // User memory layout: [path bytes][data bytes][FsRwArgs block][read buf].
+        let path = b"/etc/passwd";
+        let data = b"alice:hash";
+        let base = 0x4000_0000u64;
+        let path_off = 0usize;
+        let data_off = path.len();
+        let args_off = data_off + data.len();
+        let readbuf_off = args_off + FS_RW_ARGS_LEN;
+        let readbuf_len = 32usize;
+
+        let write_args = FsRwArgs {
+            path_ptr: base + path_off as u64,
+            path_len: path.len() as u64,
+            buf_ptr: base + data_off as u64,
+            buf_len: data.len() as u64,
+        };
+
+        let mut mem = alloc::vec::Vec::new();
+        mem.extend_from_slice(path);
+        mem.extend_from_slice(data);
+        mem.extend_from_slice(&write_args.to_bytes());
+        mem.extend_from_slice(&[0u8; 32]); // read buffer space
+        let env = env_bytes(&mem);
+
+        // fs_write(args_ptr)
+        let wr = SyscallRequest {
+            number: Syscall::FsWrite.number(),
+            arg0: base + args_off as u64,
+            arg1: 0,
+            arg2: 0,
+            boundary: BoundaryId::new(1),
+        };
+        assert_eq!(dispatch(&wr, &env), SyscallOutcome::Return(data.len() as i64));
+        assert_eq!(env.files.borrow().get(&path.to_vec()).unwrap(), data);
+
+        // fs_read(args_ptr) into the read buffer; reuse an args block pointing at
+        // the read buffer.
+        let read_args = FsRwArgs {
+            path_ptr: base + path_off as u64,
+            path_len: path.len() as u64,
+            buf_ptr: base + readbuf_off as u64,
+            buf_len: readbuf_len as u64,
+        };
+        // Overwrite the args block in user memory with the read args.
+        env.data.borrow_mut()[args_off..args_off + FS_RW_ARGS_LEN]
+            .copy_from_slice(&read_args.to_bytes());
+        let rr = SyscallRequest {
+            number: Syscall::FsRead.number(),
+            arg0: base + args_off as u64,
+            arg1: 0,
+            arg2: 0,
+            boundary: BoundaryId::new(1),
+        };
+        assert_eq!(dispatch(&rr, &env), SyscallOutcome::Return(data.len() as i64));
+        // The data landed in the read buffer.
+        let got = &env.data.borrow()[readbuf_off..readbuf_off + data.len()];
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn fs_read_missing_is_not_found() {
+        // Layout: [path at 0][args block at 64][read buf at 96].
+        let path = b"/nope";
+        let base = 0x4000_0000u64;
+        let args = FsRwArgs {
+            path_ptr: base,
+            path_len: path.len() as u64,
+            buf_ptr: base + 96,
+            buf_len: 16,
+        };
+        let mut mem = alloc::vec::Vec::new();
+        mem.extend_from_slice(path);
+        mem.resize(64, 0);
+        mem.extend_from_slice(&args.to_bytes()); // 64..96
+        mem.resize(96 + 16, 0); // read buffer
+        let env = env_bytes(&mem);
+        let r = SyscallRequest {
+            number: Syscall::FsRead.number(),
+            arg0: base + 64,
+            arg1: 0,
+            arg2: 0,
+            boundary: BoundaryId::new(1),
+        };
+        assert_eq!(
+            dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::NotFound.as_return())
+        );
+    }
+
+    #[test]
+    fn fs_mkdir_and_exists() {
+        let path = b"/home";
+        let base = 0x4000_0000u64;
+        let env = env_bytes(path);
+        let mk = req(Syscall::FsMkdir.number(), base, path.len() as u64);
+        assert_eq!(dispatch(&mk, &env), SyscallOutcome::Return(0));
+        let ex = req(Syscall::FsExists.number(), base, path.len() as u64);
+        assert_eq!(dispatch(&ex, &env), SyscallOutcome::Return(1));
+        // A different path does not exist.
+        let env2 = env_bytes(b"/other");
+        let ex2 = req(Syscall::FsExists.number(), base, 6);
+        assert_eq!(dispatch(&ex2, &env2), SyscallOutcome::Return(0));
+    }
+
+    #[test]
+    fn fs_default_env_denies() {
+        // The default trait methods reject access (kernel with no filesystem).
+        struct Bare {
+            base: u64,
+            data: alloc::vec::Vec<u8>,
+        }
+        impl SyscallEnv for Bare {
+            fn copy_from_user(&self, _b: BoundaryId, ptr: u64, len: usize, out: &mut [u8]) -> Result<(), SyscallError> {
+                let s = ptr.checked_sub(self.base).ok_or(SyscallError::BadAddress)? as usize;
+                let e = s.checked_add(len).ok_or(SyscallError::InvalidArgument)?;
+                if e > self.data.len() { return Err(SyscallError::BadAddress); }
+                out[..len].copy_from_slice(&self.data[s..e]);
+                Ok(())
+            }
+            fn console_write(&self, _b: &[u8]) {}
+            fn now_nanos(&self) -> u64 { 0 }
+            fn copy_to_user(&self, _b: BoundaryId, _p: u64, _by: &[u8]) -> Result<(), SyscallError> {
+                Ok(())
+            }
+        }
+        let env = Bare { base: 0x4000_0000, data: b"/x".to_vec() };
+        let r = req(Syscall::FsExists.number(), 0x4000_0000, 2);
+        assert_eq!(
+            dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
+        );
     }
 }

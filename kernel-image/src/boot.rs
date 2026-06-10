@@ -499,6 +499,51 @@ fn run_ring3_demo(
     }
 }
 
+/// Exercise the filesystem through the actual syscall ABI: build an `FsRwArgs`
+/// block plus path/data buffers in kernel memory, issue `FsWrite` then `FsRead`
+/// via `handle_syscall`, and confirm the round-trip. This proves the whole path
+/// — trap dispatcher → `SyscallEnv` → mounted CIBOSFS → ATA disk — not just the
+/// filesystem in isolation. (In this step the "user" pointers are kernel-mapped,
+/// as with the existing log/exit transport; ring-3 boundaries will translate
+/// through their address space with no ABI change.)
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+fn demonstrate_fs_syscalls() {
+    use shared::protocols::syscall::{FsRwArgs, Syscall};
+
+    let path = b"/etc/via_syscall";
+    let data = b"written through the syscall ABI";
+    let mut readbuf = [0u8; 64];
+
+    // Write via the FsWrite syscall.
+    let wargs = FsRwArgs {
+        path_ptr: path.as_ptr() as u64,
+        path_len: path.len() as u64,
+        buf_ptr: data.as_ptr() as u64,
+        buf_len: data.len() as u64,
+    };
+    let wbytes = wargs.to_bytes();
+    let wret = handle_syscall(Syscall::FsWrite.number(), wbytes.as_ptr() as u64, 0, 0);
+
+    // Read it back via the FsRead syscall into readbuf.
+    let rargs = FsRwArgs {
+        path_ptr: path.as_ptr() as u64,
+        path_len: path.len() as u64,
+        buf_ptr: readbuf.as_mut_ptr() as u64,
+        buf_len: readbuf.len() as u64,
+    };
+    let rbytes = rargs.to_bytes();
+    let rret = handle_syscall(Syscall::FsRead.number(), rbytes.as_ptr() as u64, 0, 0);
+
+    let ok = wret == data.len() as i64
+        && rret == data.len() as i64
+        && &readbuf[..data.len()] == data;
+    kprintln!(
+        "CIBOS kernel: fs syscalls — FsWrite returned {wret}, FsRead returned {rret}, \
+         round-trip {}",
+        if ok { "OK" } else { "FAIL" }
+    );
+}
+
 /// Probe the primary ATA bus and read back the boot medium to prove real block
 /// I/O. Reads LBA 0 (the MBR — must end in the 0x55AA boot signature) and LBA 1
 /// (the Boot Layout Descriptor — must carry the `CIBOSBL1` magic the image tool
@@ -612,10 +657,15 @@ fn demonstrate_storage() {
                         if ok_live { "OK" } else { "FAIL" },
                         if ok_persist { "OK" } else { "FAIL" }
                     );
+                    // Install as the kernel's root filesystem so the filesystem
+                    // SYSCALLS operate on it, then exercise the full ABI path.
+                    *ROOT_FS.lock() = Some(fs2);
                     Ok(())
                 })();
                 if let Err(e) = r {
                     kprintln!("CIBOS kernel: CIBOSFS demo failed: {:?}", e);
+                } else {
+                    demonstrate_fs_syscalls();
                 }
             }
             None => kprintln!("CIBOS kernel: no data disk on the primary slave (skipping FS demo)"),
@@ -703,6 +753,26 @@ fn bring_up_mmu(_handoff: &HandoffData) {
 #[cfg(target_arch = "x86_64")]
 struct KernelSyscallEnv;
 
+/// The kernel's optionally-mounted root filesystem (CIBOSFS over the ATA data
+/// disk). When mounted, the filesystem syscalls operate on it; when absent they
+/// report `NotPermitted`. Guarded by a spinlock so the trap path and any setup
+/// code do not race.
+#[cfg(target_arch = "x86_64")]
+static ROOT_FS: cibos_kernel::sync::SpinLock<
+    Option<cibos_kernel::fs::Fs<crate::arch::ata::AtaDisk>>,
+> = cibos_kernel::sync::SpinLock::new(None);
+
+/// Map a filesystem error onto the syscall ABI error set.
+#[cfg(target_arch = "x86_64")]
+fn fs_err(e: cibos_kernel::fs::FsError) -> shared::protocols::syscall::SyscallError {
+    use cibos_kernel::fs::FsError;
+    use shared::protocols::syscall::SyscallError;
+    match e {
+        FsError::NotFound => SyscallError::NotFound,
+        _ => SyscallError::IoError,
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
     fn copy_from_user(
@@ -738,6 +808,80 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
         // A real monotonic clock is wired with the timer subsystem; for now the
         // syscall reports zero rather than a fabricated value.
         0
+    }
+
+    fn copy_to_user(
+        &self,
+        _boundary: shared::BoundaryId,
+        ptr: u64,
+        bytes: &[u8],
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        if ptr == 0 {
+            return Err(SyscallError::BadAddress);
+        }
+        if ptr.checked_add(bytes.len() as u64).is_none() {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // SAFETY: symmetric to copy_from_user — in this step the caller is
+        // supervisor code and `ptr` is a kernel-mapped address in the active
+        // identity map; the length is bounded by the dispatcher before we get
+        // here. Once apps run in ring 3 this will translate through the calling
+        // boundary's address space.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        }
+        Ok(())
+    }
+
+    // The filesystem syscall methods route to the kernel's mounted root
+    // filesystem (ROOT_FS). When nothing is mounted they fall through to the
+    // trait defaults (NotPermitted).
+    fn fs_read(
+        &self,
+        path: &[u8],
+    ) -> Result<Option<alloc::vec::Vec<u8>>, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_ref() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        match fs.read_file(path) {
+            Ok(data) => Ok(Some(data)),
+            Err(cibos_kernel::fs::FsError::NotFound) => Ok(None),
+            Err(e) => Err(fs_err(e)),
+        }
+    }
+
+    fn fs_write(
+        &self,
+        path: &[u8],
+        data: &[u8],
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_mut() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        fs.write_file(path, data).map(|_| ()).map_err(fs_err)
+    }
+
+    fn fs_mkdir(&self, path: &[u8]) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_mut() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        fs.mkdir(path).map(|_| ()).map_err(fs_err)
+    }
+
+    fn fs_exists(&self, path: &[u8]) -> Result<bool, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_ref() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        Ok(fs.exists(path))
     }
 }
 
