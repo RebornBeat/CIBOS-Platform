@@ -72,6 +72,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cibos-app"
+version = "0.1.0"
+dependencies = [
+ "shared",
+]
+
+[[package]]
 name = "cibos-async-runtime"
 version = "0.1.0"
 dependencies = [

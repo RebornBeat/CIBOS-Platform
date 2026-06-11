@@ -1,0 +1,15 @@
+[package]
+name = "cibos-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS bare application runtime — the no_std library a ring-3 .capp links against to reach the kernel via syscalls (console, filesystem, exit)"
+
+[lib]
+name = "cibos_app"
+path = "src/lib.rs"
+
+[dependencies]
+# The syscall ABI contract (numbers, FsRwArgs, errors). no_std, no alloc.
+shared = { workspace = true, default-features = false }

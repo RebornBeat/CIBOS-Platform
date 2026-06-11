@@ -256,7 +256,8 @@ pub unsafe fn map_user_stack(
 /// This is the external-image counterpart to [`run_user_payload`]: the
 /// program comes from a `.capp` (its segments and entry are described by the
 /// image) rather than a single embedded code blob, so each segment lands with
-/// its own permissions. The user stack is mapped at [`USER_STACK_VIRT`].
+/// its own permissions. The user stack is mapped within the app's own address
+/// region (derived from its entry) so distinct apps get distinct stacks.
 ///
 /// # Safety
 ///
@@ -269,8 +270,13 @@ pub unsafe fn run_app_image(
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) -> Result<i64, &'static str> {
     let entry = load_app_image(space, frames, image, phys_to_ptr)?;
-    // One page of user stack, mapped just below the conventional stack address.
-    let stack_top = map_user_stack(space, frames, USER_STACK_VIRT, 1, phys_to_ptr)?;
+    // Place the user stack at a fixed offset within this app's own address
+    // region (derived from its entry), so two apps loaded at different base
+    // addresses get distinct, non-overlapping stacks. One page below a 1 MiB
+    // boundary above the entry's 4 GiB-aligned base.
+    let app_base = entry & !0xFFFF_FFFF; // 4 GiB-align the app's region
+    let stack_base = app_base + 0x0010_0000; // +1 MiB
+    let stack_top = map_user_stack(space, frames, stack_base, 1, phys_to_ptr)?;
 
     crate::arch::paging::install(space.root());
     let code = enter_user_context(

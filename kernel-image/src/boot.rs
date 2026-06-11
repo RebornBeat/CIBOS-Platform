@@ -496,6 +496,29 @@ fn run_ring3_demo(
             }
             Err(e) => kprintln!("CIBOS kernel: .capp parse failed: {e}"),
         }
+
+        // Now load and run a second external app — written in RUST on the
+        // cibos-app runtime — proving a real Rust application (not assembly)
+        // runs in ring 3 through the same loader and syscall ABI.
+        const HELLO_RS_CAPP: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/hello-rs.capp"));
+        match shared::AppImage::parse(HELLO_RS_CAPP) {
+            Ok(image) => {
+                kprintln!(
+                    "CIBOS kernel: loading Rust app image (.capp): {} segment(s), entry {:#x}",
+                    image.segment_count(),
+                    image.entry()
+                );
+                match crate::loader::run_app_image(space, frames, &image, phys_to_ptr) {
+                    Ok(code) => kprintln!(
+                        "CIBOS kernel: Rust app exited with code {code} \
+                         (cibos-app runtime, ran in ring 3)"
+                    ),
+                    Err(e) => kprintln!("CIBOS kernel: Rust app launch failed: {e}"),
+                }
+            }
+            Err(e) => kprintln!("CIBOS kernel: Rust .capp parse failed: {e}"),
+        }
     }
 }
 
