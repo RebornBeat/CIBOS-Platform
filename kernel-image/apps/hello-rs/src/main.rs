@@ -54,5 +54,15 @@ fn main() -> u64 {
         Err(_) => console::println("  [app:hello-rs] fs::write error (no root fs mounted?)"),
     }
 
+    // Probe the input syscall (non-blocking, so a headless boot does not hang).
+    // This proves the ReadKey path works from ring 3; with a real keyboard it
+    // would return the pending key.
+    match cibos_app::input::poll_key() {
+        Some((code, _)) => {
+            console::println(&format!("  [app:hello-rs] input: a key was waiting ({code:?})"));
+        }
+        None => console::println("  [app:hello-rs] input: ReadKey ok (no key buffered)"),
+    }
+
     9
 }

@@ -20,17 +20,12 @@ use cibos_sdk::{AppHost, CibosProfile, ResourceLimits, System};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-/// A line-oriented console.
-///
-/// Not required to be `Send`/`Sync`: CLI tasks run on the single-threaded host
-/// executor and hold the console by shared reference.
-pub trait Console {
-    /// Write a line of output, followed by a newline.
-    fn write_line(&self, line: &str);
-
-    /// Read a line of input, or `None` at end of input.
-    fn read_line(&self) -> Option<String>;
-}
+/// The line-oriented console seam. Re-exported from the `cibos-console` crate so
+/// that applications written against it (and `login::run_login`) run unchanged
+/// whether the backend is the host [`StdConsole`] below or the on-kernel
+/// syscall-backed console. The host backends [`StdConsole`] and
+/// [`CaptureConsole`] implement this trait.
+pub use cibos_console::Console;
 
 /// A console backed by the host's standard input and output.
 pub struct StdConsole;

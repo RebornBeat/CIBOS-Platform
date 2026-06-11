@@ -17,6 +17,7 @@
 //! selects which algorithms physically exist.
 
 pub mod backends;
+pub mod credential;
 pub mod hash;
 pub mod kem;
 pub mod signature;

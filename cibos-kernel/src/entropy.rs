@@ -64,6 +64,13 @@ impl Csprng {
         b
     }
 
+    /// Fill `out` with stream bytes. Used by the `get_random` syscall.
+    pub fn fill_bytes(&mut self, out: &mut [u8]) {
+        for b in out.iter_mut() {
+            *b = self.next_u8();
+        }
+    }
+
     /// Produce the next `u64` of the stream (little-endian from 8 bytes).
     pub fn next_u64(&mut self) -> u64 {
         let mut bytes = [0u8; 8];

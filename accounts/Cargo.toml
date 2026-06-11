@@ -11,7 +11,17 @@ name = "accounts"
 path = "src/lib.rs"
 
 [dependencies]
-shared = { workspace = true, features = ["std", "pqc-sphincs"] }
+shared = { workspace = true, default-features = false }
 
 [dev-dependencies]
 shared = { workspace = true, features = ["std", "pqc-sphincs"] }
+
+[features]
+# Host build: link std and the std-side SPHINCS+ backend (verifier + signer +
+# keygen) for the key-device path. On by default so existing host consumers
+# (the SDK side, lockscreen, the host login flow, tests) are unchanged.
+default = ["std"]
+std = ["shared/std", "shared/pqc-sphincs"]
+# Bare-metal build: no std; the key-device path uses the no_std portable
+# SPHINCS+ verifier. The password path needs neither.
+portable-pqc = ["shared/pqc-sphincs-portable"]

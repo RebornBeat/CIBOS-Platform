@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "accounts"
+version = "0.1.0"
+dependencies = [
+ "shared",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -100,13 +107,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hello-rs"
-version = "0.1.0"
-dependencies = [
- "cibos-app",
-]
-
-[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -120,6 +120,26 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "login"
+version = "0.1.0"
+dependencies = [
+ "accounts",
+ "cibos-console",
+ "shared",
+]
+
+[[package]]
+name = "login-rs"
+version = "0.1.0"
+dependencies = [
+ "accounts",
+ "cibos-app",
+ "cibos-console",
+ "login",
+ "shared",
+]
 
 [[package]]
 name = "sha2"

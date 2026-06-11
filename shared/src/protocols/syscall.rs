@@ -68,6 +68,16 @@ pub enum Syscall {
     /// `fs_exists(path_ptr: *const u8, path_len: usize) -> 0|1`. Whether a path
     /// exists.
     FsExists = 8,
+    /// `read_key(blocking: u64) -> i64`. Read the next keyboard event. With
+    /// `blocking == 0` returns immediately ([`SyscallError::NotFound`] if the
+    /// queue is empty); with `blocking != 0` waits (via the system timer) until a
+    /// key is available. On success the event is packed into the return value by
+    /// [`encode_key`]; decode it with [`decode_key`].
+    ReadKey = 9,
+    /// `get_random(buf_ptr: *mut u8, len: usize) -> isize`. Fill `len` bytes at
+    /// `buf_ptr` with cryptographically-random bytes from the kernel CSPRNG;
+    /// returns the number of bytes written or a negative error.
+    GetRandom = 10,
 }
 
 impl Syscall {
@@ -83,6 +93,8 @@ impl Syscall {
             6 => Some(Syscall::FsWrite),
             7 => Some(Syscall::FsMkdir),
             8 => Some(Syscall::FsExists),
+            9 => Some(Syscall::ReadKey),
+            10 => Some(Syscall::GetRandom),
             _ => None,
         }
     }
@@ -117,6 +129,118 @@ pub struct FsRwArgs {
 
 /// Encoded size of [`FsRwArgs`] in bytes.
 pub const FS_RW_ARGS_LEN: usize = 32;
+
+/// A decoded keyboard event from [`Syscall::ReadKey`]. Printable keys carry a
+/// `char`; the rest are named. This mirrors the kernel's input model but lives
+/// in the ABI crate so the kernel and applications share one wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCode {
+    /// A printable character (case already resolved).
+    Char(char),
+    /// Return/Enter.
+    Enter,
+    /// Backspace.
+    Backspace,
+    /// Forward delete.
+    Delete,
+    /// Tab.
+    Tab,
+    /// Escape.
+    Escape,
+    /// Arrow / navigation keys.
+    Left,
+    /// Right arrow.
+    Right,
+    /// Up arrow.
+    Up,
+    /// Down arrow.
+    Down,
+    /// Home.
+    Home,
+    /// End.
+    End,
+}
+
+/// Modifier state accompanying a [`KeyCode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyMods {
+    /// Shift held.
+    pub shift: bool,
+    /// Control held.
+    pub ctrl: bool,
+    /// Alt held.
+    pub alt: bool,
+}
+
+const KEY_KIND_SHIFT: u64 = 32;
+const KEY_MODS_SHIFT: u64 = 40;
+const KEY_CHAR_MASK: u64 = 0xFFFF_FFFF;
+
+fn key_kind(code: KeyCode) -> u64 {
+    match code {
+        KeyCode::Char(_) => 0,
+        KeyCode::Enter => 1,
+        KeyCode::Backspace => 2,
+        KeyCode::Delete => 3,
+        KeyCode::Tab => 4,
+        KeyCode::Escape => 5,
+        KeyCode::Left => 6,
+        KeyCode::Right => 7,
+        KeyCode::Up => 8,
+        KeyCode::Down => 9,
+        KeyCode::Home => 10,
+        KeyCode::End => 11,
+    }
+}
+
+/// Pack a key event into the non-negative `i64` returned by [`Syscall::ReadKey`].
+/// Layout: bits [31:0] = char scalar (for `Char`), [39:32] = kind tag,
+/// [42:40] = shift/ctrl/alt bits.
+#[must_use]
+pub fn encode_key(code: KeyCode, mods: KeyMods) -> i64 {
+    let ch = if let KeyCode::Char(c) = code {
+        c as u64
+    } else {
+        0
+    };
+    let m = (mods.shift as u64) | ((mods.ctrl as u64) << 1) | ((mods.alt as u64) << 2);
+    let raw = (ch & KEY_CHAR_MASK) | (key_kind(code) << KEY_KIND_SHIFT) | (m << KEY_MODS_SHIFT);
+    // Always fits in 43 bits, so it is a non-negative i64.
+    raw as i64
+}
+
+/// Decode a value packed by [`encode_key`]. Returns `None` for the (negative)
+/// no-key / error returns.
+#[must_use]
+pub fn decode_key(ret: i64) -> Option<(KeyCode, KeyMods)> {
+    if ret < 0 {
+        return None;
+    }
+    let raw = ret as u64;
+    let kind = (raw >> KEY_KIND_SHIFT) & 0xFF;
+    let m = (raw >> KEY_MODS_SHIFT) & 0x7;
+    let mods = KeyMods {
+        shift: m & 1 != 0,
+        ctrl: m & 2 != 0,
+        alt: m & 4 != 0,
+    };
+    let code = match kind {
+        0 => KeyCode::Char(char::from_u32((raw & KEY_CHAR_MASK) as u32)?),
+        1 => KeyCode::Enter,
+        2 => KeyCode::Backspace,
+        3 => KeyCode::Delete,
+        4 => KeyCode::Tab,
+        5 => KeyCode::Escape,
+        6 => KeyCode::Left,
+        7 => KeyCode::Right,
+        8 => KeyCode::Up,
+        9 => KeyCode::Down,
+        10 => KeyCode::Home,
+        11 => KeyCode::End,
+        _ => return None,
+    };
+    Some((code, mods))
+}
 
 impl FsRwArgs {
     /// Encode to the 32-byte little-endian layout.
@@ -200,11 +324,34 @@ mod tests {
             Syscall::FsWrite,
             Syscall::FsMkdir,
             Syscall::FsExists,
+            Syscall::ReadKey,
+            Syscall::GetRandom,
         ] {
             assert_eq!(Syscall::from_number(s.number()), Some(s));
         }
         assert_eq!(Syscall::from_number(0), None);
         assert_eq!(Syscall::from_number(999), None);
+    }
+
+    #[test]
+    fn key_encode_decode_roundtrip() {
+        let cases = [
+            (KeyCode::Char('a'), KeyMods::default()),
+            (KeyCode::Char('Z'), KeyMods { shift: true, ctrl: false, alt: false }),
+            (KeyCode::Char('c'), KeyMods { shift: false, ctrl: true, alt: false }),
+            (KeyCode::Enter, KeyMods::default()),
+            (KeyCode::Backspace, KeyMods::default()),
+            (KeyCode::Left, KeyMods { shift: false, ctrl: false, alt: true }),
+            (KeyCode::Escape, KeyMods::default()),
+        ];
+        for (code, mods) in cases {
+            let enc = encode_key(code, mods);
+            assert!(enc >= 0, "encoded key must be non-negative");
+            assert_eq!(decode_key(enc), Some((code, mods)));
+        }
+        // Negative returns decode to None (no key / error).
+        assert_eq!(decode_key(-1), None);
+        assert_eq!(decode_key(SyscallError::NotFound.as_return()), None);
     }
 
     #[test]

@@ -107,6 +107,20 @@ pub trait SyscallEnv {
     fn fs_exists(&self, _path: &[u8]) -> Result<bool, SyscallError> {
         Err(SyscallError::NotPermitted)
     }
+
+    /// Read the next keyboard event. `blocking` selects waiting vs immediate.
+    /// Returns the packed key value (>= 0, via `encode_key`) or a negative
+    /// [`SyscallError`] (`NotFound` when non-blocking and the queue is empty).
+    /// The default reports no input device.
+    fn read_key(&self, _blocking: bool) -> i64 {
+        SyscallError::NotFound.as_return()
+    }
+
+    /// Fill `out` with cryptographically-random bytes from the kernel CSPRNG.
+    /// The default reports no entropy source.
+    fn fill_random(&self, _out: &mut [u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
 }
 
 /// Handle one syscall request against `env`, returning the outcome.
@@ -165,7 +179,25 @@ pub fn dispatch<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome 
                 Err(e) => SyscallOutcome::Return(e.as_return()),
             }
         }
+        Syscall::ReadKey => SyscallOutcome::Return(env.read_key(req.arg0 != 0)),
+        Syscall::GetRandom => get_random(req, env),
     }
+}
+
+/// `get_random`: fill the user buffer at `arg0` (len `arg1`) with CSPRNG bytes.
+fn get_random<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let len = req.arg1 as usize;
+    if len == 0 || len > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    let mut buf = alloc::vec![0u8; len];
+    if let Err(e) = env.fill_random(&mut buf) {
+        return SyscallOutcome::Return(e.as_return());
+    }
+    if let Err(e) = env.copy_to_user(req.boundary, req.arg0, &buf) {
+        return SyscallOutcome::Return(e.as_return());
+    }
+    SyscallOutcome::Return(len as i64)
 }
 
 /// Copy a bounded path from user memory into a kernel `Vec`.
@@ -320,6 +352,18 @@ mod tests {
         fn fs_exists(&self, path: &[u8]) -> Result<bool, SyscallError> {
             Ok(self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path))
         }
+        fn read_key(&self, _blocking: bool) -> i64 {
+            use shared::protocols::syscall::{encode_key, KeyCode, KeyMods};
+            // The mock yields a single 'k' keypress.
+            encode_key(KeyCode::Char('k'), KeyMods::default())
+        }
+        fn fill_random(&self, out: &mut [u8]) -> Result<(), SyscallError> {
+            // Deterministic non-zero fill for the test.
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            Ok(())
+        }
     }
 
     fn env_with(text: &str) -> MockEnv {
@@ -409,6 +453,40 @@ mod tests {
         let env = env_with("");
         let r = req(Syscall::Now.number(), 0, 0);
         assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(123_456_789));
+    }
+
+    #[test]
+    fn read_key_returns_encoded_event() {
+        use shared::protocols::syscall::{decode_key, KeyCode, KeyMods};
+        let env = env_with("");
+        let r = req(Syscall::ReadKey.number(), 1, 0);
+        let out = dispatch(&r, &env);
+        let SyscallOutcome::Return(v) = out else {
+            panic!("expected Return");
+        };
+        assert_eq!(decode_key(v), Some((KeyCode::Char('k'), KeyMods::default())));
+    }
+
+    #[test]
+    fn get_random_fills_user_buffer() {
+        // User memory is a 16-byte zeroed region at base; GetRandom must fill it.
+        let env = env_bytes(&[0u8; 16]);
+        let r = SyscallRequest {
+            number: Syscall::GetRandom.number(),
+            arg0: 0x4000_0000,
+            arg1: 16,
+            arg2: 0,
+            boundary: BoundaryId::new(1),
+        };
+        assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(16));
+        // The buffer is no longer all-zero (the mock filled it deterministically).
+        assert!(env.data.borrow().iter().any(|&b| b != 0));
+        // Zero length is rejected.
+        let r0 = req(Syscall::GetRandom.number(), 0x4000_0000, 0);
+        assert_eq!(
+            dispatch(&r0, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
     }
 
     #[test]

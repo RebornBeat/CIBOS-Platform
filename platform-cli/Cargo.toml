@@ -13,3 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 shared = { workspace = true, features = ["std"] }
 cibos-sdk = { workspace = true }
+cibos-console = { workspace = true }

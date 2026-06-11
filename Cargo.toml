@@ -15,6 +15,7 @@ members = [
     "platform-cli",
     "cibos-input",
     "cibos-app",
+    "cibos-console",
     "platform-gui",
     "platform-mobile",
     "platform-server",
@@ -59,6 +60,7 @@ cibos-sdk = { path = "cibos-sdk" }
 cibos-macros = { path = "cibos-macros" }
 platform-cli = { path = "platform-cli" }
 cibos-input = { path = "cibos-input" }
+cibos-console = { path = "cibos-console" }
 platform-gui = { path = "platform-gui" }
 platform-mobile = { path = "platform-mobile" }
 platform-server = { path = "platform-server" }
@@ -66,8 +68,8 @@ package-manager = { path = "applications/package-manager" }
 kvstore = { path = "applications/kvstore" }
 editor = { path = "applications/editor" }
 probe = { path = "applications/probe" }
-accounts = { path = "accounts" }
-login = { path = "login" }
+accounts = { path = "accounts", default-features = false }
+login = { path = "login", default-features = false }
 web-protocol = { path = "applications/web-protocol" }
 vane = { path = "applications/vane" }
 lens = { path = "applications/lens" }

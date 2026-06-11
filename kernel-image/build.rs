@@ -34,6 +34,7 @@ fn main() {
     if arch == "x86_64" {
         build_hello_capp(&dir);
         build_hello_rs_capp(&dir);
+        build_login_rs_capp(&dir);
     }
 }
 
@@ -95,19 +96,27 @@ fn run(cmd: &mut std::process::Command) {
 /// flat binary, and wrap it as a single read+execute segment. This proves a real
 /// Rust application — not assembly — runs in ring 3 via the syscall ABI.
 fn build_hello_rs_capp(dir: &str) {
+    build_rust_capp(dir, "hello-rs", 0x0000_5100_0000_0000);
+}
+
+/// Build a standalone Rust application crate (under `kernel-image/apps/<name>`,
+/// using the `cibos-app` runtime) into a `.capp` at `OUT_DIR/<name>.capp`. The
+/// crate is compiled for the bare app target with the large code model (its
+/// code/data live at the high application virtual address, which needs 64-bit
+/// relocations), then its `.text` (read+execute) and `.data`/`.bss`
+/// (read+write, bss zero-filled) regions are wrapped as two `.capp` segments.
+/// `app_vaddr` must match the address in the crate's linker script.
+fn build_rust_capp(dir: &str, name: &str, app_vaddr: u64) {
     use shared::AppImageBuilder;
     use shared::{SEG_FLAG_EXEC, SEG_FLAG_READ, SEG_FLAG_WRITE};
     use std::process::Command;
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let app_dir = format!("{dir}/apps/hello-rs");
-    let ld = format!("{app_dir}/hello-rs.ld");
-    let app_target_dir = format!("{out_dir}/hello-rs-target");
-    let elf = format!(
-        "{app_target_dir}/x86_64-unknown-none/release/hello-rs"
-    );
-    let capp = format!("{out_dir}/hello-rs.capp");
-    const APP_VADDR: u64 = 0x0000_5100_0000_0000;
+    let app_dir = format!("{dir}/apps/{name}");
+    let ld = format!("{app_dir}/{name}.ld");
+    let app_target_dir = format!("{out_dir}/{name}-target");
+    let elf = format!("{app_target_dir}/x86_64-unknown-none/release/{name}");
+    let capp = format!("{out_dir}/{name}.capp");
 
     println!("cargo:rerun-if-changed={app_dir}/src/main.rs");
     println!("cargo:rerun-if-changed={ld}");
@@ -115,13 +124,13 @@ fn build_hello_rs_capp(dir: &str) {
 
     // Compile the standalone app crate for the bare target. The large code model
     // emits 64-bit relocations (required at the high app vaddr); -Z build-std
-    // rebuilds core under the same model so LTO/bitcode agree. A separate target
-    // dir avoids contention with the outer build.
+    // rebuilds core/alloc under the same model so LTO/bitcode agree. A separate
+    // target dir avoids contention with the outer build.
     let rustflags = format!(
         "-C link-arg=-T{ld} -C link-arg=-nostdlib -C relocation-model=static -C code-model=large"
     );
     // Resolve the nightly toolchain root from RUSTUP_HOME (the build-script env
-    // inherits it). Invoke nightly's cargo/rustc by absolute path so the outer
+    // inherits it). Invoke nightly's cargo by absolute path so the outer
     // toolchain pin cannot redirect us back to stable (build-std needs nightly).
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| {
         format!("{}/.rustup", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
@@ -159,17 +168,17 @@ fn build_hello_rs_capp(dir: &str) {
     // .capp segments: code+rodata (read+execute) at the app base, and writable
     // data+bss (read+write) at the page-aligned data address. The bss tail is
     // expressed as mem_size > file_size so the loader zero-fills it.
-    let code_bin = format!("{out_dir}/hello-rs.text.bin");
-    let data_bin = format!("{out_dir}/hello-rs.data.bin");
+    let code_bin = format!("{out_dir}/{name}.text.bin");
+    let data_bin = format!("{out_dir}/{name}.data.bin");
     run(Command::new("objcopy").args([
         "-O", "binary", "--only-section=.text", &elf, &code_bin,
     ]));
     run(Command::new("objcopy").args([
         "-O", "binary", "--only-section=.data", &elf, &data_bin,
     ]));
-    let code = std::fs::read(&code_bin).expect("read hello-rs .text");
+    let code = std::fs::read(&code_bin).unwrap_or_else(|_| panic!("read {name} .text"));
     let data = std::fs::read(&data_bin).unwrap_or_default();
-    assert!(!code.is_empty(), "hello-rs .text is empty");
+    assert!(!code.is_empty(), "{name} .text is empty");
 
     let (data_vaddr, data_secsize, bss_vaddr, bss_size) = elf_data_layout(&elf);
     let _ = data_secsize;
@@ -190,22 +199,22 @@ fn build_hello_rs_capp(dir: &str) {
         data.len() as u32
     };
 
-    let mut builder = AppImageBuilder::new(APP_VADDR).segment(
-        APP_VADDR,
+    let mut builder = AppImageBuilder::new(app_vaddr).segment(
+        app_vaddr,
         code.len() as u32,
         SEG_FLAG_READ | SEG_FLAG_EXEC,
         &code,
     );
     if data_mem > 0 {
-        builder = builder.segment(
-            seg_vaddr,
-            data_mem,
-            SEG_FLAG_READ | SEG_FLAG_WRITE,
-            seg_file,
-        );
+        builder = builder.segment(seg_vaddr, data_mem, SEG_FLAG_READ | SEG_FLAG_WRITE, seg_file);
     }
     let image = builder.build();
-    std::fs::write(&capp, &image).expect("write hello-rs.capp");
+    std::fs::write(&capp, &image).unwrap_or_else(|_| panic!("write {name}.capp"));
+}
+
+/// Build the login application `.capp` (create-user / login on cibos-app).
+fn build_login_rs_capp(dir: &str) {
+    build_rust_capp(dir, "login-rs", 0x0000_5200_0000_0000);
 }
 
 /// Parse `readelf -S` to find the `.data` and `.bss` section addresses/sizes for

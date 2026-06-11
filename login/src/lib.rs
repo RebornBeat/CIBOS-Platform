@@ -9,11 +9,17 @@
 //! keyboard; profiles requiring a key device are reported as needing one (the
 //! device interaction belongs to a platform with the wired port available).
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::ToString;
+
 use accounts::{Accounts, Credential, Session};
-use platform_cli::Console;
+use cibos_console::Console;
 use shared::AuthenticationMethod;
 
 /// Outcome of a login attempt sequence.
@@ -52,13 +58,39 @@ pub fn run_login(console: &dyn Console, accounts: &Accounts, max_attempts: u32) 
             continue;
         }
 
+        // Resolved the profile; run the password gate for it, giving the user
+        // the remaining attempts. A bad password here ends the sequence (the
+        // profile was correctly identified), matching a single-prompt gate.
+        return run_login_for(console, accounts, boundary, remaining);
+    }
+    LoginResult::Denied
+}
+
+/// Run the password gate for an already-resolved profile `boundary`, allowing up
+/// to `max_attempts` password tries. This is the per-profile core of
+/// [`run_login`]; callers that already know which profile is being authenticated
+/// (e.g. the on-kernel login app, which prompted for the name to load the
+/// profile's credential from disk) use this directly to avoid prompting for the
+/// name twice. Returns as soon as the password verifies, or after the attempts
+/// are exhausted.
+#[must_use]
+pub fn run_login_for(
+    console: &dyn Console,
+    accounts: &Accounts,
+    boundary: shared::BoundaryId,
+    max_attempts: u32,
+) -> LoginResult {
+    if accounts.method_for(boundary) == Some(AuthenticationMethod::PhysicalKeyDevice) {
+        console.write_line("this profile requires a physical key device");
+        return LoginResult::Denied;
+    }
+    for remaining in (1..=max_attempts).rev() {
         console.write_line("password:");
-        let Some(password) = console.read_line() else {
+        let Some(password) = console.read_secret() else {
             return LoginResult::Aborted;
         };
 
-        match accounts.open_session(boundary, Credential::Password(password.trim_end().as_bytes()))
-        {
+        match accounts.open_session(boundary, Credential::Password(password.trim_end().as_bytes())) {
             Some(session) => {
                 console.write_line(&format!("welcome, {}", session.profile));
                 return LoginResult::Granted(session);

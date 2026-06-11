@@ -13,3 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 # The syscall ABI contract (numbers, FsRwArgs, errors). no_std, no alloc.
 shared = { workspace = true, default-features = false }
+# The Console trait, so cibos-app can provide the on-kernel (syscall-backed)
+# console backend that the existing CLI apps and login::run_login run against.
+cibos-console = { workspace = true }

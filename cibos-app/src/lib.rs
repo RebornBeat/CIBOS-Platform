@@ -26,8 +26,11 @@
 extern crate alloc;
 
 pub mod console;
+pub mod console_backend;
 pub mod fs;
 pub mod heap;
+pub mod input;
+pub mod rand;
 pub mod syscall;
 
 // The freestanding runtime entry (_start + panic handler) is only meaningful on
@@ -36,6 +39,9 @@ pub mod syscall;
 pub mod rt;
 
 pub use shared::protocols::syscall::SyscallError;
+
+pub use console_backend::SyscallConsole;
+pub use cibos_console::Console;
 
 #[cfg(test)]
 mod tests {

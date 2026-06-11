@@ -32,6 +32,16 @@ pub const USER_CODE_VIRT: u64 = 0x0000_5000_0000_0000;
 /// Virtual address where the user stack is mapped (one page).
 pub const USER_STACK_VIRT: u64 = 0x0000_5000_0010_0000;
 
+/// Amount of physical address space identity-mapped into every address space
+/// (the kernel's and each per-process space). It must cover everything the
+/// kernel executes from after a CR3 switch — kernel code/data at 16 MiB, its
+/// heap and stack, the GDT/TSS/IDT, the page-table frames, and the VGA buffer
+/// at `0xB8000` — so an app space can run ring-0 trap/IRQ handlers after its
+/// CR3 is installed. Single source of truth shared by `bring_up_mmu` and the
+/// per-process launcher below; they must map the identical range or a CR3
+/// switch would fault on the first kernel access.
+pub const KERNEL_IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
 extern "C" {
     fn enter_user_mode(entry: u64, user_stack: u64, user_code_sel: u64, user_data_sel: u64) -> !;
     /// Enter ring 3 saving the kernel context; returns the user's exit code when
@@ -65,9 +75,9 @@ pub unsafe fn return_to_kernel(code: i64) -> ! {
 /// must `exit` (which the kernel handles) or run forever.
 ///
 /// This diverging entry suits a task that never returns to the kernel (e.g. a
-/// top-level init that owns the machine). [`run_app_image`] is the
-/// variant used by the current demo and the basis for the process model, where
-/// `exit` unwinds back to the kernel. Kept as a documented alternative.
+/// top-level init that owns the machine). [`run_app_image_isolated`] is the
+/// variant used by the process model, where each app runs in its own address
+/// space and `exit` unwinds back to the kernel. Kept as a documented alternative.
 ///
 /// `code` must be position-independent and fit in one page; `phys_to_ptr` is the
 /// active identity map.
@@ -251,44 +261,73 @@ pub unsafe fn map_user_stack(
     Ok((stack_base + pages * FRAME_SIZE) & !0xF)
 }
 
-/// Load a parsed application image into `space`, map a user stack, install the
-/// space, and enter ring 3 at the image's entry point. Returns the user's exit
-/// code when it calls `exit`.
+/// Run an application image in its **own fresh address space** — the real
+/// process model.
 ///
-/// This is the external-image counterpart to [`run_user_payload`]: the
-/// program comes from a `.capp` (its segments and entry are described by the
-/// image) rather than a single embedded code blob, so each segment lands with
-/// its own permissions. The user stack is mapped within the app's own address
-/// region (derived from its entry) so distinct apps get distinct stacks.
+/// Unlike a single shared address space (where two runs collide on the same
+/// user vaddrs), this builds a brand-new
+/// [`AddressSpace`] per call: it identity-maps the kernel range into it (so
+/// ring-0 trap/IRQ handlers execute after the CR3 switch), maps the app's
+/// segments, stack, and heap, installs the space, drops to ring 3, and on the
+/// app's `exit` restores the caller's CR3. Each process is therefore isolated
+/// and re-runnable — the same app, or different apps, can run back-to-back
+/// without vaddr collisions, and one process cannot reach another's pages.
+///
+/// Returns the app's exit code.
 ///
 /// # Safety
 ///
-/// As [`load_app_image`]. Only one `enter_user_context` may be live at a time
-/// (the kernel-context save/restore is a single slot).
-pub unsafe fn run_app_image(
-    space: &AddressSpace,
+/// As [`load_app_image`]. Additionally: `kernel_root` must be the address space
+/// to return to (the caller's installed CR3), and only one `enter_user_context`
+/// may be live at a time (the kernel-context save/restore is a single slot).
+pub unsafe fn run_app_image_isolated(
     frames: &FrameAllocator,
     image: &shared::AppImage,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) -> Result<i64, &'static str> {
-    let entry = load_app_image(space, frames, image, phys_to_ptr)?;
-    // Place the user stack at a fixed offset within this app's own address
-    // region (derived from its entry), so two apps loaded at different base
-    // addresses get distinct, non-overlapping stacks. One page below a 1 MiB
-    // boundary above the entry's 4 GiB-aligned base.
+    use cibos_kernel::paging::Permissions;
+
+    // The CR3 to restore when the app exits (the caller's space — the kernel's).
+    let kernel_root = crate::arch::paging::current_root();
+
+    // Fresh per-process space.
+    let space = AddressSpace::new(frames, phys_to_ptr).map_err(|_| "no frame for app space root")?;
+
+    // Identity-map the kernel range into the new space so ring-0 execution
+    // (the syscall/IRQ handlers, the kernel stack, the page tables themselves)
+    // continues to work after we switch CR3 to this space. Kernel pages:
+    // supervisor-only, read/write/execute — identical to the kernel's own map.
+    let kernel_pages = KERNEL_IDENTITY_MAP_BYTES / FRAME_SIZE;
+    space
+        .map_range::<X86PageTable>(
+            0,
+            0,
+            kernel_pages,
+            Permissions {
+                read: true,
+                write: true,
+                execute: true,
+                user: false,
+            },
+            frames,
+            phys_to_ptr,
+        )
+        .map_err(|_| "map kernel range into app space failed")?;
+
+    // Map the app's segments (each with its own permissions), its stack, and a
+    // heap — exactly as the shared-space path does, but into this private space.
+    let entry = load_app_image(&space, frames, image, phys_to_ptr)?;
+
     let app_base = entry & !0xFFFF_FFFF; // 4 GiB-align the app's region
     let stack_base = app_base + 0x0010_0000; // +1 MiB
-    let stack_top = map_user_stack(space, frames, stack_base, 1, phys_to_ptr)?;
+    let stack_top = map_user_stack(&space, frames, stack_base, 1, phys_to_ptr)?;
 
-    // Map a heap region for the application (so it can use `alloc`) and pass its
-    // base/size to `_start` via the entry registers. Placed above the stack
-    // within the app's own region so distinct apps get distinct heaps. 64 pages
-    // = 256 KiB, enough for the shell/login working set.
-    const HEAP_PAGES: u64 = 64;
+    const HEAP_PAGES: u64 = 64; // 256 KiB
     let heap_base = app_base + 0x0020_0000; // +2 MiB
-    map_user_stack(space, frames, heap_base, HEAP_PAGES, phys_to_ptr)?;
+    map_user_stack(&space, frames, heap_base, HEAP_PAGES, phys_to_ptr)?;
     let heap_size = HEAP_PAGES * FRAME_SIZE;
 
+    // Switch to the app's space, run it in ring 3, then restore the kernel's.
     crate::arch::paging::install(space.root());
     let code = enter_user_context(
         entry,
@@ -298,5 +337,9 @@ pub unsafe fn run_app_image(
         heap_base,
         heap_size,
     );
+    // Back from ring 3 (the app called `exit`): restore the caller's address
+    // space before returning so the rest of the kernel runs on its own CR3.
+    crate::arch::paging::install(cibos_kernel::PhysFrame::containing(kernel_root));
+
     Ok(code)
 }

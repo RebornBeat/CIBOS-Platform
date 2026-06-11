@@ -18,22 +18,39 @@
 //! A profile may require either factor or **both** (`PasswordAndKeyDevice`), in
 //! which case both must verify.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use shared::crypto::backends::sphincs::SphincsPlusVerifier;
-use shared::crypto::hash::{digests_equal_ct, sha256, Digest256};
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+// The key-device path verifies a SPHINCS+ signature. Use the std-side backend
+// on host (the `std` feature pulls `shared/pqc-sphincs`) and the no_std portable
+// verifier on bare (the `portable-pqc` feature pulls `shared/pqc-sphincs-portable`);
+// both implement the same `SignatureVerifier` trait and produce identical results.
+#[cfg(feature = "std")]
+use shared::crypto::backends::sphincs::SphincsPlusVerifier as KeyDeviceVerifier;
+#[cfg(all(not(feature = "std"), feature = "portable-pqc"))]
+use shared::crypto::backends::sphincs_portable::SphincsPlusPortableVerifier as KeyDeviceVerifier;
+use shared::crypto::credential::{hash_password, CredentialRecord};
+use shared::crypto::hash::{digests_equal_ct, Digest256};
+#[cfg(any(feature = "std", feature = "portable-pqc"))]
 use shared::crypto::signature::SignatureVerifier;
 use shared::types::authentication::AuthenticationFailureReason;
 use shared::{AuthenticationMethod, AuthenticationOutcome, BoundaryId};
-use std::collections::BTreeMap;
 
 /// Compute the stored verifier hash for a password and salt.
+///
+/// This delegates to [`shared::crypto::credential::hash_password`] — the single
+/// canonical `sha256(salt ++ password)` construction shared across CIBOS — so
+/// the in-memory registry here and the on-disk [`CredentialRecord`] used by the
+/// kernel login path are guaranteed byte-identical and cannot drift.
 fn password_hash(salt: &[u8; 32], password: &[u8]) -> Digest256 {
-    let mut buf = Vec::with_capacity(salt.len() + password.len());
-    buf.extend_from_slice(salt);
-    buf.extend_from_slice(password);
-    sha256(&buf)
+    hash_password(salt, password)
 }
 
 /// The stored verifier material for a profile.
@@ -129,6 +146,50 @@ impl Accounts {
         );
     }
 
+    /// Enroll a password-only profile directly from a persisted
+    /// [`CredentialRecord`] (e.g. loaded from `/etc/passwd.d/<name>` in the
+    /// kernel filesystem). This is the persistence counterpart of
+    /// [`Self::enroll_password`]: it stores the already-hashed verifier without
+    /// re-hashing, so a record written by the on-kernel login path enrolls here
+    /// byte-for-byte identically.
+    pub fn enroll_password_record(
+        &mut self,
+        name: &str,
+        boundary: BoundaryId,
+        record: &CredentialRecord,
+    ) {
+        self.profiles.insert(
+            boundary.0,
+            Profile {
+                name: name.to_string(),
+                boundary,
+                method: AuthenticationMethod::Password,
+                verifier: Verifier::Password {
+                    salt: record.salt,
+                    hash: record.hash,
+                },
+            },
+        );
+    }
+
+    /// Export a password profile's verifier as a [`CredentialRecord`] for
+    /// persistence (e.g. to write to the kernel filesystem). Returns `None` if
+    /// the profile is absent or is not a password (or password+key) profile.
+    /// For a `PasswordAndKeyDevice` profile this exports only the password
+    /// factor's record (the key-device public key is persisted separately).
+    #[must_use]
+    pub fn password_record_for(&self, boundary: BoundaryId) -> Option<CredentialRecord> {
+        match self.profiles.get(&boundary.0).map(|p| &p.verifier)? {
+            Verifier::Password { salt, hash } | Verifier::Both { salt, hash, .. } => {
+                Some(CredentialRecord {
+                    salt: *salt,
+                    hash: *hash,
+                })
+            }
+            Verifier::KeyDevice { .. } => None,
+        }
+    }
+
     /// Enroll a key-device-only profile with the device's public key.
     pub fn enroll_key_device(&mut self, name: &str, boundary: BoundaryId, public_key: Vec<u8>) {
         self.profiles.insert(
@@ -194,7 +255,17 @@ impl Accounts {
     }
 
     fn check_key_device(public_key: &[u8], challenge: &[u8], signature: &[u8]) -> bool {
-        SphincsPlusVerifier::verify(public_key, challenge, signature).is_ok()
+        #[cfg(any(feature = "std", feature = "portable-pqc"))]
+        {
+            KeyDeviceVerifier::verify(public_key, challenge, signature).is_ok()
+        }
+        // With no SPHINCS+ backend compiled in, the key-device factor cannot be
+        // verified, so it must fail closed (never silently accept).
+        #[cfg(not(any(feature = "std", feature = "portable-pqc")))]
+        {
+            let _ = (public_key, challenge, signature);
+            false
+        }
     }
 
     /// Authenticate a credential against the profile for `boundary`.
@@ -419,5 +490,46 @@ mod tests {
         assert_eq!(session.boundary, b);
         assert_eq!(session.profile, "dana");
         assert!(acc.open_session(b, Credential::Password(b"nope")).is_none());
+    }
+
+    #[test]
+    fn credential_record_bridge_roundtrips_and_authenticates() {
+        use shared::crypto::credential::CredentialRecord;
+
+        // Enroll normally, then export the persisted record.
+        let mut acc = Accounts::new();
+        let b = BoundaryId::new(77);
+        acc.enroll_password("erin", b, SALT, b"sunflower");
+        let record = acc.password_record_for(b).expect("password record");
+
+        // The exported record verifies the same password (one scheme).
+        assert!(record.verify(b"sunflower"));
+        assert!(!record.verify(b"wrong"));
+
+        // Enrolling a *fresh* registry from that record (as the kernel would,
+        // loading from disk) authenticates identically — no re-hashing.
+        let mut loaded = Accounts::new();
+        loaded.enroll_password_record("erin", b, &record);
+        assert!(loaded
+            .authenticate(b, Credential::Password(b"sunflower"))
+            .is_success());
+        assert!(!loaded
+            .authenticate(b, Credential::Password(b"nope"))
+            .is_success());
+
+        // And a record built directly (as the login app does) enrolls and
+        // authenticates the same way — proving the on-disk format and the
+        // registry agree byte-for-byte.
+        let direct = CredentialRecord::new(SALT, b"sunflower");
+        assert_eq!(direct, record);
+    }
+
+    #[test]
+    fn key_device_profile_has_no_password_record() {
+        let (public_key, _secret) = generate_keypair().unwrap();
+        let mut acc = Accounts::new();
+        let b = BoundaryId::new(88);
+        acc.enroll_key_device("kh", b, public_key);
+        assert!(acc.password_record_for(b).is_none());
     }
 }

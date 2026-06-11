@@ -11,9 +11,20 @@ name = "login"
 path = "src/lib.rs"
 
 [dependencies]
-accounts = { workspace = true }
-platform-cli = { workspace = true }
-shared = { workspace = true, features = ["std"] }
+accounts = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+shared = { workspace = true, default-features = false }
 
 [dev-dependencies]
+# The tests use platform-cli's CaptureConsole and the std SPHINCS+ backend.
+platform-cli = { workspace = true }
 shared = { workspace = true, features = ["std", "pqc-sphincs"] }
+
+[features]
+# Host build (default): pull std-side accounts (with the SPHINCS+ key-device
+# backend). On by default so existing host consumers are unchanged.
+default = ["std"]
+std = ["accounts/std", "shared/std"]
+# Bare-metal build: no_std login over the no_std accounts (password path; the
+# key-device path uses the portable verifier when enabled).
+portable-pqc = ["accounts/portable-pqc"]

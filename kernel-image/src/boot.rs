@@ -166,6 +166,16 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // bringing up the user apps, so a ring-3 .capp can issue filesystem
             // syscalls against it. The ATA driver is port-I/O based and needs no
             // MMU, so this is safe here.
+            // Seed the kernel CSPRNG (backs the get_random syscall) from the
+            // firmware entropy seed before any app can request randomness.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut seed = [0u8; 32];
+                let n = seed.len().min(shared::protocols::handoff::ENTROPY_SEED_LEN);
+                seed[..n].copy_from_slice(&handoff.entropy_seed[..n]);
+                seed_kernel_rng(seed);
+            }
+
             #[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
             mount_root_fs_early();
 
@@ -271,7 +281,9 @@ fn bring_up_mmu(handoff: &HandoffData) {
     const RESERVED_BELOW: u64 = 64 * 1024 * 1024;
     // Identity-map this much physical address space (covers everything the
     // kernel touches in the 128 MiB guest, plus the VGA buffer at 0xB8000).
-    const IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+    // Shared with the per-process launcher so every space maps the identical
+    // kernel range.
+    const IDENTITY_MAP_BYTES: u64 = crate::loader::KERNEL_IDENTITY_MAP_BYTES;
 
     // Collect the usable memory map the same way the kernel core does.
     let regions: Vec<MemoryRegion> = match handoff.typed_regions() {
@@ -358,9 +370,10 @@ fn bring_up_mmu(handoff: &HandoffData) {
         // allocator remains available for the ring-3 payload below.
         demonstrate_container_isolation(&frames, &phys_to_ptr);
 
-        // Drop to ring 3 and run an unprivileged user payload that reaches the
-        // kernel only via int 0x80 syscalls — the full user/kernel boundary.
-        run_ring3_demo(&space, &frames, &phys_to_ptr);
+        // Drop to ring 3 and run unprivileged user payloads, each in its own
+        // per-process address space, reaching the kernel only via int 0x80
+        // syscalls — the full user/kernel boundary.
+        run_ring3_demo(&frames, &phys_to_ptr);
 
         // `space` and `frames` back the live page tables (CR3) for the rest of
         // this boot. Neither type implements `Drop` and the page-table frames
@@ -441,7 +454,6 @@ fn demonstrate_container_isolation(
 /// The payload logs a message and calls `exit`, both via `int 0x80`.
 #[cfg(target_arch = "x86_64")]
 fn run_ring3_demo(
-    space: &cibos_kernel::paging::AddressSpace,
     frames: &cibos_kernel::FrameAllocator,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) {
@@ -489,7 +501,7 @@ fn run_ring3_demo(
                     image.segment_count(),
                     image.entry()
                 );
-                match crate::loader::run_app_image(space, frames, &image, phys_to_ptr) {
+                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
                     // The app logs, then `exit(7)` unwinds back here via the
                     // saved kernel context — proving the kernel loaded and ran
                     // an external image in a user address space and regained
@@ -516,7 +528,7 @@ fn run_ring3_demo(
                     image.segment_count(),
                     image.entry()
                 );
-                match crate::loader::run_app_image(space, frames, &image, phys_to_ptr) {
+                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
                     Ok(code) => kprintln!(
                         "CIBOS kernel: Rust app exited with code {code} \
                          (cibos-app runtime, ran in ring 3)"
@@ -526,7 +538,58 @@ fn run_ring3_demo(
             }
             Err(e) => kprintln!("CIBOS kernel: Rust .capp parse failed: {e}"),
         }
+
+        // Run the login application (.capp) twice under the storage-selftest
+        // configuration, driving it with injected keystrokes (deterministic,
+        // since QEMU sendkey is unreliable): first run CREATES profile "alice"
+        // (no credential file yet), the second LOGS IN as "alice". This exercises
+        // the whole interactive stack — ReadKey -> read_line, GetRandom -> salt,
+        // fs -> CIBOSFS credential file, shared salted-SHA-256 verify — in ring 3.
+        #[cfg(feature = "storage-selftest")]
+        {
+            const LOGIN_RS_CAPP: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/login-rs.capp"));
+            if let Ok(image) = shared::AppImage::parse(LOGIN_RS_CAPP) {
+                // First run: create "alice" with password "pw123" (typed twice).
+                kprintln!("CIBOS kernel: --- login app: create-user run ---");
+                inject_text("alice");
+                inject_enter();
+                inject_text("pw123");
+                inject_enter();
+                inject_text("pw123");
+                inject_enter();
+                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                    Ok(code) => kprintln!("CIBOS kernel: login(create) exited with code {code}"),
+                    Err(e) => kprintln!("CIBOS kernel: login(create) launch failed: {e}"),
+                }
+
+                // Second run: log in as "alice" with the correct password.
+                kprintln!("CIBOS kernel: --- login app: login run ---");
+                inject_text("alice");
+                inject_enter();
+                inject_text("pw123");
+                inject_enter();
+                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                    Ok(code) => kprintln!("CIBOS kernel: login(auth) exited with code {code}"),
+                    Err(e) => kprintln!("CIBOS kernel: login(auth) launch failed: {e}"),
+                }
+            }
+        }
     }
+}
+
+/// Inject the characters of `s` into the keyboard queue (selftest only).
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+fn inject_text(s: &str) {
+    for c in s.chars() {
+        crate::keyboard::inject_key(cibos_input::KeyEvent::ch(c));
+    }
+}
+
+/// Inject an Enter key (selftest only).
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+fn inject_enter() {
+    crate::keyboard::inject_key(cibos_input::KeyEvent::new(cibos_input::Key::Enter));
 }
 
 /// Exercise the filesystem through the actual syscall ABI: build an `FsRwArgs`
@@ -826,6 +889,18 @@ static ROOT_FS: cibos_kernel::sync::SpinLock<
     Option<cibos_kernel::fs::Fs<crate::arch::ata::AtaDisk>>,
 > = cibos_kernel::sync::SpinLock::new(None);
 
+/// The kernel CSPRNG backing the `get_random` syscall, seeded from the firmware
+/// entropy seed in the handoff at bring-up. `None` until seeded.
+#[cfg(target_arch = "x86_64")]
+static KERNEL_RNG: cibos_kernel::sync::SpinLock<Option<cibos_kernel::entropy::Csprng>> =
+    cibos_kernel::sync::SpinLock::new(None);
+
+/// Seed the kernel CSPRNG from the firmware entropy seed. Called once at boot.
+#[cfg(target_arch = "x86_64")]
+fn seed_kernel_rng(seed: [u8; 32]) {
+    *KERNEL_RNG.lock() = Some(cibos_kernel::entropy::Csprng::from_seed(seed));
+}
+
 /// Map a filesystem error onto the syscall ABI error set.
 #[cfg(target_arch = "x86_64")]
 fn fs_err(e: cibos_kernel::fs::FsError) -> shared::protocols::syscall::SyscallError {
@@ -946,6 +1021,69 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
             return Err(SyscallError::NotPermitted);
         };
         Ok(fs.exists(path))
+    }
+
+    fn read_key(&self, blocking: bool) -> i64 {
+        use shared::protocols::syscall::{encode_key, KeyCode, KeyMods, SyscallError};
+        // Map a kernel KeyEvent to the ABI key encoding.
+        fn map(ev: cibos_input::KeyEvent) -> i64 {
+            use cibos_input::Key;
+            let code = match ev.key {
+                Key::Char(c) => KeyCode::Char(c),
+                Key::Enter => KeyCode::Enter,
+                Key::Backspace => KeyCode::Backspace,
+                Key::Delete => KeyCode::Delete,
+                Key::Tab => KeyCode::Tab,
+                Key::Escape => KeyCode::Escape,
+                Key::Left => KeyCode::Left,
+                Key::Right => KeyCode::Right,
+                Key::Up => KeyCode::Up,
+                Key::Down => KeyCode::Down,
+                Key::Home => KeyCode::Home,
+                Key::End => KeyCode::End,
+            };
+            let mods = KeyMods {
+                shift: ev.mods.shift,
+                ctrl: ev.mods.ctrl,
+                alt: ev.mods.alt,
+            };
+            encode_key(code, mods)
+        }
+
+        if let Some(ev) = crate::keyboard::poll_key() {
+            return map(ev);
+        }
+        if !blocking {
+            return SyscallError::NotFound.as_return();
+        }
+        // Block efficiently using the timer's bounded wait primitive: sleep via
+        // `hlt` until a key arrives or the timeout elapses. `wait_ticks_or` is
+        // the established building block for "wait for input up to a deadline";
+        // the steady PIT tick guarantees this always terminates.
+        // SAFETY: interrupts are enabled and the timer/keyboard IRQs are live by
+        // the time user code runs.
+        let got = unsafe {
+            crate::timer::wait_ticks_or(
+                crate::timer::millis_to_ticks(30_000),
+                crate::keyboard::has_key,
+            )
+        };
+        if got {
+            if let Some(ev) = crate::keyboard::poll_key() {
+                return map(ev);
+            }
+        }
+        SyscallError::NotFound.as_return()
+    }
+
+    fn fill_random(&self, out: &mut [u8]) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = KERNEL_RNG.lock();
+        let Some(rng) = guard.as_mut() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        rng.fill_bytes(out);
+        Ok(())
     }
 }
 

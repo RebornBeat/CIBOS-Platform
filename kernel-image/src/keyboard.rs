@@ -59,6 +59,22 @@ pub fn poll_key() -> Option<KeyEvent> {
     KEYBOARD.lock().queue.pop()
 }
 
+/// Whether any key event is currently buffered.
+#[must_use]
+pub fn has_key() -> bool {
+    !KEYBOARD.lock().queue.is_empty()
+}
+
+/// Inject a key event directly into the input queue, as if it had arrived from
+/// the keyboard IRQ. This drives the real `ReadKey` syscall path from a
+/// deterministic source (QEMU's `sendkey` injection is unreliable against a
+/// headless guest), so the interactive applications can be verified end to end.
+/// Only built for the storage-selftest configuration.
+#[cfg(feature = "storage-selftest")]
+pub fn inject_key(ev: KeyEvent) {
+    KEYBOARD.lock().queue.push(ev);
+}
+
 /// Number of scancodes the handler has processed (diagnostic).
 #[must_use]
 pub fn scancodes_seen() -> u64 {
