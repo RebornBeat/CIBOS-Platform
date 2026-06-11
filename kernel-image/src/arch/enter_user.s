@@ -72,6 +72,24 @@ enter_user_context:
     push 0x202
     push rdx
     push rdi
+    // Hand the application its heap: the 5th/6th C args (r8 = heap base, r9 =
+    // heap size) become rdi/rsi in ring 3, so _start receives (heap_base,
+    // heap_size). Clear the other GPRs so no kernel state leaks to the app.
+    mov rdi, r8
+    mov rsi, r9
+    xor rax, rax
+    xor rbx, rbx
+    xor rcx, rcx
+    xor rdx, rdx
+    xor rbp, rbp
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    xor r11, r11
+    xor r12, r12
+    xor r13, r13
+    xor r14, r14
+    xor r15, r15
     iretq
 
 .global return_to_kernel

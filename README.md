@@ -6,11 +6,18 @@ microkernel OS, and **HIP** (Hybrid Isolation Paradigm) is its isolation model:
 the security principal is the *boundary*, not a user account, and isolation is
 binary — maximal or none, never tiered.
 
-Everything here is real, compiles, and is covered by **205 unit tests** plus
-doctests. There are no placeholders or mocks. Where a capability genuinely
-depends on hardware (real NIC packets, a physical display, usermode privilege
-separation, in-firmware PQC), that boundary is called out honestly in the docs
-rather than faked.
+Everything here is real, compiles, and is covered by **298 unit tests** plus
+doctests and the application/example suites. There are no placeholders or mocks.
+Where a capability genuinely depends on hardware, that boundary is called out
+honestly in the docs rather than faked.
+
+The from-scratch boot path and the on-kernel runtime are **runtime-verified in
+QEMU** (used as a hardware stand-in, not a shortcut): BIOS → custom MBR → CIBIOS
+firmware → CIBOS kernel → weighted-entropy scheduler → MMU with per-container
+address spaces → ring-3 user mode → `int 0x80` syscalls → PS/2 keyboard IRQ →
+PIT timer → ATA-PIO block storage → an on-disk filesystem (**CIBOSFS**) → and
+real `.capp` applications (including a **Rust** program built on the `cibos-app`
+runtime) loaded into ring 3 that reach the kernel through the syscall ABI.
 
 ## What's built
 
@@ -31,11 +38,26 @@ rather than faked.
   **Lens** browser, and the **Hail** request protocol. See `NETWORKING.md`.
 * **Security** — boundary isolation, password / wired-key-device authentication
   (`accounts`), a CLI **login** gate, and a mobile **PIN lock screen**.
+* **Bare-metal on-kernel runtime (runtime-verified in QEMU)** — the kernel
+  builds its own page tables and switches `CR3`; per-container address spaces
+  (a page mapped in one boundary is physically absent in another); ring-3 user
+  mode with an `int 0x80` syscall transport (`Log`, `Exit`, `FsRead`/`FsWrite`/
+  `FsMkdir`/`FsExists`); a remapped-PIC PS/2 keyboard IRQ path with a portable
+  scancode decoder; a PIT system timer (the wake/timeout source); an **ATA-PIO**
+  block driver; **CIBOSFS**, an on-disk filesystem (superblock + block bitmap +
+  inodes + directories) over a portable `BlockDevice` trait; and a `.capp`
+  external-application format whose images are loaded into ring 3 — including a
+  **Rust** application built on the `cibos-app` `no_std` runtime.
+* **`cibos-app`** — the `no_std` runtime a ring-3 `.capp` links against: console
+  output, filesystem access, and exit, all over the syscall ABI.
 * **Storage** — **Live** (RAM-only, wiped on shutdown, no trace) and
-  **Persistent** (partition-backed) volumes.
+  **Persistent** (partition-backed) volumes. *(Host model today; CIBOSFS is the
+  on-disk backing the Persistent volume is being wired onto.)*
 * **Applications** — package manager, app store (Trove), shell, text editor,
   key-value store, calculator IPC service, port scanner, web server + browser,
   notepad (GUI), messaging (Courier), email (Postbox), contacts, calendar.
+  *(All 17 build and pass tests as host programs run in-process via `AppHost`;
+  porting them onto `cibos-app` to run as on-kernel `.capp`s is in progress.)*
 
 ## Workspace layout
 
@@ -43,9 +65,10 @@ rather than faked.
 shared/                foundation: types, crypto (SHA-256, SPHINCS+/ML-KEM/ML-DSA), protocols
 cibios/                firmware: boot, detection, image verify, handoff (4 arches)
 cibos-async-runtime/   Catch-and-Release executor
-cibos-kernel/          HIP scheduler, channels, isolation, memory
+cibos-kernel/          HIP scheduler, channels, isolation, memory, block + CIBOSFS, syscalls
 cibos-sdk/             app SDK: System, channels, fs, Lattice
-kernel-image/          bootable kernel binary
+cibos-app/             no_std on-kernel app runtime (syscall/console/fs) a .capp links against
+kernel-image/          bootable kernel binary; apps/ holds the .capp sample programs
 tools/mkimage/         image build + SPHINCS+ signing/verification
 platform-cli/ -gui/ -input/ -mobile/ -server/   the four platforms + input model
 accounts/ login/       authentication and login gate
@@ -116,4 +139,4 @@ hardware/validation-gated items noted in `SECURITY-NOTES.md` and `NETWORKING.md`
 
 ## License
 
-PolyForm Noncommercial (per the workspace owner's conventions).
+MIT — Copyright (c) 2026 RebornBeat (Christian). See `LICENSE`.

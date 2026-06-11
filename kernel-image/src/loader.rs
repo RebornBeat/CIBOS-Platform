@@ -41,6 +41,8 @@ extern "C" {
         user_stack: u64,
         user_code_sel: u64,
         user_data_sel: u64,
+        heap_base: u64,
+        heap_size: u64,
     ) -> i64;
 }
 
@@ -278,12 +280,23 @@ pub unsafe fn run_app_image(
     let stack_base = app_base + 0x0010_0000; // +1 MiB
     let stack_top = map_user_stack(space, frames, stack_base, 1, phys_to_ptr)?;
 
+    // Map a heap region for the application (so it can use `alloc`) and pass its
+    // base/size to `_start` via the entry registers. Placed above the stack
+    // within the app's own region so distinct apps get distinct heaps. 64 pages
+    // = 256 KiB, enough for the shell/login working set.
+    const HEAP_PAGES: u64 = 64;
+    let heap_base = app_base + 0x0020_0000; // +2 MiB
+    map_user_stack(space, frames, heap_base, HEAP_PAGES, phys_to_ptr)?;
+    let heap_size = HEAP_PAGES * FRAME_SIZE;
+
     crate::arch::paging::install(space.root());
     let code = enter_user_context(
         entry,
         stack_top,
         gdt::USER_CODE as u64,
         gdt::USER_DATA as u64,
+        heap_base,
+        heap_size,
     );
     Ok(code)
 }

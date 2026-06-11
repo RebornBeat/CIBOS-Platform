@@ -96,7 +96,7 @@ fn run(cmd: &mut std::process::Command) {
 /// Rust application — not assembly — runs in ring 3 via the syscall ABI.
 fn build_hello_rs_capp(dir: &str) {
     use shared::AppImageBuilder;
-    use shared::{SEG_FLAG_EXEC, SEG_FLAG_READ};
+    use shared::{SEG_FLAG_EXEC, SEG_FLAG_READ, SEG_FLAG_WRITE};
     use std::process::Command;
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -106,7 +106,6 @@ fn build_hello_rs_capp(dir: &str) {
     let elf = format!(
         "{app_target_dir}/x86_64-unknown-none/release/hello-rs"
     );
-    let bin = format!("{out_dir}/hello-rs.bin");
     let capp = format!("{out_dir}/hello-rs.capp");
     const APP_VADDR: u64 = 0x0000_5100_0000_0000;
 
@@ -136,7 +135,7 @@ fn build_hello_rs_capp(dir: &str) {
             "--target",
             "x86_64-unknown-none",
             "-Z",
-            "build-std=core",
+            "build-std=core,alloc",
             "--target-dir",
             &app_target_dir,
         ])
@@ -156,17 +155,88 @@ fn build_hello_rs_capp(dir: &str) {
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env("RUSTFLAGS", &rustflags));
 
-    // Flatten to raw bytes and wrap as a .capp.
-    run(Command::new("objcopy").args(["-O", "binary", &elf, &bin]));
-    let code = std::fs::read(&bin).expect("read hello-rs.bin");
-    assert!(!code.is_empty(), "hello-rs flat binary is empty");
-    let image = AppImageBuilder::new(APP_VADDR)
-        .segment(
-            APP_VADDR,
-            code.len() as u32,
-            SEG_FLAG_READ | SEG_FLAG_EXEC,
-            &code,
-        )
-        .build();
+    // Extract the two regions the linker script produced and wrap them as two
+    // .capp segments: code+rodata (read+execute) at the app base, and writable
+    // data+bss (read+write) at the page-aligned data address. The bss tail is
+    // expressed as mem_size > file_size so the loader zero-fills it.
+    let code_bin = format!("{out_dir}/hello-rs.text.bin");
+    let data_bin = format!("{out_dir}/hello-rs.data.bin");
+    run(Command::new("objcopy").args([
+        "-O", "binary", "--only-section=.text", &elf, &code_bin,
+    ]));
+    run(Command::new("objcopy").args([
+        "-O", "binary", "--only-section=.data", &elf, &data_bin,
+    ]));
+    let code = std::fs::read(&code_bin).expect("read hello-rs .text");
+    let data = std::fs::read(&data_bin).unwrap_or_default();
+    assert!(!code.is_empty(), "hello-rs .text is empty");
+
+    let (data_vaddr, data_secsize, bss_vaddr, bss_size) = elf_data_layout(&elf);
+    let _ = data_secsize;
+    // The writable region starts at whichever of .data/.bss exists first. If
+    // there is no .data (common — the only writable state is the allocator's
+    // .bss), the segment is the .bss: zero file bytes, mem_size = bss size.
+    let (seg_vaddr, seg_file): (u64, &[u8]) = if !data.is_empty() && data_vaddr != 0 {
+        (data_vaddr, &data)
+    } else {
+        (bss_vaddr, &[])
+    };
+    // mem_size spans from the segment start through the end of .bss.
+    let data_mem = if data_vaddr != 0 && bss_vaddr != 0 {
+        ((bss_vaddr + bss_size) - data_vaddr) as u32
+    } else if bss_vaddr != 0 {
+        bss_size as u32
+    } else {
+        data.len() as u32
+    };
+
+    let mut builder = AppImageBuilder::new(APP_VADDR).segment(
+        APP_VADDR,
+        code.len() as u32,
+        SEG_FLAG_READ | SEG_FLAG_EXEC,
+        &code,
+    );
+    if data_mem > 0 {
+        builder = builder.segment(
+            seg_vaddr,
+            data_mem,
+            SEG_FLAG_READ | SEG_FLAG_WRITE,
+            seg_file,
+        );
+    }
+    let image = builder.build();
     std::fs::write(&capp, &image).expect("write hello-rs.capp");
+}
+
+/// Parse `readelf -S` to find the `.data` and `.bss` section addresses/sizes for
+/// the Rust app, so the build can size and place the writable segment. Returns
+/// `(data_addr, data_size, bss_addr, bss_size)`; a missing section is 0.
+fn elf_data_layout(elf: &str) -> (u64, u64, u64, u64) {
+    use std::process::Command;
+    let out = Command::new("readelf")
+        .args(["-S", "-W", elf])
+        .output()
+        .expect("readelf -S");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut data_addr, mut data_size, mut bss_addr, mut bss_size) = (0u64, 0u64, 0u64, 0u64);
+    for line in text.lines() {
+        let l = line.trim_start();
+        let l = l.strip_prefix('[').unwrap_or(l);
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if let Some(pos) = cols.iter().position(|t| *t == ".data" || *t == ".bss") {
+            // readelf -W layout after the name: TYPE ADDR OFF SIZE
+            if pos + 4 < cols.len() {
+                let addr = u64::from_str_radix(cols[pos + 2], 16).unwrap_or(0);
+                let size = u64::from_str_radix(cols[pos + 4], 16).unwrap_or(0);
+                if cols[pos] == ".data" {
+                    data_addr = addr;
+                    data_size = size;
+                } else {
+                    bss_addr = addr;
+                    bss_size = size;
+                }
+            }
+        }
+    }
+    (data_addr, data_size, bss_addr, bss_size)
 }

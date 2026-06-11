@@ -23,9 +23,17 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
 pub mod console;
 pub mod fs;
+pub mod heap;
 pub mod syscall;
+
+// The freestanding runtime entry (_start + panic handler) is only meaningful on
+// the bare application target.
+#[cfg(target_os = "none")]
+pub mod rt;
 
 pub use shared::protocols::syscall::SyscallError;
 

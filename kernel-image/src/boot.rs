@@ -162,6 +162,13 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // bring_up_mmu now also installs the GDT/IDT and drops to ring 3 to
             // run an unprivileged user payload that syscalls via int 0x80,
             // exercising the full user/kernel boundary on real hardware.
+            // Mount a root filesystem (CIBOSFS on the slave data disk) BEFORE
+            // bringing up the user apps, so a ring-3 .capp can issue filesystem
+            // syscalls against it. The ATA driver is port-I/O based and needs no
+            // MMU, so this is safe here.
+            #[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+            mount_root_fs_early();
+
             bring_up_mmu(&handoff);
 
             // Bring up real block storage: probe the primary ATA bus and read
@@ -567,6 +574,34 @@ fn demonstrate_fs_syscalls() {
     );
 }
 
+/// Probe the slave data disk, format a fresh CIBOSFS, seed `/etc/`, and install
+/// it as the kernel's root filesystem (`ROOT_FS`) — done before the user apps
+/// run so a ring-3 `.capp` can issue filesystem syscalls against it.
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+fn mount_root_fs_early() {
+    use cibos_kernel::fs::Fs;
+    // SAFETY: single-threaded bring-up; probes the primary slave ATA ports.
+    let Some(data) = (unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Slave) })
+    else {
+        kprintln!("CIBOS kernel: no data disk on the slave (root fs not mounted)");
+        return;
+    };
+    kprintln!(
+        "CIBOS kernel: data disk (slave) online — {} sectors; formatting CIBOSFS",
+        data.sectors()
+    );
+    match Fs::format(data, 64).and_then(|mut fs| {
+        fs.mkdir(b"/etc")?;
+        Ok(fs)
+    }) {
+        Ok(fs) => {
+            *ROOT_FS.lock() = Some(fs);
+            kprintln!("CIBOS kernel: root filesystem mounted (CIBOSFS), /etc ready");
+        }
+        Err(e) => kprintln!("CIBOS kernel: root fs format failed: {:?}", e),
+    }
+}
+
 /// Probe the primary ATA bus and read back the boot medium to prove real block
 /// I/O. Reads LBA 0 (the MBR — must end in the 0x55AA boot signature) and LBA 1
 /// (the Boot Layout Descriptor — must carry the `CIBOSBL1` magic the image tool
@@ -656,6 +691,12 @@ fn demonstrate_storage() {
     #[cfg(feature = "storage-selftest")]
     {
         use cibos_kernel::fs::Fs;
+        // If the root filesystem was already mounted early (before the apps),
+        // exercise it through the syscall ABI rather than reformatting.
+        if ROOT_FS.lock().is_some() {
+            demonstrate_fs_syscalls();
+            return;
+        }
         // SAFETY: single-threaded bring-up; probes the primary slave.
         match unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Slave) } {
             Some(data) => {
