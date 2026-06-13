@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// A line-oriented console: write a line, read a line.
 ///
@@ -45,3 +46,40 @@ pub trait Console {
         self.read_line()
     }
 }
+
+/// The filesystem surface a line-oriented application uses.
+///
+/// This is the exact set of operations the shell's command dispatcher needs,
+/// over `&str` paths (UTF-8). It is implemented twice — by the host SDK's
+/// `Filesystem` (development/tests) and by the on-kernel `cibos-app` runtime
+/// (syscall-backed) — so the *same* application logic runs in both places.
+pub trait ShellFs {
+    /// Create or overwrite the file at `path` with `data`; `true` on success.
+    fn write(&self, path: &str, data: &[u8]) -> bool;
+    /// Read the whole file at `path`, or `None` if it does not exist.
+    fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// List entries under `path` (a directory or prefix).
+    fn list(&self, path: &str) -> Vec<String>;
+    /// Delete the file at `path`; `true` if it was removed.
+    fn delete(&self, path: &str) -> bool;
+}
+
+/// The minimal system surface a line-oriented application uses: a filesystem,
+/// a monotonic clock, and its resource limits. This is everything the shell's
+/// synchronous command dispatcher touches — deliberately no spawn, channels, or
+/// networking, which belong to the async host runtime and are replaced by the
+/// kernel's own process model.
+pub trait ShellSystem {
+    /// The filesystem handle type this system hands out.
+    type Fs: ShellFs;
+
+    /// Obtain a filesystem handle.
+    fn filesystem(&self) -> Self::Fs;
+
+    /// Monotonic time since boot, in nanoseconds.
+    fn now_nanos(&self) -> u64;
+
+    /// The resource limits granted to this application.
+    fn resource_limits(&self) -> shared::ResourceLimits;
+}
+

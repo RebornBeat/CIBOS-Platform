@@ -1,0 +1,31 @@
+[package]
+name = "shell-rs"
+version = "0.1.0"
+edition = "2021"
+description = "CIBOS shell application (.capp): the REAL shell::dispatch running in ring 3 on the cibos-app runtime, composing the existing package-manager"
+
+[[bin]]
+name = "shell-rs"
+path = "src/main.rs"
+
+[dependencies]
+cibos-app = { path = "../../../cibos-app" }
+shared = { path = "../../../shared", default-features = false }
+cibos-console = { path = "../../../cibos-console" }
+# The REAL shell library and the existing apps it composes, no_std builds —
+# reused verbatim, not reimplemented.
+shell = { path = "../../../applications/shell", default-features = false }
+package-manager = { path = "../../../applications/package-manager", default-features = false }
+kvstore = { path = "../../../applications/kvstore", default-features = false }
+editor = { path = "../../../applications/editor", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+# Standalone: built only for the bare app target by kernel-image's build script.

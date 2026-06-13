@@ -1,0 +1,29 @@
+CIBOS / CIBIOS / HIP — FULL sandbox archive
+============================================
+State at archive time: steps 1-4 of the app-layer port COMPLETE and
+runtime-verified in QEMU. The real interactive product loop now reaches:
+  boot -> storage -> create-user -> login (real login crate) -> shell
+  -> compose existing apps (pkg / kv / edit) in ring 3.
+
+Verified this state:
+  - Workspace: 315 tests pass, 0 fail.
+  - All crates build host; bare crates build for x86_64-unknown-none.
+  - clippy clean on touched crates.
+  - QEMU: login::run_login_for authenticates; shell::dispatch runs in ring 3
+    composing the EXISTING package-manager, kvstore, editor (each reused
+    verbatim via process_command). FsList/FsDelete syscalls + CIBOSFS
+    remove_file exercised (ls / rm). Boot completes.
+
+Key crates added/changed this arc:
+  - cibos-console  : Console + ShellFs/ShellSystem traits (no_std app seam)
+  - cibos-sync     : std-API-compatible no_std spin Mutex (for app shared state)
+  - cibos-app      : SyscallConsole + SyscallSystem (ring-3 backends)
+  - accounts/login : converted to no_std (+ portable-pqc); credential format
+                     reconciled (one hash, CredentialRecord persistence bridge)
+  - shell / package-manager / kvstore / editor : no_std-capable (CliApp gated)
+  - kernel-image/apps/{login-rs, shell-rs} : thin ring-3 .capp launchers for the
+                     REAL shared crates (NOT reimplementations)
+
+Excluded from archive: target/, *-target/, *.img, *.key (regenerable / secret).
+deliverable-docs/ holds the four firmware ELFs (x86_64/aarch64/riscv64/i686).
+License: MIT. See PORT-PLAN-AND-REVIEW.md for the authoritative ordered plan.

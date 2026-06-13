@@ -9,3 +9,7 @@ description = "CIBOS line-oriented Console trait — the no_std I/O seam shared 
 [lib]
 name = "cibos_console"
 path = "src/lib.rs"
+
+[dependencies]
+# For ResourceLimits in the ShellSystem trait (no_std, no default features).
+shared = { workspace = true, default-features = false }

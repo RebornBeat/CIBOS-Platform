@@ -89,6 +89,9 @@ dependencies = [
 [[package]]
 name = "cibos-console"
 version = "0.1.0"
+dependencies = [
+ "shared",
+]
 
 [[package]]
 name = "cibos-input"
@@ -116,10 +119,15 @@ name = "cibos-sdk"
 version = "0.1.0"
 dependencies = [
  "cibos-async-runtime",
+ "cibos-console",
  "cibos-kernel",
  "cibos-macros",
  "shared",
 ]
+
+[[package]]
+name = "cibos-sync"
+version = "0.1.0"
 
 [[package]]
 name = "clock"
@@ -179,7 +187,9 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "editor"
 version = "0.1.0"
 dependencies = [
+ "cibos-console",
  "cibos-sdk",
+ "cibos-sync",
  "platform-cli",
  "shared",
 ]
@@ -271,7 +281,9 @@ dependencies = [
 name = "kvstore"
 version = "0.1.0"
 dependencies = [
+ "cibos-console",
  "cibos-sdk",
+ "cibos-sync",
  "platform-cli",
  "shared",
 ]
@@ -345,7 +357,7 @@ dependencies = [
 name = "package-manager"
 version = "0.1.0"
 dependencies = [
- "cibos-sdk",
+ "cibos-console",
  "platform-cli",
  "shared",
 ]
@@ -525,6 +537,7 @@ dependencies = [
 name = "shell"
 version = "0.1.0"
 dependencies = [
+ "cibos-console",
  "cibos-sdk",
  "editor",
  "kvstore",

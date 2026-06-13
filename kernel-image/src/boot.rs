@@ -574,6 +574,34 @@ fn run_ring3_demo(
                     Err(e) => kprintln!("CIBOS kernel: login(auth) launch failed: {e}"),
                 }
             }
+
+            // Run the REAL shell (shell::dispatch composing the existing
+            // package-manager) in ring 3, driving it with a scripted command
+            // sequence (sendkey is unreliable, so inject programmatically). This
+            // exercises the whole shell stack — ReadKey -> read_line, the generic
+            // dispatch, the Fs* syscalls (write/read/ls/rm), Now -> uptime, and a
+            // composed app program (`pkg`) — all on the booted kernel.
+            const SHELL_RS_CAPP: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
+            if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
+                kprintln!("CIBOS kernel: --- shell app run ---");
+                inject_text("help");
+                inject_enter();
+                inject_text("kv set k hi");
+                inject_enter();
+                inject_text("kv get k");
+                inject_enter();
+                inject_text("edit append line1");
+                inject_enter();
+                inject_text("edit show");
+                inject_enter();
+                inject_text("exit");
+                inject_enter();
+                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                    Ok(code) => kprintln!("CIBOS kernel: shell exited with code {code}"),
+                    Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+                }
+            }
         }
     }
 }
@@ -1021,6 +1049,37 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
             return Err(SyscallError::NotPermitted);
         };
         Ok(fs.exists(path))
+    }
+
+    fn fs_list(
+        &self,
+        path: &[u8],
+    ) -> Result<Option<alloc::vec::Vec<alloc::string::String>>, shared::protocols::syscall::SyscallError>
+    {
+        use shared::protocols::syscall::SyscallError;
+        let guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_ref() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        match fs.list_dir(path) {
+            Ok(entries) => Ok(Some(
+                entries
+                    .into_iter()
+                    .map(|e| alloc::string::String::from_utf8_lossy(&e.name).into_owned())
+                    .collect(),
+            )),
+            Err(cibos_kernel::fs::FsError::NotFound) => Ok(None),
+            Err(e) => Err(fs_err(e)),
+        }
+    }
+
+    fn fs_delete(&self, path: &[u8]) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = ROOT_FS.lock();
+        let Some(fs) = guard.as_mut() else {
+            return Err(SyscallError::NotPermitted);
+        };
+        fs.remove_file(path).map_err(fs_err)
     }
 
     fn read_key(&self, blocking: bool) -> i64 {

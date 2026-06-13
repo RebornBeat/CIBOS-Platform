@@ -40,6 +40,9 @@ dependencies = [
 [[package]]
 name = "cibos-console"
 version = "0.1.0"
+dependencies = [
+ "shared",
+]
 
 [[package]]
 name = "cpufeatures"

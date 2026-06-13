@@ -11,15 +11,33 @@ name = "shell"
 path = "src/lib.rs"
 
 # A runnable system shell composing the shell library with bundled utilities
-# (the package manager), driven by the host console.
+# (the package manager), driven by the host console. Host-only (std).
 [[bin]]
 name = "cibos-shell"
 path = "src/main.rs"
+required-features = ["std"]
 
 [dependencies]
-shared = { workspace = true, features = ["std"] }
-cibos-sdk = { workspace = true }
-platform-cli = { workspace = true }
-package-manager = { workspace = true }
-kvstore = { workspace = true }
-editor = { workspace = true }
+shared = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+# Host-only (the runnable CliApp/async entry, the bundled-utility bin, and tests).
+cibos-sdk = { workspace = true, optional = true }
+platform-cli = { workspace = true, optional = true }
+package-manager = { workspace = true, optional = true }
+kvstore = { workspace = true, optional = true }
+editor = { workspace = true, optional = true }
+
+[features]
+# Host build (default): the runnable shell, its CliApp impl, the host console,
+# and the bundled utilities. On by default so the bin and existing tests are
+# unchanged. The no_std build (kernel `.capp`) uses only the portable core
+# (`Shell`/`Program`/`dispatch`) and registers programs itself.
+default = ["std"]
+std = [
+    "dep:cibos-sdk",
+    "dep:platform-cli",
+    "dep:package-manager",
+    "dep:kvstore",
+    "dep:editor",
+    "shared/std",
+]

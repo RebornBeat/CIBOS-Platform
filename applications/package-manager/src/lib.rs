@@ -12,13 +12,26 @@
 //! reads commands from the console and prints results. Supported commands:
 //! `list`, `info <name>`, `verify <name>`, `install <name>`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use platform_cli::{CliApp, CliContext, Console};
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use alloc::vec;
+use alloc::vec::Vec;
+
+use cibos_console::Console;
 use shared::crypto::hash::{digests_equal_ct, sha256, Digest256};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+
+#[cfg(feature = "std")]
+use platform_cli::{CliApp, CliContext};
 
 /// A package: its identity, declared content hash, and the bytes as delivered.
 #[derive(Debug, Clone)]
@@ -89,15 +102,18 @@ impl Package {
 }
 
 /// The package catalog.
+#[cfg(feature = "std")]
 struct Catalog {
     packages: BTreeMap<String, Package>,
 }
 
 /// The package manager application.
+#[cfg(feature = "std")]
 pub struct PackageManager {
     catalog: Arc<Catalog>,
 }
 
+#[cfg(feature = "std")]
 impl PackageManager {
     /// Build a package manager over the given packages.
     #[must_use]
@@ -185,6 +201,7 @@ fn not_found(arg: Option<&str>) -> String {
     }
 }
 
+#[cfg(feature = "std")]
 impl CliApp for PackageManager {
     fn name(&self) -> &str {
         "package-manager"

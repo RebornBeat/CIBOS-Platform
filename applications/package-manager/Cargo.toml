@@ -11,6 +11,14 @@ name = "package_manager"
 path = "src/lib.rs"
 
 [dependencies]
-shared = { workspace = true, features = ["std"] }
-cibos-sdk = { workspace = true }
-platform-cli = { workspace = true }
+shared = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+# Host-only: the CliApp/CliContext host entry + Capture/Runner in tests.
+platform-cli = { workspace = true, optional = true }
+
+[features]
+# Host build (default): the runnable CliApp entry + host console. On by default
+# so existing consumers/tests are unchanged. The no_std build exposes the core
+# (`Package`, `process_command`, verification) for the on-kernel shell `.capp`.
+default = ["std"]
+std = ["dep:platform-cli", "shared/std"]

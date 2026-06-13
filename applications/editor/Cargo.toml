@@ -11,6 +11,17 @@ name = "editor"
 path = "src/lib.rs"
 
 [dependencies]
-shared = { workspace = true, features = ["std"] }
-cibos-sdk = { workspace = true }
-platform-cli = { workspace = true }
+shared = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+cibos-sync = { workspace = true }
+# Host-only: the CliApp/async entry + filesystem-backed save/load + tests.
+cibos-sdk = { workspace = true, optional = true }
+platform-cli = { workspace = true, optional = true }
+
+[features]
+# Host build (default): the runnable CliApp entry, the filesystem save/load, and
+# the host console. On by default so existing consumers/tests are unchanged. The
+# no_std build exposes the core (`Buffer`, `new_buffer`, `process_command` — pure
+# buffer ops) for the on-kernel shell `.capp`.
+default = ["std"]
+std = ["dep:cibos-sdk", "dep:platform-cli", "shared/std"]

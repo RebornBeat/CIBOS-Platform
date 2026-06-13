@@ -35,6 +35,7 @@ fn main() {
         build_hello_capp(&dir);
         build_hello_rs_capp(&dir);
         build_login_rs_capp(&dir);
+        build_shell_rs_capp(&dir);
     }
 }
 
@@ -215,6 +216,12 @@ fn build_rust_capp(dir: &str, name: &str, app_vaddr: u64) {
 /// Build the login application `.capp` (create-user / login on cibos-app).
 fn build_login_rs_capp(dir: &str) {
     build_rust_capp(dir, "login-rs", 0x0000_5200_0000_0000);
+}
+
+/// Build the shell application `.capp` (the real `shell::dispatch` on cibos-app,
+/// composing the existing package-manager).
+fn build_shell_rs_capp(dir: &str) {
+    build_rust_capp(dir, "shell-rs", 0x0000_5300_0000_0000);
 }
 
 /// Parse `readelf -S` to find the `.data` and `.bss` section addresses/sizes for

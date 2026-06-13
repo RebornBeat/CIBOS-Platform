@@ -7,13 +7,34 @@
 //! (so it composes into the shell as a program) and a [`CliApp`] that spawns a
 //! worker lane reading commands from the console.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use cibos_console::Console;
+
+// The shared store lives behind a lock so `process_command` is identical on the
+// host (state shared into an async worker) and in a ring-3 `.capp`. On the host
+// that lock is `std::sync::Mutex`; in `no_std` it is the spin `Mutex` from
+// `cibos-sync` — both expose `lock() -> Result<Guard, _>`, so the body is the
+// same either way.
+#[cfg(feature = "std")]
+use std::sync::Mutex;
+#[cfg(not(feature = "std"))]
+use cibos_sync::Mutex;
+
+#[cfg(feature = "std")]
 use cibos_sdk::WeightClass;
-use platform_cli::{CliApp, CliContext, Console};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "std")]
+use platform_cli::{CliApp, CliContext};
 
 /// Shared store state.
 pub type Store = Arc<Mutex<BTreeMap<String, String>>>;
@@ -107,6 +128,7 @@ impl Default for KvStore {
     }
 }
 
+#[cfg(feature = "std")]
 impl CliApp for KvStore {
     fn name(&self) -> &str {
         "kvstore"

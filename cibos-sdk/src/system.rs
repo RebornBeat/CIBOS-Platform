@@ -394,3 +394,39 @@ impl System {
             .map_err(|e| crate::SdkError::from(shared::SharedError::from(e)))
     }
 }
+
+// ---- App-seam trait impls (cibos-console) ------------------------------------
+//
+// These let the *same* line-oriented application logic (e.g. `shell::dispatch`)
+// run against the host SDK here and against the on-kernel `cibos-app` runtime,
+// by abstracting exactly the surface that logic uses. The bodies delegate to the
+// existing inherent methods, so host behavior is unchanged.
+
+impl cibos_console::ShellFs for Filesystem {
+    fn write(&self, path: &str, data: &[u8]) -> bool {
+        Filesystem::write(self, path, data)
+    }
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        Filesystem::read(self, path)
+    }
+    fn list(&self, path: &str) -> Vec<String> {
+        Filesystem::list(self, path)
+    }
+    fn delete(&self, path: &str) -> bool {
+        Filesystem::delete(self, path)
+    }
+}
+
+impl cibos_console::ShellSystem for System {
+    type Fs = Filesystem;
+
+    fn filesystem(&self) -> Filesystem {
+        System::filesystem(self)
+    }
+    fn now_nanos(&self) -> u64 {
+        System::now(self).as_nanos()
+    }
+    fn resource_limits(&self) -> shared::ResourceLimits {
+        System::resource_limits(self)
+    }
+}

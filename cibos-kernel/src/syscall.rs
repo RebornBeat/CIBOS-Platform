@@ -108,6 +108,18 @@ pub trait SyscallEnv {
         Err(SyscallError::NotPermitted)
     }
 
+    /// List the directory at `path`, returning the entry names. `Ok(None)` if the
+    /// path does not exist or is not a directory.
+    fn fs_list(&self, _path: &[u8]) -> Result<Option<alloc::vec::Vec<alloc::string::String>>, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Delete the file at `path`. `Ok(())` on success;
+    /// [`SyscallError::NotFound`] if absent.
+    fn fs_delete(&self, _path: &[u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
     /// Read the next keyboard event. `blocking` selects waiting vs immediate.
     /// Returns the packed key value (>= 0, via `encode_key`) or a negative
     /// [`SyscallError`] (`NotFound` when non-blocking and the queue is empty).
@@ -181,6 +193,16 @@ pub fn dispatch<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome 
         }
         Syscall::ReadKey => SyscallOutcome::Return(env.read_key(req.arg0 != 0)),
         Syscall::GetRandom => get_random(req, env),
+        Syscall::FsList => fs_list(req, env),
+        Syscall::FsDelete => {
+            match read_path(req.boundary, req.arg0, req.arg1 as usize, env) {
+                Ok(path) => match env.fs_delete(&path) {
+                    Ok(()) => SyscallOutcome::Return(0),
+                    Err(e) => SyscallOutcome::Return(e.as_return()),
+                },
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
     }
 }
 
@@ -248,6 +270,41 @@ fn fs_read<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
     // Copy up to buf_len bytes back to the user; return the count.
     let n = core::cmp::min(data.len(), args.buf_len as usize);
     if let Err(e) = env.copy_to_user(req.boundary, args.buf_ptr, &data[..n]) {
+        return SyscallOutcome::Return(e.as_return());
+    }
+    SyscallOutcome::Return(n as i64)
+}
+
+/// `fs_list`: list the directory named by the path in the arg block, writing the
+/// entry names joined by `\n` (no trailing newline) into the user buffer in the
+/// arg block; return bytes written (truncated to `buf_len`) or a negative error.
+fn fs_list<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let args = match read_rw_args(req.boundary, req.arg0, env) {
+        Ok(a) => a,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    if args.buf_len as usize > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    let path = match read_path(req.boundary, args.path_ptr, args.path_len as usize, env) {
+        Ok(p) => p,
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    let names = match env.fs_list(&path) {
+        Ok(Some(n)) => n,
+        Ok(None) => return SyscallOutcome::Return(SyscallError::NotFound.as_return()),
+        Err(e) => return SyscallOutcome::Return(e.as_return()),
+    };
+    // Join the entry names with '\n' into a single byte buffer.
+    let mut out = alloc::vec::Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(name.as_bytes());
+    }
+    let n = core::cmp::min(out.len(), args.buf_len as usize);
+    if let Err(e) = env.copy_to_user(req.boundary, args.buf_ptr, &out[..n]) {
         return SyscallOutcome::Return(e.as_return());
     }
     SyscallOutcome::Return(n as i64)
@@ -348,6 +405,39 @@ mod tests {
         fn fs_mkdir(&self, path: &[u8]) -> Result<(), SyscallError> {
             self.dirs.borrow_mut().insert(path.to_vec());
             Ok(())
+        }
+        fn fs_list(
+            &self,
+            path: &[u8],
+        ) -> Result<Option<alloc::vec::Vec<alloc::string::String>>, SyscallError> {
+            use alloc::string::String;
+            if !self.dirs.borrow().contains(path) {
+                return Ok(None);
+            }
+            let mut prefix = path.to_vec();
+            if prefix.last() != Some(&b'/') {
+                prefix.push(b'/');
+            }
+            // Snapshot the keys first so we don't hold the files borrow.
+            let keys: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+                self.files.borrow().keys().cloned().collect();
+            let mut names = alloc::vec::Vec::new();
+            for key in keys {
+                if key.len() > prefix.len() && key.starts_with(&prefix) {
+                    let rest = &key[prefix.len()..];
+                    if !rest.contains(&b'/') {
+                        names.push(String::from_utf8_lossy(rest).into_owned());
+                    }
+                }
+            }
+            Ok(Some(names))
+        }
+        fn fs_delete(&self, path: &[u8]) -> Result<(), SyscallError> {
+            if self.files.borrow_mut().remove(path).is_some() {
+                Ok(())
+            } else {
+                Err(SyscallError::NotFound)
+            }
         }
         fn fs_exists(&self, path: &[u8]) -> Result<bool, SyscallError> {
             Ok(self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path))
@@ -576,6 +666,65 @@ mod tests {
         };
         assert_eq!(
             dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::NotFound.as_return())
+        );
+    }
+
+    #[test]
+    fn fs_list_and_delete_through_syscalls() {
+        // Set up a dir /d with two files via the env directly, then exercise the
+        // FsList and FsDelete syscalls through dispatch.
+        let base = 0x4000_0000u64;
+        let env = env_with("");
+        env.dirs.borrow_mut().insert(b"/d".to_vec());
+        env.files
+            .borrow_mut()
+            .insert(b"/d/a".to_vec(), b"x".to_vec());
+        env.files
+            .borrow_mut()
+            .insert(b"/d/b".to_vec(), b"y".to_vec());
+
+        // User memory: [path "/d"][FsRwArgs][listing buffer].
+        let path = b"/d";
+        let args_off = path.len();
+        let buf_off = args_off + FS_RW_ARGS_LEN;
+        let buf_len = 32usize;
+        let list_args = FsRwArgs {
+            path_ptr: base,
+            path_len: path.len() as u64,
+            buf_ptr: base + buf_off as u64,
+            buf_len: buf_len as u64,
+        };
+        let mut mem = alloc::vec::Vec::new();
+        mem.extend_from_slice(path);
+        mem.extend_from_slice(&list_args.to_bytes());
+        mem.extend_from_slice(&alloc::vec![0u8; buf_len]);
+        *env.data.borrow_mut() = mem;
+
+        // FsList -> writes "a\nb" (3 bytes) into the buffer.
+        let lr = SyscallRequest {
+            number: Syscall::FsList.number(),
+            arg0: base + args_off as u64,
+            arg1: 0,
+            arg2: 0,
+            boundary: BoundaryId::new(1),
+        };
+        let out = dispatch(&lr, &env);
+        // The listing is "a" and "b" joined by '\n' = 3 bytes (order from BTreeMap).
+        assert_eq!(out, SyscallOutcome::Return(3));
+        let written: alloc::vec::Vec<u8> = env.data.borrow()[buf_off..buf_off + 3].to_vec();
+        assert_eq!(&written, b"a\nb");
+
+        // FsDelete /d/a -> 0, then listing has only "b".
+        let delpath = b"/d/a";
+        // Reuse arg0/arg1 path-style for FsDelete: put the path at base again.
+        *env.data.borrow_mut() = delpath.to_vec();
+        let dr = req(Syscall::FsDelete.number(), base, delpath.len() as u64);
+        assert_eq!(dispatch(&dr, &env), SyscallOutcome::Return(0));
+        assert!(!env.files.borrow().contains_key(&delpath.to_vec()));
+        // Deleting a missing file -> NotFound.
+        assert_eq!(
+            dispatch(&dr, &env),
             SyscallOutcome::Return(SyscallError::NotFound.as_return())
         );
     }

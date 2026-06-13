@@ -500,6 +500,25 @@ impl<D: BlockDevice> Fs<D> {
         Err(FsError::NotFound)
     }
 
+    /// Remove the entry `name` from directory `dir_ino` by re-encoding the
+    /// directory without it. Mirrors [`Self::dir_add`]. Returns
+    /// [`FsError::NotFound`] if the entry is absent.
+    fn dir_remove(&mut self, dir_ino: u32, name: &[u8]) -> Result<(), FsError> {
+        let existing = self.read_dir_entries(dir_ino)?;
+        let before = existing.len();
+        let entries: Vec<(u32, Vec<u8>)> = existing
+            .into_iter()
+            .filter(|(_, _, n)| n != name)
+            .map(|(i, _, n)| (i, n))
+            .collect();
+        if entries.len() == before {
+            return Err(FsError::NotFound);
+        }
+        let data = Self::encode_dir(&entries)?;
+        let mut dir = self.read_inode(dir_ino)?;
+        self.write_inode_data(dir_ino, &mut dir, &data)
+    }
+
     // ---- public path-based API ---------------------------------------------
 
     /// Split a `/`-separated path into components, ignoring empty parts.
@@ -612,6 +631,36 @@ impl<D: BlockDevice> Fs<D> {
     #[must_use]
     pub fn exists(&self, path: &[u8]) -> bool {
         self.resolve(path).is_ok()
+    }
+
+    /// Remove the file at `path`: free its data blocks, free its inode, and
+    /// remove its directory entry. Only regular files are removed here;
+    /// attempting to remove a directory returns [`FsError::WrongKind`].
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::NotFound`] if the path does not exist; [`FsError::WrongKind`]
+    /// if it names a directory.
+    pub fn remove_file(&mut self, path: &[u8]) -> Result<(), FsError> {
+        let (parent, name) = self.resolve_parent(path)?;
+        let ino = self.dir_lookup(parent, name)?;
+        let mut node = self.read_inode(ino)?;
+        if node.kind != KIND_FILE {
+            return Err(FsError::WrongKind);
+        }
+        // Free every data block the file holds.
+        for &blk in node.direct.iter().take(node.blocks_used()) {
+            if blk != 0 {
+                self.free_block(blk)?;
+            }
+        }
+        // Free the inode (mark it KIND_FREE with no blocks).
+        node.kind = KIND_FREE;
+        node.size = 0;
+        node.direct = [0; DIRECT_BLOCKS];
+        self.write_inode(ino, &node)?;
+        // Unlink it from its parent directory.
+        self.dir_remove(parent, name)
     }
 }
 
@@ -753,5 +802,43 @@ mod tests {
         fs.write_file(b"/b", &vec![3u8; 2 * BLOCK_SIZE]).unwrap(); // reuses freed
         assert_eq!(fs.read_file(b"/a").unwrap(), vec![2u8; BLOCK_SIZE]);
         assert_eq!(fs.read_file(b"/b").unwrap(), vec![3u8; 2 * BLOCK_SIZE]);
+    }
+
+    #[test]
+    fn remove_file_unlinks_and_reclaims() {
+        let mut fs = fresh(64, 32);
+        fs.mkdir(b"/etc").unwrap();
+        fs.write_file(b"/etc/a", &vec![1u8; 2 * BLOCK_SIZE]).unwrap();
+        fs.write_file(b"/etc/b", b"keep").unwrap();
+        assert_eq!(fs.list_dir(b"/etc").unwrap().len(), 2);
+
+        // Remove /etc/a: it disappears from the listing, the other stays.
+        fs.remove_file(b"/etc/a").unwrap();
+        let listing = fs.list_dir(b"/etc").unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name, b"b");
+        assert!(!fs.exists(b"/etc/a"));
+        assert_eq!(fs.read_file(b"/etc/b").unwrap(), b"keep");
+
+        // Removing a missing file -> NotFound.
+        assert_eq!(fs.remove_file(b"/etc/a").err(), Some(FsError::NotFound));
+        // Removing a directory -> WrongKind.
+        assert_eq!(fs.remove_file(b"/etc").err(), Some(FsError::WrongKind));
+
+        // The freed blocks/inode are reusable: write a new file that needs them.
+        fs.write_file(b"/etc/c", &vec![7u8; 2 * BLOCK_SIZE]).unwrap();
+        assert_eq!(fs.read_file(b"/etc/c").unwrap(), vec![7u8; 2 * BLOCK_SIZE]);
+    }
+
+    #[test]
+    fn remove_persists_across_remount() {
+        let mut fs = fresh(128, 64);
+        fs.write_file(b"/x", b"gone soon").unwrap();
+        fs.write_file(b"/y", b"stays").unwrap();
+        fs.remove_file(b"/x").unwrap();
+        let dev = fs.into_device();
+        let fs2 = Fs::mount(dev).unwrap();
+        assert!(!fs2.exists(b"/x"));
+        assert_eq!(fs2.read_file(b"/y").unwrap(), b"stays");
     }
 }

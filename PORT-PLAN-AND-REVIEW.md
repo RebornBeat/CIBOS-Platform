@@ -151,10 +151,83 @@ This is the process model the OS needs for the login→shell hand-off anyway.
      make shell's `dispatch` generic over them (dispatch is private → safe).
      Provide TWO impls: the SDK `System`/`Filesystem` (host, behavior unchanged →
      existing shell tests stay green) and a `cibos-app` syscall-backed impl.
-   - GAP to fill first: `cibos-app::fs` has read_into/write/mkdir/exists but NO
-     `list`/`delete`, and there is no fs-list syscall yet. Add `FsList` + `FsDelete`
-     syscalls (mirror the existing `Fs*` ABI) + kernel dispatch + `cibos-app` wrappers.
-   - Then reuse `dispatch` VERBATIM on the kernel. No reimplementation of shell.
+   - GAP to fill first: DONE — `FsList` (11) + `FsDelete` (12) syscalls added,
+     kernel dispatch + CIBOSFS `remove_file`/`list_dir`, `cibos-app::fs::{list,
+     list_into,delete}` wrappers. 314/0, bare builds, clippy clean.
+   - DONE: the trait seam is implemented and verified. `cibos-console` now
+     defines `ShellFs` + `ShellSystem` (no_std, `ResourceLimits` from `shared`).
+     `shell::dispatch` is generic `dispatch<S: ShellSystem>` — the ONLY body
+     change was `now().as_nanos()` → `now_nanos()`; the `filesystem().{...}` calls
+     are verbatim. Host impl: `impl ShellSystem for cibos_sdk::System` (+ `ShellFs
+     for Filesystem`) delegating to existing methods — 6/6 shell tests still pass,
+     host behavior unchanged. Kernel impl: `cibos_app::SyscallSystem`/`SyscallFs`
+     backed by `fs::{write,read,list,delete}` + `now_nanos`. Workspace 314/0,
+     clippy clean, cibos-app builds bare. NOTHING retired; the host shell stays.
+   - REMAINING for step 4: a `shell` `.capp` that runs `dispatch` in a synchronous
+     read-line loop with `SyscallSystem` + `SyscallConsole`, then the libs shell
+     composes (package-manager, kvstore, editor) ported as needed.
+
+   STEP-4 PLAN (file-grounded; these are the EXISTING apps, reused verbatim — not
+   new ones; the only new artifact is the thin `.capp` ring-3 entry, exactly like
+   `login-rs` is now a thin launcher for the real `login` crate):
+   - Shell composes the existing apps via `with_program("pkg"|"kv"|"edit",
+     |args, &dyn Console| app::process_command(state, line, console))`. Each
+     program is `Fn(&[&str], &dyn Console)` — it needs ONLY the `Console` seam +
+     its own state; NO `System`. So they compose cleanly with `SyscallConsole`.
+   - no_std distances (measured, not assumed):
+     * `shell` (lib): portable core = `Shell`/`Program`/`with_program`/`dispatch`
+       (BTreeMap, Arc, Console, ShellSystem). std-coupled = ONLY `impl CliApp for
+       Shell::run()` (cibos_sdk/WeightClass/spawn — the async host entry). Gate the
+       CliApp impl behind `std`; the kernel `.capp` calls `dispatch` directly.
+     * `package-manager`: cleanest. Core `process_command` needs Console + BTreeMap
+       + Arc only. `CliApp`/`CliContext` impl → std-gate. Drop `cibos-sdk` from the
+       no_std build.
+     * `kvstore`: Console + `Mutex` (→ no_std mutex, e.g. `spin`) + `cibos_sdk::
+       WeightClass` (only in the CliApp impl → std-gate).
+     * `editor`: Console + `Mutex` + `WeightClass` + ONE core coupling to
+       `cibos_sdk::Filesystem` (line ~145) — needs care; abstract that helper over
+       `ShellFs` or std-gate it. Most involved of the three.
+   - All depend on `platform-cli` only for `Console` (+ Capture/CliRunner in tests)
+     — already re-exported from `cibos-console`; switch the lib import to
+     `cibos-console`, keep `platform-cli` as a dev-dep for tests.
+   - ORDER (vertical slice first, runtime-checked each step, BARE-FIRST):
+     1. DONE: `shell` lib is no_std (CliApp impl + bin gated behind `std`;
+        `dispatch`/`Shell`/`programs()`/`PROMPT` are pub portable core). Host 6/6.
+     2. DONE: `package-manager` is no_std (CliApp + `PackageManager`/`Catalog`
+        wrapper gated behind `std`; `process_command` + `Package` are the portable
+        core). Host 3/3.
+     3. DONE + RUNTIME-VERIFIED: `shell-rs` `.capp` (new thin ring-3 entry at vaddr
+        0x5300...) builds a `Shell`, registers the EXISTING package-manager as
+        `pkg` (reusing `process_command` verbatim), and runs `shell::dispatch` in a
+        synchronous read-line loop on `SyscallSystem` + `SyscallConsole`. QEMU:
+        help / pkg list / write / read / ls / rm / exit ALL work in ring 3, exit 0,
+        boot complete. The SAME dispatch the host runs.
+     4. DONE + RUNTIME-VERIFIED: `kvstore` and `editor` ported to no_std (CliApp +
+        editor's filesystem-backed `handle_storage` gated behind `std`; their
+        `process_command` is the pure no_std core). The host `Mutex` is
+        cfg-selected: `std::sync::Mutex` on host, `cibos_sync::Mutex` (a new tiny
+        std-API-compatible spin lock crate) on bare — so `process_command` is
+        byte-identical. The `shell-rs` `.capp` now registers all three existing
+        apps (`pkg`/`kv`/`edit`), reusing each `process_command` verbatim. QEMU:
+        `programs: edit kv pkg`; `kv set/get`, `edit append/show` all work in ring
+        3; exit 0; boot complete.
+   - NEW small crate: `cibos-sync` (no_std, std-API-compatible `Mutex`) — the home
+     for a shared lock primitive usable by host + bare app builds. Editor's
+     `save`/`load` (SDK `Filesystem`) stayed host-only (not needed by the shell
+     `edit` program), so no `ShellFs` rework was required.
+
+   STEP 4 COMPLETE. The real shell + its three existing composed apps all run on
+   the booted kernel in ring 3, each reused verbatim (no reimplementation).
+   - Two real bugs found by running (fixed at root cause, not worked around):
+     * `cibos-app::fs::list` put a 4 KiB buffer on the 1-page user stack →
+       stack-overflow page fault. Fixed: use a heap `Vec` (the app heap is 256 KiB;
+       transient buffers belong there, matching the rest of cibos-app).
+     * The `.capp` build script tracks only `rerun-if-changed` of the app's OWN
+       files, so a change to a path-dep (`cibos-app`) left a STALE ELF embedded.
+       GUARDRAIL: after editing a crate a `.capp` depends on, force-clean its
+       `*-target` dir (and the `.capp`) before rebuilding the image, or verify the
+       rebuilt ELF (objdump) reflects the change.
+   - Guardrail: do NOT recreate any app logic. Reuse `process_command` verbatim.
 
    FORMER step-3 text retained:
 4. **Port shell** (the integrator) — synchronous command loop — then the libs it

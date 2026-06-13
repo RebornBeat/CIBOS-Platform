@@ -72,3 +72,61 @@ pub fn exists(path: &[u8]) -> Result<bool, SyscallError> {
     let ret = unsafe { syscall3(Syscall::FsExists, path.as_ptr() as u64, path.len() as u64, 0) };
     Ok(decode(ret)? != 0)
 }
+
+/// List the directory at `path` into `buf`, returning the number of bytes
+/// written. The listing is the entry names joined by `\n` (no trailing
+/// newline), truncated to `buf.len()`.
+///
+/// # Errors
+///
+/// [`SyscallError::NotFound`] if the path is not a directory, or another kernel
+/// error.
+pub fn list_into(path: &[u8], buf: &mut [u8]) -> Result<usize, SyscallError> {
+    let args = FsRwArgs {
+        path_ptr: path.as_ptr() as u64,
+        path_len: path.len() as u64,
+        buf_ptr: buf.as_mut_ptr() as u64,
+        buf_len: buf.len() as u64,
+    };
+    let raw = args.to_bytes();
+    // SAFETY: as `read_into`.
+    let ret = unsafe { syscall3(Syscall::FsList, raw.as_ptr() as u64, 0, 0) };
+    Ok(decode(ret)? as usize)
+}
+
+/// List the directory at `path`, returning the entry names as owned strings.
+/// Uses the heap; the listing is read into a bounded scratch buffer.
+///
+/// # Errors
+///
+/// As [`list_into`].
+pub fn list(path: &[u8]) -> Result<alloc::vec::Vec<alloc::string::String>, SyscallError> {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    // A page of listing is plenty for a directory of names; truncation only
+    // drops trailing entries, never corrupts (names are whole up to the cut).
+    // The buffer lives on the heap, not the stack: the per-app stack is a single
+    // page, so a 4 KiB stack array would overflow it. The app heap (mapped by
+    // the kernel) is the right place for transient buffers like this.
+    let mut buf = alloc::vec![0u8; 4096];
+    let n = list_into(path, &mut buf)?;
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let names: Vec<String> = text
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    Ok(names)
+}
+
+/// Delete the file at `path`.
+///
+/// # Errors
+///
+/// [`SyscallError::NotFound`] if the path does not exist, or another kernel
+/// error (e.g. it names a directory).
+pub fn delete(path: &[u8]) -> Result<(), SyscallError> {
+    // SAFETY: `path` is a valid slice; the kernel validates it.
+    let ret = unsafe { syscall3(Syscall::FsDelete, path.as_ptr() as u64, path.len() as u64, 0) };
+    decode(ret).map(|_| ())
+}

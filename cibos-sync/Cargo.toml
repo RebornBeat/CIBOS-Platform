@@ -1,0 +1,11 @@
+[package]
+name = "cibos-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS no_std synchronization primitives — a std-API-compatible spin mutex for applications that run both on the host and in ring 3"
+
+[lib]
+name = "cibos_sync"
+path = "src/lib.rs"

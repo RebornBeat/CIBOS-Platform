@@ -78,6 +78,16 @@ pub enum Syscall {
     /// `buf_ptr` with cryptographically-random bytes from the kernel CSPRNG;
     /// returns the number of bytes written or a negative error.
     GetRandom = 10,
+    /// `fs_list(args: *const FsRwArgs) -> isize`. List the directory named by the
+    /// path in `args` into the user buffer in `args`, as the entry names joined
+    /// by `\n` (no trailing newline); returns the number of bytes written
+    /// (>=0, truncated to `buf_len`) or a negative [`SyscallError`]. Reuses the
+    /// [`FsRwArgs`] block (path = directory, buf = destination).
+    FsList = 11,
+    /// `fs_delete(path_ptr: *const u8, path_len: usize) -> 0`. Remove the file
+    /// named by the path; returns 0 or a negative error
+    /// ([`SyscallError::NotFound`] if absent).
+    FsDelete = 12,
 }
 
 impl Syscall {
@@ -95,6 +105,8 @@ impl Syscall {
             8 => Some(Syscall::FsExists),
             9 => Some(Syscall::ReadKey),
             10 => Some(Syscall::GetRandom),
+            11 => Some(Syscall::FsList),
+            12 => Some(Syscall::FsDelete),
             _ => None,
         }
     }
@@ -326,6 +338,8 @@ mod tests {
             Syscall::FsExists,
             Syscall::ReadKey,
             Syscall::GetRandom,
+            Syscall::FsList,
+            Syscall::FsDelete,
         ] {
             assert_eq!(Syscall::from_number(s.number()), Some(s));
         }

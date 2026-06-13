@@ -33,4 +33,5 @@ host-memory-tracking = []
 shared = { workspace = true, features = ["std"] }
 cibos-async-runtime = { workspace = true, features = ["std"] }
 cibos-kernel = { workspace = true, features = ["std"] }
+cibos-console = { workspace = true }
 cibos-macros = { workspace = true }

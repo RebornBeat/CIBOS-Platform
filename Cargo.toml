@@ -16,6 +16,7 @@ members = [
     "cibos-input",
     "cibos-app",
     "cibos-console",
+    "cibos-sync",
     "platform-gui",
     "platform-mobile",
     "platform-server",
@@ -61,6 +62,7 @@ cibos-macros = { path = "cibos-macros" }
 platform-cli = { path = "platform-cli" }
 cibos-input = { path = "cibos-input" }
 cibos-console = { path = "cibos-console" }
+cibos-sync = { path = "cibos-sync" }
 platform-gui = { path = "platform-gui" }
 platform-mobile = { path = "platform-mobile" }
 platform-server = { path = "platform-server" }

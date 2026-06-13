@@ -7,12 +7,31 @@
 //! Exposes a per-line [`process_command`] handler (so it composes into the
 //! shell) and a [`CliApp`] that spawns a worker lane.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use cibos_console::Console;
+
+// The shared buffer lives behind a lock so `process_command` is identical on the
+// host and in a ring-3 `.capp`. Host: `std::sync::Mutex`; no_std: the spin
+// `Mutex` from `cibos-sync`. Both expose `lock() -> Result<Guard, _>`.
+#[cfg(feature = "std")]
+use std::sync::Mutex;
+#[cfg(not(feature = "std"))]
+use cibos_sync::Mutex;
+
+#[cfg(feature = "std")]
 use cibos_sdk::WeightClass;
-use platform_cli::{CliApp, CliContext, Console};
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "std")]
+use platform_cli::{CliApp, CliContext};
 
 /// Shared editor buffer (the lines of text).
 pub type Buffer = Arc<Mutex<Vec<String>>>;
@@ -117,6 +136,7 @@ impl Default for Editor {
     }
 }
 
+#[cfg(feature = "std")]
 impl CliApp for Editor {
     fn name(&self) -> &str {
         "editor"
@@ -140,6 +160,7 @@ impl CliApp for Editor {
 
 /// Handle `save <path>` / `load <path>` against the filesystem. Returns whether
 /// the line was a storage command (and thus already handled).
+#[cfg(feature = "std")]
 fn handle_storage(
     buffer: &Mutex<Vec<String>>,
     fs: &cibos_sdk::Filesystem,

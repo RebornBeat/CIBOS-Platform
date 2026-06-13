@@ -11,6 +11,16 @@ name = "kvstore"
 path = "src/lib.rs"
 
 [dependencies]
-shared = { workspace = true, features = ["std"] }
-cibos-sdk = { workspace = true }
-platform-cli = { workspace = true }
+shared = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+cibos-sync = { workspace = true }
+# Host-only: the CliApp/async entry (cibos-sdk) + host console/runtime + tests.
+cibos-sdk = { workspace = true, optional = true }
+platform-cli = { workspace = true, optional = true }
+
+[features]
+# Host build (default): the runnable CliApp entry + host console. On by default
+# so existing consumers/tests are unchanged. The no_std build exposes the core
+# (`Store`, `new_store`, `process_command`) for the on-kernel shell `.capp`.
+default = ["std"]
+std = ["dep:cibos-sdk", "dep:platform-cli", "shared/std"]

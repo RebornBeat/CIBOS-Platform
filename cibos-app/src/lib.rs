@@ -32,6 +32,7 @@ pub mod heap;
 pub mod input;
 pub mod rand;
 pub mod syscall;
+pub mod system_backend;
 
 // The freestanding runtime entry (_start + panic handler) is only meaningful on
 // the bare application target.
@@ -41,7 +42,8 @@ pub mod rt;
 pub use shared::protocols::syscall::SyscallError;
 
 pub use console_backend::SyscallConsole;
-pub use cibos_console::Console;
+pub use system_backend::{SyscallFs, SyscallSystem};
+pub use cibos_console::{Console, ShellFs, ShellSystem};
 
 #[cfg(test)]
 mod tests {

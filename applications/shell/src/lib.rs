@@ -13,13 +13,24 @@
 //! `process_command`), so existing apps drop in as shell programs without
 //! modification.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use platform_cli::{CliApp, CliContext, Console};
-use cibos_sdk::{System, WeightClass};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use cibos_console::{Console, ShellFs, ShellSystem};
+
+#[cfg(feature = "std")]
+use cibos_sdk::WeightClass;
+#[cfg(feature = "std")]
+use platform_cli::{CliApp, CliContext};
 
 /// A shell program: handles one invocation given its arguments and a console.
 pub type Program = Arc<dyn Fn(&[&str], &dyn Console) + Send + Sync>;
@@ -49,14 +60,25 @@ impl Shell {
         self.programs.insert(name.to_string(), Arc::new(program));
         self
     }
+
+    /// The registered program map, for driving [`dispatch`] directly (e.g. the
+    /// on-kernel `.capp` runs its own read-line loop over this).
+    #[must_use]
+    pub fn programs(&self) -> &BTreeMap<String, Program> {
+        &self.programs
+    }
 }
 
 /// The prompt written before each command read.
-const PROMPT: &str = "cibos> ";
+pub const PROMPT: &str = "cibos> ";
 
-fn dispatch(
+/// Dispatch a single command `line` against the registered `programs` and the
+/// system `system`, writing output to `console`. Returns `false` when the shell
+/// should exit (the `exit`/`quit` built-ins). This is the synchronous heart of
+/// the shell, reused verbatim by both the host runtime and the on-kernel `.capp`.
+pub fn dispatch<S: ShellSystem>(
     programs: &BTreeMap<String, Program>,
-    system: &System,
+    system: &S,
     line: &str,
     console: &dyn Console,
 ) -> bool {
@@ -121,7 +143,7 @@ fn dispatch(
         },
         "echo" => console.write_line(&args.join(" ")),
         "time" => {
-            let ms = system.now().as_nanos() / 1_000_000;
+            let ms = system.now_nanos() / 1_000_000;
             console.write_line(&format!("uptime: {ms} ms"));
         }
         "limits" => {
@@ -149,6 +171,7 @@ fn dispatch(
     true
 }
 
+#[cfg(feature = "std")]
 impl CliApp for Shell {
     fn name(&self) -> &str {
         "shell"
