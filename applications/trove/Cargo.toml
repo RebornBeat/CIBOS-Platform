@@ -11,7 +11,16 @@ name = "trove"
 path = "src/lib.rs"
 
 [dependencies]
-cibos-sdk = { workspace = true }
-package-manager = { workspace = true }
-platform-cli = { workspace = true }
-shared = { workspace = true, features = ["std"] }
+shared = { workspace = true, default-features = false }
+cibos-console = { workspace = true }
+package-manager = { workspace = true, default-features = false }
+# Host-only: the SDK Filesystem (a ShellFs impl) + CaptureConsole used in tests.
+cibos-sdk = { workspace = true, optional = true }
+platform-cli = { workspace = true, optional = true }
+
+[features]
+# Host build (default): pulls the SDK Filesystem + host console for tests. The
+# no_std build exposes the generic `Store<F: ShellFs>` + `process_command` for
+# the on-kernel shell `.capp` (backed by the syscall filesystem).
+default = ["std"]
+std = ["dep:cibos-sdk", "dep:platform-cli", "shared/std", "package-manager/std"]

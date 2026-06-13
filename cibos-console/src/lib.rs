@@ -62,6 +62,20 @@ pub trait ShellFs {
     fn list(&self, path: &str) -> Vec<String>;
     /// Delete the file at `path`; `true` if it was removed.
     fn delete(&self, path: &str) -> bool;
+    /// Whether `path` exists. The default checks via [`ShellFs::read`]; backends
+    /// with a cheaper existence probe may override it.
+    fn exists(&self, path: &str) -> bool {
+        self.read(path).is_some()
+    }
+    /// Ensure a directory at `path` exists. On a hierarchical filesystem this
+    /// creates the directory (needed before writing files beneath it); on a flat
+    /// key-value backend it is a no-op (the default), since such backends key on
+    /// the full path and have no real directories. `true` if the directory now
+    /// exists (or the backend needs none).
+    fn mkdir(&self, path: &str) -> bool {
+        let _ = path;
+        true
+    }
 }
 
 /// The minimal system surface a line-oriented application uses: a filesystem,

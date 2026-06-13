@@ -415,6 +415,9 @@ impl cibos_console::ShellFs for Filesystem {
     fn delete(&self, path: &str) -> bool {
         Filesystem::delete(self, path)
     }
+    fn exists(&self, path: &str) -> bool {
+        Filesystem::exists(self, path)
+    }
 }
 
 impl cibos_console::ShellSystem for System {

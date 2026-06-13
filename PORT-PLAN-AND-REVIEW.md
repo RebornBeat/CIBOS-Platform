@@ -299,6 +299,35 @@ A. CONNECT THE REMAINING APPS (the 17). Ported to no_std + on the kernel shell:
 B. EXAMPLES: the 6 cibos-sdk examples still build (host async-runtime teaching
    demos — lanes/channels/pipelines). They are NOT on-kernel product; keep
    building them as host docs. Re-verify after SDK changes.
+A. CONNECT THE REMAINING APPS — REFRAMED (this arc's assessment): the 17 apps do
+   NOT all belong on the shell. By the trait each implements (verified on disk):
+   * CLI/shell apps (`process_command`/CliApp): shell, package-manager, kvstore,
+     editor, **trove** (DONE — all 5 run on the kernel shell), + calc-service
+     (CliApp + channels), probe (CliApp + spawn) [these two need IPC/spawn, deferred].
+   * GUI app (GuiApp render/handle): notepad.
+   * Touch/mobile app (TouchApp on_gesture): lockscreen; lens (render+spawn).
+   * Library/data apps (no standalone entry — backing logic other apps compose):
+     calendar, clock (Stopwatch), contacts, courier (Message/Inbox), postbox
+     (Mail/Mailbox), web-protocol (Request/Response), vane (channels).
+   So "connect all 17 to the shell" was the wrong frame — many are GUI/touch/library
+   or IPC-service apps. Each goes to its CORRECT surface.
+   DONE this arc: **trove** (the app store) ported to no_std — its `Store` is now
+   generic over `cibos_console::ShellFs` (was `cibos_sdk::Filesystem`), so the same
+   `process_command` runs host + kernel. Registered as the `store` shell program.
+   RUNTIME-VERIFIED in ring 3: `store browse` / `store install welcome` /
+   `store installed` -> welcome. Two real bugs found + fixed by running on CIBOSFS
+   (host flat-FS hid them): (1) install wrote nested `/apps/<name>/meta` without
+   creating the dir -> added `ShellFs::mkdir` (default no-op; kernel override calls
+   real mkdir) + trove mkdir before write; (2) `installed()` parsed flat full-path
+   keys -> made it robust to BOTH flat (full path) and hierarchical (child name)
+   listings. ShellFs gained `exists` + `mkdir` (defaults; SDK + SyscallFs override
+   with native ops). Also fixed: workspace deps now declare package-manager/kvstore/
+   editor/trove with default-features=false (so no_std consumers build bare). 318/0.
+   A-REMAINING: calc-service + probe (CLI but need IPC/spawn on the kernel — wait on
+   the kernel System/channels); the GUI/touch/library apps go to the GUI/mobile
+   tracks (need the display driver). web-protocol/courier/postbox wait on the
+   network stack.
+
 C. PLATFORMS: platform-cli (done, the Console seam), platform-gui, platform-mobile,
    platform-server exist as crates.
 
@@ -324,6 +353,40 @@ C. PLATFORMS: platform-cli (done, the Console seam), platform-gui, platform-mobi
    for all 3 bare arches but await the display driver to render on hardware;
    server awaits the kernel System. NO missing app/platform crates identified
    beyond these.
+
+   LEGACY ARCH (i686 / 32-bit x86) — PROGRESS (this arc): the ProcessorArchitecture
+   enum has FOUR arches (X86_64, AArch64, X86=i686, RiscV64). CIBIOS firmware
+   already builds for i686 (custom target targets/i686-cibos-none.json via
+   `build-i686.sh`, nightly build-std). The KERNEL did NOT build for i686 (missing
+   arch backend + entry + linker script). DONE: added `kernel-image/src/arch/x86.rs`
+   (COM1 serial putc/init_serial + halt, port I/O identical to x86_64),
+   `boot/x86.s` (_start: stack, BSS clear, cdecl u64 handoff push, call
+   kernel_entry), `linker/x86.ld` + `x86_handoff.ld`, and the build.rs arch+script
+   mappings. The i686 kernel now COMPILES AND LINKS (custom target, nightly). All
+   four arches build the kernel; host 318/0; the other 3 arches unaffected.
+   i686-REMAINING (honest): the firmware<->kernel i686 runtime HANDOFF contract
+   (how CIBIOS hands the handoff pointer + enters the kernel) and a QEMU i686 boot
+   path are not yet wired/verified — i686 builds but is not yet runtime-proven
+   like the other arches. Tracked as remaining boot-chain work.
+
+   APP <-> PLATFORM MATRIX (assessment): the 17 apps live in applications/ and are
+   written to the `Console` (CLI) seam via platform-cli; they are platform-cli
+   apps. They do NOT automatically carry to GUI/mobile/server — those platforms
+   have different app traits (GuiApp render/handle on a Surface; TouchApp
+   on_gesture; server daemons on System). So per-platform apps are largely
+   SEPARATE surfaces over shared logic. Identified GAPS to scope (NOT yet built):
+   * GUI/mobile need GuiApp/TouchApp front-ends (the existing app *logic* — e.g.
+     editor/kvstore/notepad/calc — can back them, but the render/event glue is new
+     per platform).
+   * SERVER: no orchestrator app yet. A "Proxmox-VE-for-CIBOS" (manage CIBOS
+     instances/containers/profiles, provisioning, the isolation boundaries as
+     first-class) is a NEW server app to design — legitimately missing, scoped for
+     the server platform track.
+   * AUTH per platform: CLI/GUI use password (login crate, done); MOBILE wants a
+     PIN/passphrase variant — accounts already supports password verifiers; a PIN
+     is a short-credential policy over the same `accounts` bridge (small add, not a
+     new auth system).
+   * No other missing app crates identified for CLI beyond the 17.
 D. SERVER / STORE: the package repo is LOCAL on the medium today (no network
    needed — by design, done). A remote store/server is the LAST step: stand up a
    server, add a network transport, let package-manager fetch+verify from it. The

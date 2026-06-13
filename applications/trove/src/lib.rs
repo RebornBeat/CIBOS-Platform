@@ -10,13 +10,19 @@
 //! Commands: `browse`, `search <q>`, `info <name>`, `install <name>`,
 //! `installed`, `remove <name>`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use cibos_sdk::Filesystem;
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use cibos_console::{Console, ShellFs};
 use package_manager::Package;
-use platform_cli::Console;
-use std::collections::BTreeMap;
 
 /// The result of an install attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +38,9 @@ pub enum InstallResult {
 }
 
 /// The app store, over a catalog and the working filesystem.
-pub struct Store {
+pub struct Store<F: ShellFs> {
     catalog: BTreeMap<String, Package>,
-    fs: Filesystem,
+    fs: F,
 }
 
 fn meta_key(name: &str) -> String {
@@ -44,11 +50,11 @@ fn bin_key(name: &str) -> String {
     format!("/apps/{name}/bin")
 }
 
-impl Store {
+impl<F: ShellFs> Store<F> {
     /// Create a store from a catalog of packages and the filesystem to install
     /// into.
     #[must_use]
-    pub fn new(packages: Vec<Package>, fs: Filesystem) -> Self {
+    pub fn new(packages: Vec<Package>, fs: F) -> Self {
         let catalog = packages.into_iter().map(|p| (p.name.clone(), p)).collect();
         Store { catalog, fs }
     }
@@ -76,15 +82,35 @@ impl Store {
         self.fs.exists(&meta_key(name))
     }
 
-    /// Names of installed apps.
+    /// Names of installed apps. Works across filesystem backends: a flat
+    /// key-value FS lists full paths (e.g. `/apps/foo/meta`), while a
+    /// hierarchical FS lists immediate child names (e.g. `foo`). We normalize
+    /// each entry to the bare app name and de-duplicate.
     #[must_use]
     pub fn installed(&self) -> Vec<String> {
-        self.fs
+        let mut names: Vec<String> = self
+            .fs
             .list("/apps/")
             .into_iter()
-            .filter_map(|k| k.strip_suffix("/meta").map(|s| s.to_string()))
-            .filter_map(|k| k.strip_prefix("/apps/").map(|s| s.to_string()))
-            .collect()
+            .filter_map(|entry| {
+                // Flat backend: ".../apps/<name>/meta" or ".../apps/<name>/bin".
+                if let Some(rest) = entry.strip_prefix("/apps/") {
+                    let app = rest.split('/').next().unwrap_or("");
+                    if !app.is_empty() {
+                        return Some(app.to_string());
+                    }
+                }
+                // Hierarchical backend: a bare child name ("<name>"), the per-app
+                // directory. Skip stray files.
+                if !entry.is_empty() && !entry.contains('/') {
+                    return Some(entry);
+                }
+                None
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Install `name` from the catalog, verifying its hash first.
@@ -98,6 +124,10 @@ impl Store {
         if !pkg.verify() {
             return InstallResult::VerificationFailed;
         }
+        // Ensure the per-app directory exists before writing files beneath it
+        // (a hierarchical filesystem requires the parent; flat backends no-op).
+        self.fs.mkdir("/apps");
+        self.fs.mkdir(&format!("/apps/{name}"));
         self.fs.write(&bin_key(name), &pkg.contents);
         self.fs
             .write(&meta_key(name), pkg.version.as_bytes());
@@ -120,7 +150,7 @@ impl Store {
 }
 
 /// Process one store command, writing output to `console`.
-pub fn process_command(store: &Store, line: &str, console: &dyn Console) {
+pub fn process_command<F: ShellFs>(store: &Store<F>, line: &str, console: &dyn Console) {
     let mut parts = line.split_whitespace();
     let Some(cmd) = parts.next() else {
         return;
@@ -237,8 +267,8 @@ mod tests {
         ]
     }
 
-    fn store() -> Store {
-        Store::new(catalog(), Filesystem::new())
+    fn store() -> Store<cibos_sdk::Filesystem> {
+        Store::new(catalog(), cibos_sdk::Filesystem::new())
     }
 
     #[test]
@@ -248,7 +278,7 @@ mod tests {
         assert!(s.is_installed("courier"));
         // The app bytes are now in the filesystem (survive reboot in Persistent
         // mode).
-        let fs = Filesystem::new();
+        let fs = cibos_sdk::Filesystem::new();
         let _ = fs; // documentation: installs live in the volume's fs
         assert_eq!(s.installed(), vec!["courier".to_string()]);
         // Re-install is a no-op.

@@ -37,6 +37,8 @@ global_asm!(include_str!("arch/enter_user.s"));
 global_asm!(include_str!("boot/aarch64.s"));
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("boot/riscv64.s"));
+#[cfg(target_arch = "x86")]
+global_asm!(include_str!("boot/x86.s"));
 
 // ---------------------------------------------------------------------------
 // Global allocator: a linked-list heap over a static region, guarded by the
@@ -592,11 +594,11 @@ fn run_ring3_demo(
                     include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
                 if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
                     kprintln!("CIBOS kernel: --- shell app run ---");
-                    inject_text("pkg install welcome");
+                    inject_text("store browse");
                     inject_enter();
-                    inject_text("ls /apps");
+                    inject_text("store install welcome");
                     inject_enter();
-                    inject_text("read /apps/welcome");
+                    inject_text("store installed");
                     inject_enter();
                     inject_text("exit");
                     inject_enter();

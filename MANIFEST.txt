@@ -1,25 +1,33 @@
-CIBOS / CIBIOS / HIP — FULL sandbox archive (steps 1-5 + security/platform arc)
-================================================================================
-Product loop (runtime-verified, bare-first): boot -> persistent CIBOSFS -> login
-(real crate) -> shell (real dispatch, ring 3) -> compose existing apps pkg/kv/edit
--> install from LOCAL /repo (SHA-256 verified, network-free) -> file in /apps;
-flavor-selectable app baking (--with-apps).
+CIBOS / CIBIOS / HIP — FULL sandbox (steps 1-5 + security/platform/legacy-arch arc)
+====================================================================================
+Product loop runs on the kernel (bare-first, QEMU-verified): boot -> persistent
+CIBOSFS -> login -> shell (ring 3) -> compose EXISTING apps -> install from local
+repo (verified). 5 apps now on the kernel shell: package-manager, kvstore, editor,
++ pkg/store via trove (the app store).
 
-THIS ARC added:
-* SECURITY (E): firmware image verification now DISPATCHES on the image's
-  signature_algorithm field (via shared verify_with, whose SPHINCS+ arm prefers
-  std then the no_std portable verifier so it links bare). Fail-closed guarantee
-  TESTED: an image selecting an algorithm with no compiled verifier is rejected,
-  never booted unverified. cibios 27/0; bare firmware builds x86_64/aarch64/
-  riscv64; QEMU Standard image boots "image verified" via the new dispatch.
-  SECURITY-NOTES.md updated with honest scheme-selection status (SPHINCS+ bare +
-  default; ML-DSA needs a portable verifier; Ed25519 intentionally unavailable).
-* PLATFORMS (C): platform-gui and platform-mobile converted to no_std + alloc;
-  both build host AND bare on all three arches. The text-cell GUI Surface +
-  touch/gesture layer are now kernel-ready across the arch matrix. Remaining:
-  a display+input driver to render on hardware; platform-server (kernel System).
+THIS ARC:
+* SECURITY: firmware image verification now DISPATCHES on the image's
+  signature_algorithm (shared verify_with; SPHINCS+ arm prefers std then portable
+  so it links bare). Fail-closed tested. SECURITY-NOTES updated (honest scheme
+  status). cibios 27/0; bare firmware x86_64/aarch64/riscv64; QEMU Standard boots
+  "image verified".
+* PLATFORMS: platform-gui + platform-mobile converted to no_std; build host AND
+  bare on all 3 arches. The text-cell GUI Surface + touch/gesture layer are
+  kernel-ready across the arch matrix. (Remaining: display+input driver to render
+  on hardware; platform-server needs kernel System.)
+* LEGACY ARCH (i686/32-bit x86): kernel now COMPILES AND LINKS for i686 (added
+  arch/x86.rs serial+halt, boot/x86.s _start, linker/x86*.ld, build.rs mappings).
+  All FOUR arches build the kernel. (Remaining: i686 firmware<->kernel runtime
+  handoff + QEMU boot path — builds but not yet runtime-proven.)
+* APPS: trove (app store) ported to no_std (Store generic over ShellFs), runtime-
+  verified in ring 3 (store browse/install/installed). ShellFs gained exists+mkdir
+  (defaults; SDK + kernel SyscallFs override natively). Two flat-vs-hierarchical FS
+  bugs found+fixed by running on real CIBOSFS.
+* APP TAXONOMY (assessment): the 17 apps split across surfaces — CLI/shell (5 done
+  + calc-service/probe pending IPC), GUI (notepad), touch (lockscreen, lens),
+  library/data (calendar/clock/contacts/courier/postbox/web-protocol/vane). Server
+  orchestrator ("Proxmox-VE-for-CIBOS") identified as a NEW app to design.
 
-Verified: 318 tests / 0 fail; examples build; clippy clean; on-kernel app crates
-+ platform-gui/mobile build for the bare arches. See PORT-PLAN-AND-REVIEW.md for
-the authoritative plan + POST-STEP-5 ROADMAP (with E and C progress + remaining
-app ports: 13 host-only apps still to connect). License: MIT.
+Verified: 318 tests/0 fail; examples build; clippy clean; on-kernel app crates +
+platform-gui/mobile build bare. See PORT-PLAN-AND-REVIEW.md for the authoritative
+plan + roadmap with all findings. License: MIT.

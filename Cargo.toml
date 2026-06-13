@@ -66,9 +66,10 @@ cibos-sync = { path = "cibos-sync" }
 platform-gui = { path = "platform-gui" }
 platform-mobile = { path = "platform-mobile" }
 platform-server = { path = "platform-server" }
-package-manager = { path = "applications/package-manager" }
-kvstore = { path = "applications/kvstore" }
-editor = { path = "applications/editor" }
+package-manager = { path = "applications/package-manager", default-features = false }
+kvstore = { path = "applications/kvstore", default-features = false }
+editor = { path = "applications/editor", default-features = false }
+trove = { path = "applications/trove", default-features = false }
 probe = { path = "applications/probe" }
 accounts = { path = "accounts", default-features = false }
 login = { path = "login", default-features = false }

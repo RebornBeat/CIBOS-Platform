@@ -48,6 +48,18 @@ fn main() -> u64 {
     let store = kvstore::new_store();
     let buffer = editor::new_buffer();
 
+    // The trove app store, over the same catalog and the syscall filesystem
+    // (installs to /apps, surviving reboot in Persistent mode). Reuses trove's
+    // process_command verbatim — it is the existing app, not a reimplementation.
+    let trove_store = trove::Store::new(
+        [
+            package_manager::Package::genuine("welcome", "1.0.0", b"welcome to cibos".to_vec()),
+            package_manager::Package::genuine("text-editor", "1.2.0", b"text editor contents".to_vec()),
+        ]
+        .to_vec(),
+        cibos_app::SyscallFs,
+    );
+
     let shell = Shell::new()
         .with_program("pkg", move |args, console| {
             // `install <name>` installs from the on-disk local repo (/repo) with
@@ -83,6 +95,9 @@ fn main() -> u64 {
         })
         .with_program("edit", move |args, console| {
             editor::process_command(&buffer, &args.join(" "), console);
+        })
+        .with_program("store", move |args, console| {
+            trove::process_command(&trove_store, &args.join(" "), console);
         });
 
     console.write_line("CIBOS shell. Type 'help' for commands.");

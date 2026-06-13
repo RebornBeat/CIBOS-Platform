@@ -18,6 +18,7 @@ shell = { path = "../../../applications/shell", default-features = false }
 package-manager = { path = "../../../applications/package-manager", default-features = false }
 kvstore = { path = "../../../applications/kvstore", default-features = false }
 editor = { path = "../../../applications/editor", default-features = false }
+trove = { path = "../../../applications/trove", default-features = false }
 
 [profile.release]
 panic = "abort"

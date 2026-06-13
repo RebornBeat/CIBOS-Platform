@@ -34,3 +34,8 @@ pub use aarch64::{halt, init_serial, putc};
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::{halt, init_serial, putc};
+
+#[cfg(target_arch = "x86")]
+mod x86;
+#[cfg(target_arch = "x86")]
+pub use x86::{halt, init_serial, putc};

@@ -19,6 +19,8 @@ fn main() {
         ("aarch64", false) => "aarch64_handoff.ld",
         ("riscv64", true) => "riscv64.ld",
         ("riscv64", false) => "riscv64_handoff.ld",
+        ("x86", true) => "x86.ld",
+        ("x86", false) => "x86_handoff.ld",
         _ => return,
     };
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();

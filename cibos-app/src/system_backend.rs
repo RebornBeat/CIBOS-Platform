@@ -81,6 +81,14 @@ impl ShellFs for SyscallFs {
     fn delete(&self, path: &str) -> bool {
         crate::fs::delete(path.as_bytes()).is_ok()
     }
+
+    fn exists(&self, path: &str) -> bool {
+        crate::fs::exists(path.as_bytes()).unwrap_or(false)
+    }
+
+    fn mkdir(&self, path: &str) -> bool {
+        crate::fs::mkdir(path.as_bytes()).is_ok()
+    }
 }
 
 impl ShellSystem for SyscallSystem {
