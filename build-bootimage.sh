@@ -48,7 +48,33 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 PROFILE="${1:?usage: build-bootimage.sh <compute|performance|maximum-isolation|balanced> [arch...]}"
 shift
+
+# Optional: --with-apps a,b,c selects which application .capps are baked into the
+# image (maps to the kernel's `app-*` features). Defaults to the interactive core
+# (login + shell) so a stock image boots straight to the product flow. Pass
+# `--with-apps none` for a bare kernel with no apps, or e.g.
+# `--with-apps hello,login,shell` to include the demo too.
+WITH_APPS="login,shell"
+_args=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with-apps) WITH_APPS="$2"; shift 2 ;;
+    --with-apps=*) WITH_APPS="${1#--with-apps=}"; shift ;;
+    *) _args="$_args $1"; shift ;;
+  esac
+done
+set -- $_args
 ARCHES="${*:-x86_64}"
+
+# Translate the app list into kernel feature flags (app-<name>), unless "none".
+APP_FEATURES=""
+if [ "$WITH_APPS" != "none" ] && [ -n "$WITH_APPS" ]; then
+  _IFS_SAVE="$IFS"; IFS=','
+  for _app in $WITH_APPS; do
+    [ -n "$_app" ] && APP_FEATURES="${APP_FEATURES:+$APP_FEATURES,}app-$_app"
+  done
+  IFS="$_IFS_SAVE"
+fi
 
 case "$PROFILE" in
   compute|performance|maximum-isolation|balanced) ;;
@@ -126,7 +152,7 @@ for a in $ARCHES; do
   # Standard profiles SIGN the image with the dev key; Lightweight build it
   # unsigned. The profile stamp must match the kernel's compiled profile (the
   # kernel halts on a mismatch).
-  cargo build -p kernel-image --no-default-features --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}" --target "$T"
+  cargo build -p kernel-image --no-default-features --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}${APP_FEATURES:+,$APP_FEATURES}" --target "$T"
   KBIN="target/$T/debug/cibos-kernel"
   "$LLVM_OC" -O binary "$KBIN" "$HERE/images/kernel-$PROFILE-$a.bin"
   if [ "$SIGNED" = "1" ]; then

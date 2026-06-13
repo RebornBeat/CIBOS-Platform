@@ -19,7 +19,9 @@ use alloc::vec;
 
 use cibos_app::{Console, SyscallConsole, SyscallSystem};
 use cibos_console::Console as _;
-use package_manager::{process_command as pkg_command, Package};
+use package_manager::{
+    install_from_repo, process_command as pkg_command, InstallOutcome, Package,
+};
 use shell::{dispatch, Shell, PROMPT};
 
 cibos_app::entry!(main);
@@ -35,6 +37,9 @@ fn main() -> u64 {
     for pkg in [
         Package::genuine("text-editor", "1.2.0", b"text editor contents".to_vec()),
         Package::genuine("file-manager", "0.9.1", b"file manager contents".to_vec()),
+        // `welcome` mirrors the package the kernel seeds into /repo/welcome; its
+        // declared hash is sha256 over the SAME bytes, so a repo install verifies.
+        Package::genuine("welcome", "1.0.0", b"welcome to cibos".to_vec()),
     ] {
         catalog.insert(pkg.name.clone(), pkg);
     }
@@ -45,7 +50,33 @@ fn main() -> u64 {
 
     let shell = Shell::new()
         .with_program("pkg", move |args, console| {
-            pkg_command(&catalog, &args.join(" "), console);
+            // `install <name>` installs from the on-disk local repo (/repo) with
+            // integrity verification, then writes to /apps — the real, network-free
+            // install path. Every other verb (list/info/verify) is the pure,
+            // storage-agnostic command handler, reused verbatim.
+            if let ["install", name] = args {
+                let Some(pkg) = catalog.get(*name) else {
+                    console.write_line(&alloc::format!("not found: {name}"));
+                    return;
+                };
+                let outcome = install_from_repo(
+                    name,
+                    &pkg.declared_hash,
+                    |p| cibos_app::fs::read_into_vec(p.as_bytes()),
+                    |p, d| cibos_app::fs::write(p.as_bytes(), d).is_ok(),
+                );
+                let msg = match outcome {
+                    InstallOutcome::Installed => alloc::format!("installed {name} -> /apps/{name}"),
+                    InstallOutcome::NotInRepo => alloc::format!("not in repo: {name}"),
+                    InstallOutcome::IntegrityFailed => {
+                        alloc::format!("refused {name}: integrity check failed")
+                    }
+                    InstallOutcome::WriteFailed => alloc::format!("install of {name} failed to write"),
+                };
+                console.write_line(&msg);
+            } else {
+                pkg_command(&catalog, &args.join(" "), console);
+            }
         })
         .with_program("kv", move |args, console| {
             kvstore::process_command(&store, &args.join(" "), console);

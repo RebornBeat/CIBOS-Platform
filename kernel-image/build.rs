@@ -32,10 +32,20 @@ fn main() {
     // wrap it in a .capp via the shared AppImageBuilder. The kernel loads it
     // through loader::run_app_image.
     if arch == "x86_64" {
+        // The assembly hello.capp is the tiny built-in smoke test; it has no
+        // dependencies and is always built. The Rust `.capp`s are opt-in via the
+        // `app-*` features (the `--with-apps` flavor flag) so an image bakes only
+        // the applications a given flavor wants.
         build_hello_capp(&dir);
-        build_hello_rs_capp(&dir);
-        build_login_rs_capp(&dir);
-        build_shell_rs_capp(&dir);
+        if std::env::var("CARGO_FEATURE_APP_HELLO").is_ok() {
+            build_hello_rs_capp(&dir);
+        }
+        if std::env::var("CARGO_FEATURE_APP_LOGIN").is_ok() {
+            build_login_rs_capp(&dir);
+        }
+        if std::env::var("CARGO_FEATURE_APP_SHELL").is_ok() {
+            build_shell_rs_capp(&dir);
+        }
     }
 }
 

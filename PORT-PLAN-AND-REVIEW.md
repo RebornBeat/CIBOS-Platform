@@ -235,6 +235,90 @@ This is the process model the OS needs for the login→shell hand-off anyway.
 5. **Wire storage Live/Persistent onto CIBOSFS**; **local package repo** on the
    medium; `--with-apps` flavor flag for `mkbootimage`.
 
+   STEP-5 PLAN (file-grounded). Current reality:
+   - The kernel ALREADY has real persistence: CIBOSFS on the ATA block device
+     (`cibos-kernel/src/fs.rs`), proven by `persists_across_remount`. But
+     `mount_root_fs_early` in boot.rs ALWAYS `Fs::format`s the data disk each boot
+     (line ~684) — effectively Live (wipe-on-boot). The `storage` crate's
+     `Volume`/`PersistenceMode::{Live,Persistent}` is the HOST simulation (SDK
+     in-memory `Filesystem` + serialize entries to a `PersistenceStore` blob); it
+     is NOT what runs on the kernel.
+   - package-manager `install <name>` looks up an in-memory catalog, verifies the
+     SHA-256 (`Package::verify`), and only PRINTS "installed". The catalog is
+     hardcoded (two samples baked into shell-rs/main.rs). `process_command` is
+     PURE (Console-only) — it composes into the shell as a program; must STAY pure
+     (same seam discipline as editor's pure `process_command` vs host-only
+     `handle_storage`).
+   INCREMENTS (vertical-slice, runtime-checked, BARE-FIRST; do NOT reimplement):
+   5a. DONE + RUNTIME-VERIFIED: `mount_root_fs_early` now tries `Fs::mount` first
+       and only `Fs::format`s (+ seeds `/etc`) on `BadSuperblock` (unformatted).
+       Two-boot QEMU test on the SAME data.img: boot 1 formats + writes `/persist`;
+       boot 2 MOUNTS ("persistent") and `read /persist` returns `boot-data`, `ls /`
+       shows `etc` + `persist` — data survived the reboot. Real on-disk
+       persistence (not the host `storage`-crate simulation). 315/0.
+   5b+5c. DONE + RUNTIME-VERIFIED: local package repo + real install.
+       - package-manager gained `install_from_repo(name, declared_hash, read,
+         write) -> InstallOutcome` — reads `/repo/<name>`, verifies SHA-256 with
+         the same audited constant-time check as `Package::verify` (BEFORE any
+         write), writes to `/apps/<name>`. FS injected as closures, so it stays
+         free of any backend and `process_command` stays PURE. Host tests cover
+         Installed / NotInRepo / IntegrityFailed (no write) / WriteFailed.
+       - `cibos-app::fs::read_into_vec` added (heap, returns owned Vec).
+       - The kernel seeds the repo on fresh format: `/repo/welcome` plus `/apps`
+         dir (`mount_root_fs_early`).
+       - shell-rs `pkg` program routes `install <name>` through `install_from_repo`
+         (wired to `cibos_app::fs::{read_into_vec,write}`); other verbs use the
+         pure `process_command`. The `welcome` package's declared hash is sha256
+         over the same bytes the kernel seeds, so verification passes.
+       - QEMU full loop: `pkg install welcome` -> "installed welcome -> /apps/
+         welcome"; `ls /apps` -> welcome; `read /apps/welcome` -> "welcome to
+         cibos". The headline product loop (boot -> login -> shell -> install from
+         LOCAL repo, network-free + integrity-verified -> file in /apps) WORKS.
+       - 317/0; clippy clean; kernel builds bare.
+   5d. DONE + RUNTIME-VERIFIED: `--with-apps` flavor flag. Kernel gained `app-hello`
+       / `app-login` / `app-shell` features (`app-shell` implies `app-login`);
+       `build.rs` builds only the enabled `.capp`s; `boot.rs` `#[cfg]`-gates each
+       embed+run block. `build-bootimage.sh --with-apps a,b,c` maps to `app-a,...`
+       (default `login,shell`; `none` = bare kernel). QEMU: default flavor runs the
+       full login->shell->install loop; `--with-apps none` boots clean with no app
+       blocks. 317/0.
+
+   STEP 5 COMPLETE. The full headline product loop works on the kernel:
+   boot -> persistent CIBOSFS -> create-user -> login (real login crate) -> shell
+   -> compose existing apps (pkg/kv/edit) -> install from LOCAL repo (integrity-
+   verified, network-free) -> file in /apps. Flavor-selectable app baking.
+
+== POST-STEP-5 ROADMAP (the remaining work, file-grounded) ==
+A. CONNECT THE REMAINING APPS (the 17). Ported to no_std + on the kernel shell:
+   shell, package-manager, kvstore, editor (4). STILL HOST-ONLY (std), to port
+   the same way (gate CliApp/std-only bits; reuse process_command verbatim):
+   calc-service, calendar, clock, contacts, courier, lens, lockscreen, notepad,
+   postbox, probe, trove, vane, web-protocol (13). Each: no_std-convert, register
+   in the shell `.capp` (or its own `.capp`), runtime-verify. web-protocol +
+   courier/postbox are the networked ones — they wait on the network stack.
+B. EXAMPLES: the 6 cibos-sdk examples still build (host async-runtime teaching
+   demos — lanes/channels/pipelines). They are NOT on-kernel product; keep
+   building them as host docs. Re-verify after SDK changes.
+C. PLATFORMS: platform-cli (done, the Console seam), platform-gui, platform-mobile,
+   platform-server exist as crates. The bare product is x86_64 today; aarch64/
+   riscv64 boot via FDT (build-profile.sh) but the app layer is x86_64-first.
+   Per-platform-per-arch matrix is future work (GUI/mobile need a display/input
+   stack on the kernel — large).
+D. SERVER / STORE: the package repo is LOCAL on the medium today (no network
+   needed — by design, done). A remote store/server is the LAST step: stand up a
+   server, add a network transport, let package-manager fetch+verify from it. The
+   local-repo install path already proves the verify+install half.
+E. SECURITY / DEPLOY (cibios/src/verification.rs, shared/src/crypto, SECURITY-
+   NOTES.md): per-image embedded key (each .img is sensitive, not WWW-shareable),
+   quantum vs non-quantum key selection at build (SPHINCS+/ML-DSA backends exist),
+   isolation/zero-day posture (profiles, ring-3, per-process address spaces — the
+   isolation core is built + runtime-verified). Deploy UX (USB flash -> partition
+   install choice, persistent vs live selection) and the GUI/CLI UX polish (ASCII
+   TUI etc.) are their own tracks. These are AUDIT + UX tracks, scoped here, NOT
+   yet implemented end-to-end.
+   - Order rationale: 5a is small + directly demonstrable; 5b/5c advance the
+     headline loop (install-from-local-repo, no network); 5d is build ergonomics.
+
 ## Guardrails (from lessons this project)
 
 - `cat` whole files before concluding something is absent; never trust a narrow

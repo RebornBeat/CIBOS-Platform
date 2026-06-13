@@ -44,6 +44,16 @@ self-boot = []
 # not scribble on the disk every boot — so this is opt-in for validation.
 storage-selftest = []
 
+# Application selection (the `--with-apps` flavor flag). Each feature opts a
+# `.capp` into the image: `build.rs` builds only the enabled ones, and `boot.rs`
+# embeds + runs only those. `login` and `shell` are the interactive core
+# (selectable but normally always on); `hello` is a demo. With none enabled the
+# kernel still boots (storage/login/shell blocks are simply absent). The build
+# wrapper's `--with-apps a,b,c` maps to `app-a,app-b,app-c`.
+app-hello = []
+app-login = []
+app-shell = ["app-login"]
+
 # Operational profile bundles: forward to the kernel library's bundle so the
 # bootable image is built as exactly one profile (ADR-007). The build wrapper
 # pairs each with the matching CIBIOS firmware build. Orthogonal to `self-boot`.

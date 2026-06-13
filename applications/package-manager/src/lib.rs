@@ -194,6 +194,55 @@ pub fn process_command(catalog_packages: &BTreeMap<String, Package>, line: &str,
     }
 }
 
+/// Outcome of a repo-backed install attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// The package was verified and written to the install destination.
+    Installed,
+    /// The package was not present in the repository.
+    NotInRepo,
+    /// The package bytes did not match the declared hash (integrity failure).
+    IntegrityFailed,
+    /// Writing the package to the install destination failed.
+    WriteFailed,
+}
+
+/// Install package `name` from a filesystem-backed local repository.
+///
+/// This is the storage-aware counterpart of the pure [`process_command`]
+/// `install` verb: it reads the package bytes from the repo via `read`
+/// (e.g. `/repo/<name>`), verifies them against `declared_hash` using the same
+/// audited, constant-time check as [`Package::verify`], and on success writes
+/// them to the install destination via `write` (e.g. `/apps/<name>`). The
+/// filesystem is injected as two closures so this function stays free of any
+/// particular FS backend — the host wires it to the SDK filesystem, the kernel
+/// `.capp` wires it to the `Fs*` syscalls — and so the pure command dispatcher
+/// remains storage-agnostic.
+///
+/// Verification happens BEFORE any write, so unverified bytes never reach the
+/// install destination.
+pub fn install_from_repo(
+    name: &str,
+    declared_hash: &Digest256,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+    write: impl Fn(&str, &[u8]) -> bool,
+) -> InstallOutcome {
+    let repo_path = format!("/repo/{name}");
+    let Some(bytes) = read(&repo_path) else {
+        return InstallOutcome::NotInRepo;
+    };
+    let actual = sha256(&bytes);
+    if !digests_equal_ct(&actual, declared_hash) {
+        return InstallOutcome::IntegrityFailed;
+    }
+    let dest = format!("/apps/{name}");
+    if write(&dest, &bytes) {
+        InstallOutcome::Installed
+    } else {
+        InstallOutcome::WriteFailed
+    }
+}
+
 fn not_found(arg: Option<&str>) -> String {
     match arg {
         Some(name) => format!("not found: {name}"),
@@ -277,5 +326,57 @@ mod tests {
         let out = console.output_text();
         assert!(out.contains("not found: nonesuch"));
         assert!(out.contains("unknown command: frobnicate"));
+    }
+
+    #[test]
+    fn install_from_repo_verifies_then_writes() {
+        use core::cell::RefCell;
+        let contents = b"the genuine package bytes".to_vec();
+        let good_hash = sha256(&contents);
+
+        let repo: RefCell<BTreeMap<String, Vec<u8>>> = RefCell::new(BTreeMap::new());
+        repo.borrow_mut()
+            .insert("/repo/widget".to_string(), contents.clone());
+        let installed: RefCell<BTreeMap<String, Vec<u8>>> = RefCell::new(BTreeMap::new());
+
+        let read = |p: &str| repo.borrow().get(p).cloned();
+        let write = |p: &str, d: &[u8]| {
+            installed.borrow_mut().insert(p.to_string(), d.to_vec());
+            true
+        };
+
+        assert_eq!(
+            install_from_repo("widget", &good_hash, &read, &write),
+            InstallOutcome::Installed
+        );
+        assert_eq!(
+            installed.borrow().get("/apps/widget").cloned(),
+            Some(contents)
+        );
+
+        assert_eq!(
+            install_from_repo("absent", &good_hash, &read, &write),
+            InstallOutcome::NotInRepo
+        );
+
+        let wrong_hash = sha256(b"something else entirely");
+        installed.borrow_mut().clear();
+        assert_eq!(
+            install_from_repo("widget", &wrong_hash, &read, &write),
+            InstallOutcome::IntegrityFailed
+        );
+        assert!(installed.borrow().is_empty());
+    }
+
+    #[test]
+    fn install_from_repo_reports_write_failure() {
+        let contents = b"bytes".to_vec();
+        let h = sha256(&contents);
+        let read = |_: &str| Some(contents.clone());
+        let write = |_: &str, _: &[u8]| false;
+        assert_eq!(
+            install_from_repo("x", &h, &read, &write),
+            InstallOutcome::WriteFailed
+        );
     }
 }

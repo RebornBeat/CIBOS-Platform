@@ -30,6 +30,22 @@ pub fn read_into(path: &[u8], buf: &mut [u8]) -> Result<usize, SyscallError> {
     Ok(decode(ret)? as usize)
 }
 
+/// Read the whole file at `path` into an owned `Vec`, or `None` if it does not
+/// exist (or cannot be read). Uses a bounded heap buffer (64 KiB), so very large
+/// files are truncated to the cap; for the package repo and shell working files
+/// this is ample. The buffer is on the heap, since the app stack is one page.
+#[must_use]
+pub fn read_into_vec(path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    match read_into(path, &mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            Some(buf)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Create or overwrite the file at `path` with `data`, returning the number of
 /// bytes written.
 ///

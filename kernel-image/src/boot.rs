@@ -518,25 +518,29 @@ fn run_ring3_demo(
 
         // Now load and run a second external app — written in RUST on the
         // cibos-app runtime — proving a real Rust application (not assembly)
-        // runs in ring 3 through the same loader and syscall ABI.
-        const HELLO_RS_CAPP: &[u8] =
-            include_bytes!(concat!(env!("OUT_DIR"), "/hello-rs.capp"));
-        match shared::AppImage::parse(HELLO_RS_CAPP) {
-            Ok(image) => {
-                kprintln!(
-                    "CIBOS kernel: loading Rust app image (.capp): {} segment(s), entry {:#x}",
-                    image.segment_count(),
-                    image.entry()
-                );
-                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
-                    Ok(code) => kprintln!(
-                        "CIBOS kernel: Rust app exited with code {code} \
-                         (cibos-app runtime, ran in ring 3)"
-                    ),
-                    Err(e) => kprintln!("CIBOS kernel: Rust app launch failed: {e}"),
+        // runs in ring 3 through the same loader and syscall ABI. Opt-in via
+        // `app-hello` (the `--with-apps` flavor flag).
+        #[cfg(feature = "app-hello")]
+        {
+            const HELLO_RS_CAPP: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/hello-rs.capp"));
+            match shared::AppImage::parse(HELLO_RS_CAPP) {
+                Ok(image) => {
+                    kprintln!(
+                        "CIBOS kernel: loading Rust app image (.capp): {} segment(s), entry {:#x}",
+                        image.segment_count(),
+                        image.entry()
+                    );
+                    match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                        Ok(code) => kprintln!(
+                            "CIBOS kernel: Rust app exited with code {code} \
+                             (cibos-app runtime, ran in ring 3)"
+                        ),
+                        Err(e) => kprintln!("CIBOS kernel: Rust app launch failed: {e}"),
+                    }
                 }
+                Err(e) => kprintln!("CIBOS kernel: Rust .capp parse failed: {e}"),
             }
-            Err(e) => kprintln!("CIBOS kernel: Rust .capp parse failed: {e}"),
         }
 
         // Run the login application (.capp) twice under the storage-selftest
@@ -545,7 +549,7 @@ fn run_ring3_demo(
         // (no credential file yet), the second LOGS IN as "alice". This exercises
         // the whole interactive stack — ReadKey -> read_line, GetRandom -> salt,
         // fs -> CIBOSFS credential file, shared salted-SHA-256 verify — in ring 3.
-        #[cfg(feature = "storage-selftest")]
+        #[cfg(all(feature = "storage-selftest", feature = "app-login"))]
         {
             const LOGIN_RS_CAPP: &[u8] =
                 include_bytes!(concat!(env!("OUT_DIR"), "/login-rs.capp"));
@@ -580,26 +584,26 @@ fn run_ring3_demo(
             // sequence (sendkey is unreliable, so inject programmatically). This
             // exercises the whole shell stack — ReadKey -> read_line, the generic
             // dispatch, the Fs* syscalls (write/read/ls/rm), Now -> uptime, and a
-            // composed app program (`pkg`) — all on the booted kernel.
-            const SHELL_RS_CAPP: &[u8] =
-                include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
-            if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
-                kprintln!("CIBOS kernel: --- shell app run ---");
-                inject_text("help");
-                inject_enter();
-                inject_text("kv set k hi");
-                inject_enter();
-                inject_text("kv get k");
-                inject_enter();
-                inject_text("edit append line1");
-                inject_enter();
-                inject_text("edit show");
-                inject_enter();
-                inject_text("exit");
-                inject_enter();
-                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
-                    Ok(code) => kprintln!("CIBOS kernel: shell exited with code {code}"),
-                    Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+            // composed app program (`pkg`) — all on the booted kernel. Opt-in via
+            // `app-shell` (the `--with-apps` flavor flag).
+            #[cfg(feature = "app-shell")]
+            {
+                const SHELL_RS_CAPP: &[u8] =
+                    include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
+                if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
+                    kprintln!("CIBOS kernel: --- shell app run ---");
+                    inject_text("pkg install welcome");
+                    inject_enter();
+                    inject_text("ls /apps");
+                    inject_enter();
+                    inject_text("read /apps/welcome");
+                    inject_enter();
+                    inject_text("exit");
+                    inject_enter();
+                    match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                        Ok(code) => kprintln!("CIBOS kernel: shell exited with code {code}"),
+                        Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+                    }
                 }
             }
         }
@@ -670,26 +674,63 @@ fn demonstrate_fs_syscalls() {
 /// run so a ring-3 `.capp` can issue filesystem syscalls against it.
 #[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
 fn mount_root_fs_early() {
-    use cibos_kernel::fs::Fs;
+    use cibos_kernel::fs::{Fs, FsError};
     // SAFETY: single-threaded bring-up; probes the primary slave ATA ports.
     let Some(data) = (unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Slave) })
     else {
         kprintln!("CIBOS kernel: no data disk on the slave (root fs not mounted)");
         return;
     };
-    kprintln!(
-        "CIBOS kernel: data disk (slave) online — {} sectors; formatting CIBOSFS",
-        data.sectors()
-    );
-    match Fs::format(data, 64).and_then(|mut fs| {
-        fs.mkdir(b"/etc")?;
-        Ok(fs)
-    }) {
+    let sectors = data.sectors();
+
+    // Persistent mode: try to MOUNT an existing CIBOSFS first, so data written in
+    // a prior boot survives. Only FORMAT (and seed /etc) when the disk has no
+    // valid filesystem yet (first boot / wiped medium). A Live profile would
+    // instead always format; that choice belongs to the boot profile (TODO 5a:
+    // surface it as a profile flag — for now the kernel is Persistent).
+    match Fs::mount(data) {
         Ok(fs) => {
             *ROOT_FS.lock() = Some(fs);
-            kprintln!("CIBOS kernel: root filesystem mounted (CIBOSFS), /etc ready");
+            kprintln!(
+                "CIBOS kernel: root filesystem mounted (CIBOSFS, persistent) — {} sectors",
+                sectors
+            );
         }
-        Err(e) => kprintln!("CIBOS kernel: root fs format failed: {:?}", e),
+        Err(FsError::BadSuperblock) => {
+            // Unformatted medium: format and seed the base directories. Re-probe
+            // because `mount` consumed the device.
+            let Some(data) =
+                (unsafe { crate::arch::ata::AtaDisk::probe(crate::arch::ata::Device::Slave) })
+            else {
+                kprintln!("CIBOS kernel: data disk vanished after mount attempt");
+                return;
+            };
+            kprintln!(
+                "CIBOS kernel: data disk unformatted — formatting CIBOSFS ({} sectors)",
+                sectors
+            );
+            match Fs::format(data, 64).and_then(|mut fs| {
+                fs.mkdir(b"/etc")?;
+                fs.mkdir(b"/apps")?;
+                // Seed the local package repository baked on the medium: a `/repo`
+                // directory holding package files the package manager can install
+                // without any network. The contents here must match what the
+                // shell `.capp` declares the package's hash to be (it computes
+                // sha256 over the same bytes), so integrity verification passes.
+                fs.mkdir(b"/repo")?;
+                fs.write_file(b"/repo/welcome", b"welcome to cibos")?;
+                Ok(fs)
+            }) {
+                Ok(fs) => {
+                    *ROOT_FS.lock() = Some(fs);
+                    kprintln!(
+                        "CIBOS kernel: root filesystem formatted (CIBOSFS), /etc /apps /repo ready"
+                    );
+                }
+                Err(e) => kprintln!("CIBOS kernel: root fs format failed: {:?}", e),
+            }
+        }
+        Err(e) => kprintln!("CIBOS kernel: root fs mount failed: {:?}", e),
     }
 }
 
