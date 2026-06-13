@@ -10,8 +10,14 @@
 //! resulting gestures, rendering the surface after each, exactly like the GUI
 //! runner but gesture-driven.
 
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+extern crate alloc;
+
+#[cfg(test)]
+use alloc::format;
 
 use platform_gui::{Flow, Surface};
 use cibos_input::{Button, Pointer, PointerAction};

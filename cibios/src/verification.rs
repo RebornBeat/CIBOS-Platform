@@ -104,12 +104,20 @@ fn verify_signature(
     view: &ImageView<'_>,
     trusted_root_key: &[u8],
 ) -> Result<(), FirmwareError> {
-    use shared::crypto::backends::sphincs_portable::SphincsPlusPortableVerifier;
-    use shared::{SharedError, SignatureVerifier};
+    use shared::crypto::signature::verify_with;
+    use shared::{SharedError, SignatureAlgorithm};
 
     let signed = view.signed_region()?;
     let signature = view.signature()?;
-    SphincsPlusPortableVerifier::verify(trusted_root_key, signed, signature)
+
+    // Read the signature algorithm the image was signed with from its header and
+    // verify with the matching backend — rather than assuming one scheme. An
+    // unknown discriminant, or an algorithm whose verifier is not compiled into
+    // this firmware (e.g. a bare build links only the portable SPHINCS+ verifier),
+    // fails CLOSED: the image is rejected rather than booted unverified.
+    let algorithm = SignatureAlgorithm::try_from(view.header().signature_algorithm)
+        .map_err(|e| FirmwareError::from(SharedError::from(e)))?;
+    verify_with(algorithm, trusted_root_key, signed, signature)
         .map_err(|e| FirmwareError::from(SharedError::from(e)))
 }
 
@@ -253,5 +261,47 @@ mod tests {
         // A wrong key must be rejected.
         let (other_pk, _) = generate_keypair().unwrap();
         assert!(verify_image(&image, &policy, &other_pk).is_err());
+    }
+
+    #[test]
+    fn unavailable_algorithm_fails_closed() {
+        // An image whose header selects an algorithm with no compiled verifier
+        // (Ed25519 has no backend in this build) MUST be rejected — never booted
+        // unverified. We sign the bytes with SPHINCS+ but stamp the header as
+        // Ed25519, so the dispatcher reaches the unavailable arm.
+        use shared::crypto::backends::sphincs::{generate_keypair, SphincsPlusSigner, SIGNATURE_LEN};
+        use shared::crypto::signature::SignatureSigner;
+
+        let (pk, sk) = generate_keypair().expect("keypair");
+        let kernel = b"kernel bytes for fail-closed test";
+        let params = ImageParams {
+            architecture: x86_64(),
+            cibos_profile: shared::CibosProfile::Balanced.as_u32(),
+            entry_point: 0x20_0000,
+            load_base: 0x20_0000,
+            // Header claims Ed25519 (no verifier compiled), but we attach a real
+            // SPHINCS+ signature underneath.
+            signature_algorithm: SignatureAlgorithm::Ed25519.as_u32(),
+            signature_len: SIGNATURE_LEN as u32,
+        };
+        let comps = [ComponentInput {
+            kind: ComponentKind::Kernel,
+            load_addr: 0x20_0000,
+            body: kernel,
+        }];
+        let unsigned = build_unsigned(&params, &comps);
+        let mut sig = std::vec::Vec::new();
+        SphincsPlusSigner::sign(&sk, &unsigned, &mut sig).expect("sign");
+        let image = finalize_signed(unsigned, &sig);
+
+        let policy = VerificationPolicy {
+            require_signature: true,
+            running_architecture: x86_64(),
+        };
+        // Must fail closed: the selected algorithm has no verifier here.
+        assert!(
+            verify_image(&image, &policy, &pk).is_err(),
+            "image with unavailable signature algorithm must be rejected"
+        );
     }
 }

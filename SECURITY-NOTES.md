@@ -69,6 +69,43 @@ produces signatures; only verification needed to move into the firmware, and it
 has. `mkimage sign` now also accepts a profile-stamp argument so signed images
 carry the correct operational profile.
 
+## Signature-algorithm selection (quantum vs classical) — current status
+
+The image header carries a `signature_algorithm` field
+(`shared::SignatureAlgorithm`: `Ed25519` = classical, `SphincsPlus` and `MlDsa`
+= post-quantum). As of this change, **firmware verification dispatches on that
+field** via the single shared entry point `shared::crypto::signature::verify_with`,
+rather than assuming one scheme:
+
+* The firmware reads the algorithm from the image header and calls the matching
+  compiled-in verifier.
+* `verify_with`'s SPHINCS+ arm prefers the std backend when present and falls
+  back to the no_std **portable** verifier on bare targets, so the dispatcher
+  links in firmware as well as host tooling.
+* **Fail-closed guarantee (tested):** if the selected algorithm has no verifier
+  compiled into the running firmware — an unknown discriminant, or e.g. an image
+  stamped `Ed25519` (no backend) or `MlDsa` (its `pqcrypto-mldsa` verifier is
+  libc-bound and does not link bare) — verification REJECTS the image rather than
+  booting it unverified. Covered by `unavailable_algorithm_fails_closed`.
+
+Honest scope of "selection" today:
+* **SPHINCS+** (post-quantum, hash-based): the complete, bare-verifiable root of
+  trust — sign (host tooling) and verify (bare firmware) both work. This is the
+  production default.
+* **ML-DSA** (post-quantum, lattice): verifier present but libc-bound, so it does
+  NOT yet link in bare firmware; a no_std/portable ML-DSA verifier (mirroring the
+  SPHINCS+ portable port) is the prerequisite before ML-DSA-signed images can be
+  booted on hardware. Until then the firmware correctly fails closed on ML-DSA.
+* **Ed25519** (classical, NON-quantum-resistant): enum + dispatcher arm only; no
+  backend is compiled. It exists so a deployment that explicitly wants a fast
+  classical option can add a `classical-crypto` backend — but it is intentionally
+  unavailable by default (a boot root of trust should be post-quantum), and the
+  firmware fails closed on it today.
+
+`mkimage sign` produces SPHINCS+ signatures (the only scheme that verifies bare).
+Adding ML-DSA *signing* there is deferred until the portable ML-DSA verifier
+exists, so the tool never emits an image that bare firmware cannot verify.
+
 ## (Historical) Known limitation: SPHINCS+ did not run in the firmware
 
 The Standard-profile signature check is fully functional in host tooling and

@@ -12,4 +12,3 @@ path = "src/lib.rs"
 
 [dependencies]
 cibos-input = { workspace = true }
-cibos-sdk = { workspace = true }

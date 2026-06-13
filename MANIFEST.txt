@@ -1,28 +1,25 @@
-CIBOS / CIBIOS / HIP — FULL sandbox archive (steps 1-5 COMPLETE)
-================================================================
-The full headline product loop runs on the booted kernel, runtime-verified in
-QEMU and built bare-metal-first:
-  boot -> persistent CIBOSFS (mount-or-format, survives reboot) -> create-user
-  -> login (REAL login crate) -> shell (REAL shell::dispatch in ring 3)
-  -> compose EXISTING apps pkg/kv/edit (each reused verbatim via process_command)
-  -> `pkg install <name>` from a LOCAL /repo (SHA-256 verified, network-free)
-  -> installed file in /apps. App baking is flavor-selectable (--with-apps).
+CIBOS / CIBIOS / HIP — FULL sandbox archive (steps 1-5 + security/platform arc)
+================================================================================
+Product loop (runtime-verified, bare-first): boot -> persistent CIBOSFS -> login
+(real crate) -> shell (real dispatch, ring 3) -> compose existing apps pkg/kv/edit
+-> install from LOCAL /repo (SHA-256 verified, network-free) -> file in /apps;
+flavor-selectable app baking (--with-apps).
 
-Verified: 317 tests pass / 0 fail; 6 SDK examples build; clippy clean; the
-on-kernel app crates (shell, package-manager, kvstore, editor, cibos-app,
-cibos-console, cibos-sync, accounts, login) all build for x86_64-unknown-none.
+THIS ARC added:
+* SECURITY (E): firmware image verification now DISPATCHES on the image's
+  signature_algorithm field (via shared verify_with, whose SPHINCS+ arm prefers
+  std then the no_std portable verifier so it links bare). Fail-closed guarantee
+  TESTED: an image selecting an algorithm with no compiled verifier is rejected,
+  never booted unverified. cibios 27/0; bare firmware builds x86_64/aarch64/
+  riscv64; QEMU Standard image boots "image verified" via the new dispatch.
+  SECURITY-NOTES.md updated with honest scheme-selection status (SPHINCS+ bare +
+  default; ML-DSA needs a portable verifier; Ed25519 intentionally unavailable).
+* PLATFORMS (C): platform-gui and platform-mobile converted to no_std + alloc;
+  both build host AND bare on all three arches. The text-cell GUI Surface +
+  touch/gesture layer are now kernel-ready across the arch matrix. Remaining:
+  a display+input driver to render on hardware; platform-server (kernel System).
 
-New/changed crates this arc:
-  cibos-console (Console + ShellFs/ShellSystem seam), cibos-sync (no_std Mutex),
-  cibos-app (SyscallConsole/SyscallSystem), accounts/login (no_std), shell/
-  package-manager/kvstore/editor (no_std-capable), kernel-image/apps/{login-rs,
-  shell-rs} (thin ring-3 launchers for the REAL shared crates).
-
-Step 5 specifics: persistent root fs; package-manager::install_from_repo (verify-
-before-write, FS via closures so process_command stays pure); kernel seeds /repo;
-shell `pkg install` wired to syscalls; `--with-apps` flavor flag (app-* features).
-
-See PORT-PLAN-AND-REVIEW.md for the authoritative plan + the POST-STEP-5 ROADMAP
-(connect remaining 13 host-only apps; platforms GUI/mobile/server; remote store
-server; security/deploy/UX tracks). Excluded: target/, *-target/, *.img, *.key.
-License: MIT.
+Verified: 318 tests / 0 fail; examples build; clippy clean; on-kernel app crates
++ platform-gui/mobile build for the bare arches. See PORT-PLAN-AND-REVIEW.md for
+the authoritative plan + POST-STEP-5 ROADMAP (with E and C progress + remaining
+app ports: 13 host-only apps still to connect). License: MIT.

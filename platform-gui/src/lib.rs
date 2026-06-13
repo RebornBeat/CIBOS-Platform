@@ -11,8 +11,15 @@
 //! A [`GuiApp`] implements `render` (paint current state) and `handle` (update
 //! state from one event, returning whether to continue).
 
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+extern crate alloc;
+
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use cibos_input::InputEvent;
 

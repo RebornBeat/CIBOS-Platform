@@ -127,13 +127,22 @@ pub fn verify_with(
 ) -> Result<(), CryptoError> {
     match algorithm {
         SignatureAlgorithm::SphincsPlus => {
+            // Prefer the std backend when present; fall back to the no_std
+            // portable verifier (bare firmware/kernel) when only that is compiled
+            // in. Both produce identical results for the same key/message/sig.
             #[cfg(feature = "pqc-sphincs")]
             {
                 super::backends::sphincs::SphincsPlusVerifier::verify(
                     public_key, message, signature,
                 )
             }
-            #[cfg(not(feature = "pqc-sphincs"))]
+            #[cfg(all(not(feature = "pqc-sphincs"), feature = "pqc-sphincs-portable"))]
+            {
+                super::backends::sphincs_portable::SphincsPlusPortableVerifier::verify(
+                    public_key, message, signature,
+                )
+            }
+            #[cfg(all(not(feature = "pqc-sphincs"), not(feature = "pqc-sphincs-portable")))]
             {
                 let _ = (public_key, message, signature);
                 Err(CryptoError::AlgorithmUnavailable {

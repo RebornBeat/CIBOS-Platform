@@ -300,10 +300,30 @@ B. EXAMPLES: the 6 cibos-sdk examples still build (host async-runtime teaching
    demos — lanes/channels/pipelines). They are NOT on-kernel product; keep
    building them as host docs. Re-verify after SDK changes.
 C. PLATFORMS: platform-cli (done, the Console seam), platform-gui, platform-mobile,
-   platform-server exist as crates. The bare product is x86_64 today; aarch64/
-   riscv64 boot via FDT (build-profile.sh) but the app layer is x86_64-first.
-   Per-platform-per-arch matrix is future work (GUI/mobile need a display/input
-   stack on the kernel — large).
+   platform-server exist as crates.
+
+   C — PROGRESS (this arc): assessment-first, then real conversions.
+   FINDINGS (on disk): platform-gui is a character-cell `Surface`/`Cell` grid
+   (text-granularity GUI) + event runner; platform-mobile adds touch gesture
+   recognition over the GUI Surface; platform-server is a headless SDK/System
+   daemon host. CRUCIALLY: platform-gui had ZERO `std::` and ZERO real `cibos_sdk`
+   use (the cibos-sdk dep was spurious); platform-mobile likewise (it builds only
+   on platform-gui + cibos-input). So both were nearly no_std-ready.
+   DONE: converted **platform-gui** and **platform-mobile** to `no_std + alloc`
+   (dropped platform-gui's unused cibos-sdk dep). Both build host (tests 3/3, 4/4)
+   AND bare on ALL THREE arches (x86_64-unknown-none, aarch64-unknown-none,
+   riscv64gc-unknown-none-elf). The text-cell GUI Surface + touch/gesture layer
+   are now KERNEL-READY across the full arch matrix — the foundation for an
+   on-kernel GUI and touch UI. 318/0.
+   C — REMAINING (scoped): platform-server stays host/SDK-coupled (it needs the
+   kernel-side System: channels/spawn/Lattice — heavier async, future). The
+   missing kernel piece for GUI is a DISPLAY+INPUT DRIVER (framebuffer/VGA-text
+   render of a Surface + the existing PS/2 keyboard; touch panel for mobile) — the
+   platform ABSTRACTIONS are now portable, the drivers are the next build. Per
+   platform x per arch: CLI works (x86_64 on kernel); GUI/mobile surfaces compile
+   for all 3 bare arches but await the display driver to render on hardware;
+   server awaits the kernel System. NO missing app/platform crates identified
+   beyond these.
 D. SERVER / STORE: the package repo is LOCAL on the medium today (no network
    needed — by design, done). A remote store/server is the LAST step: stand up a
    server, add a network transport, let package-manager fetch+verify from it. The
@@ -316,6 +336,32 @@ E. SECURITY / DEPLOY (cibios/src/verification.rs, shared/src/crypto, SECURITY-
    install choice, persistent vs live selection) and the GUI/CLI UX polish (ASCII
    TUI etc.) are their own tracks. These are AUDIT + UX tracks, scoped here, NOT
    yet implemented end-to-end.
+
+   E — PROGRESS (this arc): assessment-first, then a real, honest increment.
+   FINDINGS (on disk): image signing/verify works end-to-end (SHA-256 per
+   component + SPHINCS+ detached sig); the portable no_std SPHINCS+ verifier runs
+   in BARE firmware and is QEMU-verified (signed boots, tampered rejected). The
+   image header already carries a `signature_algorithm` field, and three schemes
+   exist in the abstraction (Ed25519 classical, SPHINCS+ + ML-DSA post-quantum) —
+   BUT sign/verify were HARDCODED to SPHINCS+ (the field was written, never
+   dispatched on), ML-DSA's verifier is libc-bound (no bare link), and Ed25519 has
+   no backend. So "quantum vs non-quantum selection" was SCAFFOLDED, not real.
+   DONE: made firmware `verify_signature` DISPATCH on the header's
+   `signature_algorithm` via the single shared `verify_with` seam (whose SPHINCS+
+   arm now prefers std then the portable verifier, so it links bare). FAIL-CLOSED
+   guarantee added + tested (`unavailable_algorithm_fails_closed`): an image
+   selecting an algorithm with no compiled verifier is REJECTED, never booted
+   unverified. cibios 27/0; bare firmware builds x86_64/aarch64/riscv64; QEMU:
+   Standard `balanced` image boots "image verified (signature checked)" via the
+   new dispatch; `container isolation verified` also observed. SECURITY-NOTES.md
+   updated with the honest selection status (SPHINCS+ bare-verifiable + default;
+   ML-DSA needs a portable verifier; Ed25519 intentionally unavailable). 318/0.
+   E-REMAINING (scoped, NOT done): portable no_std ML-DSA verifier (to make ML-DSA
+   selection bare-real); mkimage `--algorithm` once a 2nd scheme verifies bare;
+   per-image unique key provisioning + the "each .img is sensitive/not WWW-
+   shareable" deploy story; USB-flash deploy UX (partition install, persistent-vs-
+   live selection at install); GUI/CLI UX polish (ASCII TUI); a zero-day/isolation
+   audit pass. These remain AUDIT + UX tracks.
    - Order rationale: 5a is small + directly demonstrable; 5b/5c advance the
      headline loop (install-from-local-repo, no network); 5d is build ergonomics.
 

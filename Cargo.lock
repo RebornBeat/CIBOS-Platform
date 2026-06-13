@@ -382,7 +382,6 @@ name = "platform-gui"
 version = "0.1.0"
 dependencies = [
  "cibos-input",
- "cibos-sdk",
 ]
 
 [[package]]
