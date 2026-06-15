@@ -11,7 +11,7 @@
 //!   mkimage build <arch> <entry_hex> <load_hex> <kernel.bin> <out.cimg>
 //!   mkimage verify <image.cimg> <arch>
 //! ```
-//! `<arch>` is one of `x86_64`, `aarch64`, `riscv64`. Images are Lightweight
+//! `<arch>` is one of `x86_64`, `aarch64`, `riscv64`, `x86` (i686). Images are Lightweight
 //! (unsigned); the firmware accepts them when its profile does not require a
 //! signature.
 
@@ -28,6 +28,7 @@ fn arch_from_str(s: &str) -> Option<ProcessorArchitecture> {
         "x86_64" => Some(ProcessorArchitecture::X86_64),
         "aarch64" => Some(ProcessorArchitecture::AArch64),
         "riscv64" => Some(ProcessorArchitecture::RiscV64),
+        "x86" => Some(ProcessorArchitecture::X86),
         _ => None,
     }
 }

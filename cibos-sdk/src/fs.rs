@@ -69,14 +69,47 @@ impl Filesystem {
     /// All paths beginning with `prefix`, sorted. An empty prefix lists every
     /// path.
     #[must_use]
-    pub fn list(&self, prefix: &str) -> Vec<String> {
-        self.inner
+    /// Every stored key (full path), sorted.
+    ///
+    /// Distinct from [`list`](Self::list): `list` returns the immediate child
+    /// names under a directory (the `ShellFs` contract), whereas `all_keys`
+    /// returns the complete set of full paths in the store. This is what
+    /// whole-filesystem operations (serialization, zeroization) need — they must
+    /// read every entry by its full key.
+    pub fn all_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.inner.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+    ///
+    /// Contract (shared by every `ShellFs` backend, host and kernel): `list`
+    /// returns the IMMEDIATE CHILD NAMES of the directory — not full paths, and
+    /// not recursive. This flat key-value store has no real directories, so it
+    /// derives the children from the keys: every key under `dir` contributes its
+    /// next path segment, de-duplicated. A trailing slash on `dir` is optional.
+    pub fn list(&self, dir: &str) -> Vec<String> {
+        let mut prefix = dir.to_string();
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let mut names: Vec<String> = self
+            .inner
             .lock()
             .unwrap()
             .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| {
+                // The immediate child is the first segment of the remainder.
+                match rest.split_once('/') {
+                    Some((head, _)) => head.to_string(),
+                    None => rest.to_string(),
+                }
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Number of files stored.
@@ -115,9 +148,11 @@ mod tests {
         fs.write("/a/one", b"1");
         fs.write("/a/two", b"2");
         fs.write("/b/three", b"3");
+        // The contract: immediate child names, not full paths, not recursive.
         let under_a = fs.list("/a/");
-        assert_eq!(under_a, vec!["/a/one".to_string(), "/a/two".to_string()]);
-        assert_eq!(fs.list("").len(), 3);
+        assert_eq!(under_a, vec!["one".to_string(), "two".to_string()]);
+        // Top level: the two directory names, de-duplicated (not the 3 files).
+        assert_eq!(fs.list(""), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

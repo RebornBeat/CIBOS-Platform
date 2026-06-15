@@ -364,10 +364,14 @@ C. PLATFORMS: platform-cli (done, the Console seam), platform-gui, platform-mobi
    kernel_entry), `linker/x86.ld` + `x86_handoff.ld`, and the build.rs arch+script
    mappings. The i686 kernel now COMPILES AND LINKS (custom target, nightly). All
    four arches build the kernel; host 318/0; the other 3 arches unaffected.
-   i686-REMAINING (honest): the firmware<->kernel i686 runtime HANDOFF contract
-   (how CIBIOS hands the handoff pointer + enters the kernel) and a QEMU i686 boot
-   path are not yet wired/verified — i686 builds but is not yet runtime-proven
-   like the other arches. Tracked as remaining boot-chain work.
+   i686-RUNTIME — DONE (next arc): the firmware<->kernel i686 handoff is now
+   RUNTIME-PROVEN. mkimage accepts the `x86` tag; `build-bootimage.sh compute
+   i686` builds a BIOS .img (nightly+build-std via an I686 flag) that BOOTS in
+   qemu-system-i386: CIBIOS (32-bit) -> image verified -> handoff -> kernel entry
+   -> heap -> scheduler -> boot complete. ALL FOUR ARCHES NOW BOOT THE KERNEL.
+   i686-REMAINING (honest): serial-only (no VGA) + MMU/paging bring-up pending, so
+   i686 boots the kernel but does not yet run the ring-3 app flow (shared with the
+   per-arch app-flow item — the login/shell .capp run blocks are x86_64-gated).
 
    APP <-> PLATFORM MATRIX (assessment): the 17 apps live in applications/ and are
    written to the `Console` (CLI) seam via platform-cli; they are platform-cli

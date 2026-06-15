@@ -120,6 +120,13 @@ pub trait SyscallEnv {
         Err(SyscallError::NotPermitted)
     }
 
+    /// Cooperatively sleep for at least `nanos` nanoseconds, then resume. The
+    /// default is a no-op (returns immediately); a kernel environment with a
+    /// timer overrides it to actually wait.
+    fn sleep_nanos(&self, _nanos: u64) -> Result<(), SyscallError> {
+        Ok(())
+    }
+
     /// Read the next keyboard event. `blocking` selects waiting vs immediate.
     /// Returns the packed key value (>= 0, via `encode_key`) or a negative
     /// [`SyscallError`] (`NotFound` when non-blocking and the queue is empty).
@@ -131,6 +138,59 @@ pub trait SyscallEnv {
     /// Fill `out` with cryptographically-random bytes from the kernel CSPRNG.
     /// The default reports no entropy source.
     fn fill_random(&self, _out: &mut [u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Open a local (intra-boundary) bounded channel with `capacity` buffered
+    /// messages of up to `max_message_bytes` each. Returns an opaque channel
+    /// handle (>= 0) valid within `boundary`. The default reports no IPC
+    /// surface; a kernel environment with a channel registry overrides it.
+    fn open_channel(
+        &self,
+        _boundary: BoundaryId,
+        _capacity: usize,
+        _max_message_bytes: usize,
+    ) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Send `data` on the channel `handle` owned by `boundary`. Cooperative
+    /// back-pressure is handled by the kernel (Catch and Release): on a full
+    /// buffer the call reports [`SyscallError::WouldBlock`] so the caller's lane
+    /// can be parked and retried when space is signalled. The default reports no
+    /// IPC surface.
+    fn channel_send(
+        &self,
+        _boundary: BoundaryId,
+        _handle: u64,
+        _data: &[u8],
+    ) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Receive one message from channel `handle` owned by `boundary`. Returns
+    /// the message bytes, or [`SyscallError::WouldBlock`] when the buffer is
+    /// empty and the channel is open (the lane parks until data is signalled),
+    /// or [`SyscallError::NotFound`] when the channel is closed and drained. The
+    /// default reports no IPC surface.
+    fn channel_recv(
+        &self,
+        _boundary: BoundaryId,
+        _handle: u64,
+    ) -> Result<alloc::vec::Vec<u8>, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Spawn a cooperative lane in `boundary` beginning at the user entry point
+    /// `entry` with argument `arg`. Returns a lane id (>= 0). The default
+    /// reports no scheduling surface; a kernel environment overrides it to spawn
+    /// onto the single-selector executor.
+    fn spawn(
+        &self,
+        _boundary: BoundaryId,
+        _entry: u64,
+        _arg: u64,
+    ) -> Result<u64, SyscallError> {
         Err(SyscallError::NotPermitted)
     }
 }
@@ -203,6 +263,76 @@ pub fn dispatch<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome 
                 Err(e) => SyscallOutcome::Return(e.as_return()),
             }
         }
+        Syscall::Sleep => {
+            // Duration is a u64 carried in arg0 (low) and arg1 (high).
+            let nanos = req.arg0 | (req.arg1 << 32);
+            match env.sleep_nanos(nanos) {
+                Ok(()) => SyscallOutcome::Return(0),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::OpenChannel => {
+            // arg0 = buffer capacity (messages), arg1 = max message bytes.
+            let capacity = req.arg0 as usize;
+            let max_message_bytes = req.arg1 as usize;
+            if capacity == 0 || max_message_bytes == 0 || max_message_bytes > MAX_FS_IO_LEN {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            }
+            match env.open_channel(req.boundary, capacity, max_message_bytes) {
+                // Handle is non-negative; clamp into the i64 success range.
+                Ok(handle) => SyscallOutcome::Return((handle & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::ChannelSend => channel_send(req, env),
+        Syscall::ChannelRecv => channel_recv(req, env),
+        Syscall::Spawn => {
+            // arg0 = user entry pointer, arg1 = argument word.
+            match env.spawn(req.boundary, req.arg0, req.arg1) {
+                Ok(lane) => SyscallOutcome::Return((lane & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+    }
+}
+
+/// `channel_send`: copy the user buffer (`arg1` ptr, `arg2` len) and hand it to
+/// the channel `arg0`. A full buffer surfaces as [`SyscallError::WouldBlock`].
+fn channel_send<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let handle = req.arg0;
+    let len = req.arg2 as usize;
+    if len > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    let mut buf = alloc::vec![0u8; len];
+    if let Err(e) = env.copy_from_user(req.boundary, req.arg1, len, &mut buf) {
+        return SyscallOutcome::Return(e.as_return());
+    }
+    match env.channel_send(req.boundary, handle, &buf) {
+        Ok(()) => SyscallOutcome::Return(0),
+        Err(e) => SyscallOutcome::Return(e.as_return()),
+    }
+}
+
+/// `channel_recv`: receive one message from channel `arg0` and copy it to the
+/// user buffer (`arg1` ptr, `arg2` len), returning the byte count written
+/// (truncated to the buffer). An empty open channel surfaces as
+/// [`SyscallError::WouldBlock`]; a closed, drained channel as `NotFound`.
+fn channel_recv<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome {
+    let handle = req.arg0;
+    let cap = req.arg2 as usize;
+    if cap > MAX_FS_IO_LEN {
+        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+    }
+    match env.channel_recv(req.boundary, handle) {
+        Ok(msg) => {
+            let n = core::cmp::min(msg.len(), cap);
+            if let Err(e) = env.copy_to_user(req.boundary, req.arg1, &msg[..n]) {
+                return SyscallOutcome::Return(e.as_return());
+            }
+            SyscallOutcome::Return(n as i64)
+        }
+        Err(e) => SyscallOutcome::Return(e.as_return()),
     }
 }
 
@@ -351,6 +481,13 @@ mod tests {
         // A tiny in-memory filesystem: path -> contents; dirs tracked as a set.
         files: RefCell<alloc::collections::BTreeMap<alloc::vec::Vec<u8>, alloc::vec::Vec<u8>>>,
         dirs: RefCell<alloc::collections::BTreeSet<alloc::vec::Vec<u8>>>,
+        // A tiny in-memory channel registry exercising the canonical local-channel
+        // contract: handle -> (capacity, FIFO of buffered messages). `WouldBlock`
+        // models Catch-and-Release back-pressure (full on send, empty on recv).
+        channels: RefCell<alloc::collections::BTreeMap<u64, (usize, alloc::collections::VecDeque<alloc::vec::Vec<u8>>)>>,
+        next_handle: RefCell<u64>,
+        // Each spawn records (entry, arg); returns a fresh lane id.
+        spawned: RefCell<alloc::vec::Vec<(u64, u64)>>,
     }
 
     impl SyscallEnv for MockEnv {
@@ -454,6 +591,57 @@ mod tests {
             }
             Ok(())
         }
+        fn open_channel(
+            &self,
+            _boundary: BoundaryId,
+            capacity: usize,
+            _max_message_bytes: usize,
+        ) -> Result<u64, SyscallError> {
+            let mut next = self.next_handle.borrow_mut();
+            let handle = *next;
+            *next += 1;
+            self.channels
+                .borrow_mut()
+                .insert(handle, (capacity, alloc::collections::VecDeque::new()));
+            Ok(handle)
+        }
+        fn channel_send(
+            &self,
+            _boundary: BoundaryId,
+            handle: u64,
+            data: &[u8],
+        ) -> Result<(), SyscallError> {
+            let mut chans = self.channels.borrow_mut();
+            let (cap, queue) = chans.get_mut(&handle).ok_or(SyscallError::NotFound)?;
+            // Full buffer => Catch-and-Release back-pressure, surfaced as WouldBlock.
+            if queue.len() >= *cap {
+                return Err(SyscallError::WouldBlock);
+            }
+            queue.push_back(data.to_vec());
+            Ok(())
+        }
+        fn channel_recv(
+            &self,
+            _boundary: BoundaryId,
+            handle: u64,
+        ) -> Result<alloc::vec::Vec<u8>, SyscallError> {
+            let mut chans = self.channels.borrow_mut();
+            let (_cap, queue) = chans.get_mut(&handle).ok_or(SyscallError::NotFound)?;
+            // Empty but open => park (WouldBlock); the kernel env distinguishes a
+            // closed-drained channel as NotFound. The mock keeps channels open.
+            queue.pop_front().ok_or(SyscallError::WouldBlock)
+        }
+        fn spawn(
+            &self,
+            _boundary: BoundaryId,
+            entry: u64,
+            arg: u64,
+        ) -> Result<u64, SyscallError> {
+            let mut spawned = self.spawned.borrow_mut();
+            let lane = spawned.len() as u64;
+            spawned.push((entry, arg));
+            Ok(lane)
+        }
     }
 
     fn env_with(text: &str) -> MockEnv {
@@ -464,6 +652,9 @@ mod tests {
             clock: 123_456_789,
             files: RefCell::new(alloc::collections::BTreeMap::new()),
             dirs: RefCell::new(alloc::collections::BTreeSet::new()),
+            channels: RefCell::new(alloc::collections::BTreeMap::new()),
+            next_handle: RefCell::new(0),
+            spawned: RefCell::new(alloc::vec::Vec::new()),
         }
     }
 
@@ -543,6 +734,15 @@ mod tests {
         let env = env_with("");
         let r = req(Syscall::Now.number(), 0, 0);
         assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(123_456_789));
+    }
+
+    #[test]
+    fn sleep_returns_ok() {
+        // The default SyscallEnv::sleep_nanos is a no-op returning Ok, so the
+        // dispatcher returns 0. (The kernel env overrides it to actually wait.)
+        let env = env_with("");
+        let r = req(Syscall::Sleep.number(), 5_000_000, 0);
+        assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(0));
     }
 
     #[test]
@@ -770,6 +970,189 @@ mod tests {
         assert_eq!(
             dispatch(&r, &env),
             SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
+        );
+    }
+
+    // ---- Track 2: channels + spawn ----
+
+    /// Build a request with all three argument registers.
+    fn req3(number: u64, a0: u64, a1: u64, a2: u64) -> SyscallRequest {
+        SyscallRequest {
+            number,
+            arg0: a0,
+            arg1: a1,
+            arg2: a2,
+            boundary: BoundaryId::new(1),
+        }
+    }
+
+    #[test]
+    fn open_channel_returns_handle() {
+        let env = env_with("");
+        // capacity=4 messages, max 64 bytes each.
+        let r = req(Syscall::OpenChannel.number(), 4, 64);
+        // First handle is 0 (the mock's counter starts at 0).
+        assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(0));
+        // A second open yields a distinct handle.
+        assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(1));
+        assert_eq!(env.channels.borrow().len(), 2);
+    }
+
+    #[test]
+    fn open_channel_rejects_zero_capacity_or_size() {
+        let env = env_with("");
+        let bad_cap = req(Syscall::OpenChannel.number(), 0, 64);
+        assert_eq!(
+            dispatch(&bad_cap, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
+        let bad_size = req(Syscall::OpenChannel.number(), 4, 0);
+        assert_eq!(
+            dispatch(&bad_size, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
+        // Oversized message bound is rejected too.
+        let too_big = req(Syscall::OpenChannel.number(), 4, (MAX_FS_IO_LEN + 1) as u64);
+        assert_eq!(
+            dispatch(&too_big, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
+    }
+
+    #[test]
+    fn channel_send_then_recv_round_trips() {
+        let env = env_with("");
+        // Open a channel (handle 0).
+        let open = req(Syscall::OpenChannel.number(), 4, 64);
+        assert_eq!(dispatch(&open, &env), SyscallOutcome::Return(0));
+
+        // Lay out user memory: 5 payload bytes at base, then a 64-byte recv buffer.
+        let payload = b"hello";
+        let recv_off = payload.len();
+        let recv_cap = 64usize;
+        let mut mem = alloc::vec::Vec::new();
+        mem.extend_from_slice(payload);
+        mem.extend_from_slice(&alloc::vec![0u8; recv_cap]);
+        *env.data.borrow_mut() = mem;
+        let base = env.base;
+
+        // Send: arg0=handle 0, arg1=ptr to payload, arg2=len.
+        let send = req3(Syscall::ChannelSend.number(), 0, base, payload.len() as u64);
+        assert_eq!(dispatch(&send, &env), SyscallOutcome::Return(0));
+
+        // Recv: arg0=handle 0, arg1=ptr to recv buffer, arg2=capacity.
+        // Returns the byte count written (5).
+        let recv = req3(
+            Syscall::ChannelRecv.number(),
+            0,
+            base + recv_off as u64,
+            recv_cap as u64,
+        );
+        assert_eq!(dispatch(&recv, &env), SyscallOutcome::Return(payload.len() as i64));
+        let got = env.data.borrow()[recv_off..recv_off + payload.len()].to_vec();
+        assert_eq!(&got, payload);
+    }
+
+    #[test]
+    fn channel_send_full_buffer_would_block() {
+        let env = env_with("");
+        // Capacity 1.
+        let open = req(Syscall::OpenChannel.number(), 1, 64);
+        assert_eq!(dispatch(&open, &env), SyscallOutcome::Return(0));
+        let payload = b"x";
+        *env.data.borrow_mut() = payload.to_vec();
+        let base = env.base;
+        let send = req3(Syscall::ChannelSend.number(), 0, base, 1);
+        // First send fits.
+        assert_eq!(dispatch(&send, &env), SyscallOutcome::Return(0));
+        // Second send hits back-pressure -> WouldBlock (Catch-and-Release parks the lane).
+        assert_eq!(
+            dispatch(&send, &env),
+            SyscallOutcome::Return(SyscallError::WouldBlock.as_return())
+        );
+    }
+
+    #[test]
+    fn channel_recv_empty_would_block() {
+        let env = env_with("");
+        let open = req(Syscall::OpenChannel.number(), 4, 64);
+        assert_eq!(dispatch(&open, &env), SyscallOutcome::Return(0));
+        // Recv on an empty (but open) channel -> WouldBlock.
+        *env.data.borrow_mut() = alloc::vec![0u8; 64];
+        let base = env.base;
+        let recv = req3(Syscall::ChannelRecv.number(), 0, base, 64);
+        assert_eq!(
+            dispatch(&recv, &env),
+            SyscallOutcome::Return(SyscallError::WouldBlock.as_return())
+        );
+    }
+
+    #[test]
+    fn channel_ops_on_unknown_handle_not_found() {
+        let env = env_with("");
+        *env.data.borrow_mut() = alloc::vec![0u8; 64];
+        let base = env.base;
+        // No channel opened; handle 7 does not exist.
+        let send = req3(Syscall::ChannelSend.number(), 7, base, 1);
+        assert_eq!(
+            dispatch(&send, &env),
+            SyscallOutcome::Return(SyscallError::NotFound.as_return())
+        );
+        let recv = req3(Syscall::ChannelRecv.number(), 7, base, 64);
+        assert_eq!(
+            dispatch(&recv, &env),
+            SyscallOutcome::Return(SyscallError::NotFound.as_return())
+        );
+    }
+
+    #[test]
+    fn spawn_records_entry_and_arg() {
+        let env = env_with("");
+        // arg0 = entry pointer, arg1 = argument word.
+        let r = req(Syscall::Spawn.number(), 0xdead_beef, 42);
+        // First lane id is 0.
+        assert_eq!(dispatch(&r, &env), SyscallOutcome::Return(0));
+        // Second spawn -> lane id 1.
+        let r2 = req(Syscall::Spawn.number(), 0xfeed_face, 7);
+        assert_eq!(dispatch(&r2, &env), SyscallOutcome::Return(1));
+        let spawned = env.spawned.borrow();
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[0], (0xdead_beef, 42));
+        assert_eq!(spawned[1], (0xfeed_face, 7));
+    }
+
+    #[test]
+    fn track2_default_env_denies() {
+        // The default trait methods reject channel/spawn (a kernel env with no
+        // IPC/scheduling surface). Real success requires an env override.
+        struct Bare;
+        impl SyscallEnv for Bare {
+            fn copy_from_user(&self, _b: BoundaryId, _p: u64, _l: usize, _o: &mut [u8]) -> Result<(), SyscallError> {
+                Ok(())
+            }
+            fn console_write(&self, _b: &[u8]) {}
+            fn now_nanos(&self) -> u64 { 0 }
+            fn copy_to_user(&self, _b: BoundaryId, _p: u64, _by: &[u8]) -> Result<(), SyscallError> {
+                Ok(())
+            }
+        }
+        let env = Bare;
+        let denied = SyscallError::NotPermitted.as_return();
+        assert_eq!(
+            dispatch(&req(Syscall::OpenChannel.number(), 4, 64), &env),
+            SyscallOutcome::Return(denied)
+        );
+        assert_eq!(
+            dispatch(&req3(Syscall::ChannelSend.number(), 0, 0, 0), &env),
+            SyscallOutcome::Return(denied)
+        );
+        assert_eq!(
+            dispatch(&req3(Syscall::ChannelRecv.number(), 0, 0, 0), &env),
+            SyscallOutcome::Return(denied)
+        );
+        assert_eq!(
+            dispatch(&req(Syscall::Spawn.number(), 0, 0), &env),
+            SyscallOutcome::Return(denied)
         );
     }
 }

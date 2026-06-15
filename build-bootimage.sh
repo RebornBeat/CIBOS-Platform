@@ -26,19 +26,13 @@
 #   ./build-bootimage.sh <compute|performance|maximum-isolation|balanced> [arch...]
 #     arch defaults to: x86_64
 #
-# Only x86_64 produces a complete bootable .img today. The i686 path has two
-# pre-existing prerequisites that are NOT met yet (both outside the bootloader
-# layers, recorded here so they are not lost):
-#   1. `mkimage` accepts only the x86_64/aarch64/riscv64 arch tags; it cannot
-#      stamp the `x86` (32-bit) tag that ProcessorArchitecture::X86 = 3 needs, so
-#      CIBIOS would reject an i686 .cimg as a wrong-arch image at boot.
-#   2. `kernel-image`'s 32-bit x86 arch backend is incomplete: it is missing
-#      `arch::putc`, `arch::init_serial`, and `arch::halt`, and has two type
-#      mismatches, so `cargo build -p kernel-image` does not compile for
-#      i686-cibos-none. (CIBIOS itself builds i686 fine on both boot paths; this
-#      gap is in the kernel image, not the firmware or the bootloader.)
-# When both are addressed, add i686 back to the arch loop below.
-#
+# Both x86_64 and i686 produce a complete bootable .img. i686 uses the custom
+# target (targets/i686-cibos-none.json) built with nightly + build-std (handled
+# automatically below via the I686 flag); the firmware and kernel both build and
+# the firmware->kernel handoff is runtime-proven in QEMU (qemu-system-i386). Note
+# i686 is serial-only at the kernel (no VGA yet) and its MMU/paging bring-up is
+# pending, so i686 boots the kernel but does not yet run the ring-3 app flow.
+# aarch64/riscv64 boot via QEMU -kernel/-initrd (build-profile.sh), not a BIOS img.
 # Requires: rustup with x86_64-unknown-none, llvm-tools-preview, and GNU binutils
 # (gcc/ld/objcopy) for the bootloader.
 set -e
@@ -133,17 +127,17 @@ for a in $ARCHES; do
       MKARCH=x86_64
       ;;
     i686)
-      echo "ERROR: the i686 bootable .img is not buildable yet. Two prerequisites"
-      echo "       (both outside the bootloader layers) are unmet:"
-      echo "         1. mkimage cannot stamp the 'x86' (32-bit) arch tag, so CIBIOS"
-      echo "            would reject the .cimg as wrong-arch at boot."
-      echo "         2. kernel-image's 32-bit x86 arch backend is incomplete"
-      echo "            (missing arch::putc/init_serial/halt; two type mismatches)."
-      echo "       The bootloader, the boot contract, mkbootimage, and CIBIOS i686"
-      echo "       all build; only the kernel image and mkimage arch tag are gating."
-      exit 3
+      # 32-bit x86 (legacy BIOS). The kernel needs nightly build-std for the
+      # custom target; handled by the I686 flag + the per-arch kernel build below.
+      T="$HERE/targets/i686-cibos-none.json"
+      KE=0x1000000          # CIBOS kernel load/entry (matches linker/x86_handoff.ld)
+      CIBIOS_LOAD=0x100000  # matches cibios/linker/x86.ld (multiboot 1M)
+      CIBOS_LOAD=0x4000000
+      S2="$HERE/bootloader/build/stage2-i686.bin"
+      MKARCH=x86
+      I686=1
       ;;
-    *) echo "unsupported arch for BIOS image: $a (only x86_64 today)"; exit 1 ;;
+    *) echo "unsupported arch for BIOS image: $a (x86_64 or i686)"; exit 1 ;;
   esac
 
   echo "== $PROFILE / $a : CIBOS kernel image =="
@@ -152,8 +146,24 @@ for a in $ARCHES; do
   # Standard profiles SIGN the image with the dev key; Lightweight build it
   # unsigned. The profile stamp must match the kernel's compiled profile (the
   # kernel halts on a mismatch).
-  cargo build -p kernel-image --no-default-features --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}${APP_FEATURES:+,$APP_FEATURES}" --target "$T"
-  KBIN="target/$T/debug/cibos-kernel"
+  if [ "${I686:-0}" = "1" ]; then
+    # 32-bit x86 has no precompiled core; use nightly + build-std on the custom
+    # target. (Only this arch needs nightly; everything else builds on stable.)
+    cargo +nightly build -p kernel-image --no-default-features \
+      --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}${APP_FEATURES:+,$APP_FEATURES}" \
+      --target "$T" -Z json-target-spec \
+      -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+  else
+    cargo build -p kernel-image --no-default-features --features "profile-$PROFILE${EXTRA_KFEATURES:+,$EXTRA_KFEATURES}${APP_FEATURES:+,$APP_FEATURES}" --target "$T"
+  fi
+  # Cargo's output directory uses the target *name*, which for a custom JSON
+  # spec is the file stem (e.g. i686-cibos-none), not the full path in $T.
+  case "$T" in
+    *.json) TNAME=$(basename "$T" .json) ;;
+    *)      TNAME="$T" ;;
+  esac
+
+  KBIN="target/$TNAME/debug/cibos-kernel"
   "$LLVM_OC" -O binary "$KBIN" "$HERE/images/kernel-$PROFILE-$a.bin"
   if [ "$SIGNED" = "1" ]; then
     cargo run -q -p mkimage -- sign "$MKARCH" "$KE" "$KE" \
@@ -165,8 +175,14 @@ for a in $ARCHES; do
   fi
 
   echo "== $PROFILE / $a : CIBIOS firmware (firmware-bootloader) =="
-  cargo build -p cibios --no-default-features --features "$FW_FEATURES" --target "$T"
-  CIBIOS_ELF="target/$T/debug/cibios"
+  if [ "${I686:-0}" = "1" ]; then
+    cargo +nightly build -p cibios --no-default-features --features "$FW_FEATURES" \
+      --target "$T" -Z json-target-spec \
+      -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+  else
+    cargo build -p cibios --no-default-features --features "$FW_FEATURES" --target "$T"
+  fi
+  CIBIOS_ELF="target/$TNAME/debug/cibios"
   "$LLVM_OC" -O binary "$CIBIOS_ELF" "$HERE/images/cibios-$PROFILE-$a.bin"
   CIBIOS_ENTRY=$(elf_entry "$CIBIOS_ELF")
   [ -n "$CIBIOS_ENTRY" ] || { echo "could not read CIBIOS entry from $CIBIOS_ELF"; exit 1; }

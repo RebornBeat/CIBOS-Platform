@@ -88,6 +88,36 @@ pub enum Syscall {
     /// named by the path; returns 0 or a negative error
     /// ([`SyscallError::NotFound`] if absent).
     FsDelete = 12,
+    /// `sleep(nanos_lo: u64, nanos_hi: u64) -> 0`. Cooperatively yield the CPU
+    /// for at least the given duration (a u64 split across two args), then
+    /// resume. Backed by the kernel timer + scheduler. The first ring-3 entry to
+    /// the kernel's scheduling/IPC surface (the System/IPC track).
+    Sleep = 13,
+    /// `open_channel(capacity: u64, max_message_bytes: u64) -> isize`. Create a
+    /// local (intra-boundary) bounded channel and return a non-negative channel
+    /// handle, or a negative [`SyscallError`]. Maps to the kernel
+    /// `ChannelRegistry`/`Channel` (point-to-point, back-pressured). The handle
+    /// is valid only within the calling boundary — channels never cross the
+    /// isolation boundary except by the (later) request/accept path.
+    OpenChannel = 14,
+    /// `channel_send(handle: u64, ptr: *const u8, len: usize) -> isize`. Send
+    /// `len` bytes from the user buffer on the channel `handle`. Returns 0 on
+    /// success; if the buffer is full the call cooperatively waits (Catch and
+    /// Release back-pressure) until space is available; negative on error
+    /// (closed channel, message too large, bad handle).
+    ChannelSend = 15,
+    /// `channel_recv(handle: u64, ptr: *mut u8, len: usize) -> isize`. Receive
+    /// one message from channel `handle` into the user buffer, returning the
+    /// number of bytes written (>=0, truncated to `len`). If no message is
+    /// available the call cooperatively waits (Catch and Release) until one
+    /// arrives or the channel closes; negative on error.
+    ChannelRecv = 16,
+    /// `spawn(entry: u64, arg: u64) -> isize`. Spawn a cooperative lane in the
+    /// calling boundary that begins at the user function pointer `entry` with
+    /// `arg`. Returns a non-negative lane id or a negative [`SyscallError`].
+    /// Lanes are the HIP unit of parallelism; this maps to the kernel's
+    /// cooperative `spawn` onto the single-selector executor.
+    Spawn = 17,
 }
 
 impl Syscall {
@@ -107,6 +137,11 @@ impl Syscall {
             10 => Some(Syscall::GetRandom),
             11 => Some(Syscall::FsList),
             12 => Some(Syscall::FsDelete),
+            13 => Some(Syscall::Sleep),
+            14 => Some(Syscall::OpenChannel),
+            15 => Some(Syscall::ChannelSend),
+            16 => Some(Syscall::ChannelRecv),
+            17 => Some(Syscall::Spawn),
             _ => None,
         }
     }
@@ -296,6 +331,12 @@ pub enum SyscallError {
     /// A storage/filesystem operation failed (I/O error, corrupt, no space,
     /// wrong kind, too large).
     IoError = 6,
+    /// The operation cannot complete right now without blocking (a full send
+    /// buffer or an empty receive buffer on an open channel). The caller's lane
+    /// is parked by the kernel and the operation should be retried when the
+    /// resource is signalled. Distinct from [`SyscallError::NotFound`], which a
+    /// channel returns only once it is closed and drained.
+    WouldBlock = 7,
 }
 
 impl SyscallError {
@@ -316,6 +357,7 @@ impl SyscallError {
             -4 => Some(SyscallError::NotPermitted),
             -5 => Some(SyscallError::NotFound),
             -6 => Some(SyscallError::IoError),
+            -7 => Some(SyscallError::WouldBlock),
             _ => None,
         }
     }
@@ -340,6 +382,11 @@ mod tests {
             Syscall::GetRandom,
             Syscall::FsList,
             Syscall::FsDelete,
+            Syscall::Sleep,
+            Syscall::OpenChannel,
+            Syscall::ChannelSend,
+            Syscall::ChannelRecv,
+            Syscall::Spawn,
         ] {
             assert_eq!(Syscall::from_number(s.number()), Some(s));
         }
@@ -388,6 +435,7 @@ mod tests {
             SyscallError::NotPermitted,
             SyscallError::NotFound,
             SyscallError::IoError,
+            SyscallError::WouldBlock,
         ] {
             assert!(e.as_return() < 0);
             assert_eq!(SyscallError::from_return(e.as_return()), Some(e));

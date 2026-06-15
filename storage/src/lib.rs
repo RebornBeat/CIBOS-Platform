@@ -191,7 +191,7 @@ impl Volume {
     fn snapshot(&self) -> Vec<(String, Vec<u8>)> {
         let mut entries: Vec<(String, Vec<u8>)> = self
             .fs
-            .list("")
+            .all_keys()
             .into_iter()
             .filter_map(|p| self.fs.read(&p).map(|d| (p, d)))
             .collect();
@@ -209,7 +209,7 @@ impl Volume {
 
     /// Zeroize the in-RAM working filesystem (no trace in memory).
     fn wipe_ram(&self) {
-        for path in self.fs.list("") {
+        for path in self.fs.all_keys() {
             // Overwrite with zeros of equal length before removing.
             if let Some(data) = self.fs.read(&path) {
                 self.fs.write(&path, &vec![0u8; data.len()]);

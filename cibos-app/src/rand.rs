@@ -44,3 +44,17 @@ pub fn now_nanos() -> u64 {
         ret as u64
     }
 }
+
+/// Cooperatively sleep for at least `nanos` nanoseconds via the `Sleep` syscall.
+pub fn sleep_nanos(nanos: u64) {
+    // The duration u64 is carried in arg0 (low 32 bits) and arg1 (high 32).
+    let lo = nanos & 0xFFFF_FFFF;
+    let hi = nanos >> 32;
+    // SAFETY: Sleep takes two scalar arguments and no pointers.
+    let _ = unsafe { syscall3(Syscall::Sleep, lo, hi, 0) };
+}
+
+/// Cooperatively sleep for at least `millis` milliseconds.
+pub fn sleep_millis(millis: u64) {
+    sleep_nanos(millis.saturating_mul(1_000_000));
+}

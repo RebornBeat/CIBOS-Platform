@@ -27,6 +27,7 @@ extern crate alloc;
 
 pub mod console;
 pub mod console_backend;
+pub mod channel;
 pub mod fs;
 pub mod heap;
 pub mod input;

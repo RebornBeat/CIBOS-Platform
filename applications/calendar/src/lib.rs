@@ -67,11 +67,11 @@ impl Calendar {
     /// `YYYY-MM-DD`).
     #[must_use]
     pub fn dates(&self) -> Vec<String> {
-        self.fs
-            .list("/calendar/")
-            .into_iter()
-            .filter_map(|k| k.strip_prefix("/calendar/").map(str::to_string))
-            .collect()
+        // `list` returns immediate child names (the contract), so each entry is
+        // already a bare date key.
+        let mut dates = self.fs.list("/calendar/");
+        dates.sort();
+        dates
     }
 
     /// Remove all events on a date; returns whether the date existed.

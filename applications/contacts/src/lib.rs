@@ -50,11 +50,11 @@ impl Contacts {
     /// All contact names, sorted.
     #[must_use]
     pub fn names(&self) -> Vec<String> {
-        self.fs
-            .list("/contacts/")
-            .into_iter()
-            .filter_map(|k| k.strip_prefix("/contacts/").map(str::to_string))
-            .collect()
+        // `list` returns immediate child names (the contract), so each entry is
+        // already a bare contact name.
+        let mut names = self.fs.list("/contacts/");
+        names.sort();
+        names
     }
 
     /// Names containing `query` (case-insensitive).

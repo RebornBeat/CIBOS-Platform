@@ -154,6 +154,16 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
                 kprintln!("CIBOS kernel: init lane running");
             });
 
+            // Portable in-kernel IPC demo: two cooperative lanes exchange
+            // messages over a bounded channel, driven by the single selector's
+            // Catch-and-Release loop. This is arch-independent (pure cibos-kernel
+            // Rust), so it proves the canonical channel model on EVERY arch —
+            // including aarch64/riscv64, which do not yet run the ring-3 syscall
+            // path. The sender's second send parks on a full buffer until the
+            // receiver drains a slot (back-pressure), then resumes.
+            #[cfg(feature = "channel-demo")]
+            demonstrate_kernel_channel(&mut kernel);
+
             let polls = kernel.run_until_idle();
             kprintln!("CIBOS kernel: scheduler idle after {polls} poll(s)");
 
@@ -188,6 +198,29 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // hardware (the disk we booted from).
             #[cfg(target_arch = "x86_64")]
             demonstrate_storage();
+
+            // Display-driver demo: run the notepad GuiApp on the VGA text
+            // console via the kernel GUI runner. Proves the Surface -> VGA blit
+            // and keyboard-driven render loop on real (emulated) hardware.
+            #[cfg(all(target_arch = "x86_64", feature = "gui-demo"))]
+            {
+                kprintln!("CIBOS kernel: --- notepad GUI demo (VGA) ---");
+                // Drive it programmatically (sendkey is unreliable): type a few
+                // characters, then Enter to exit. The text is blitted to VGA each
+                // render; the serial log proves the loop ran and exited.
+                inject_text("hello cibos");
+                inject_enter();
+                let mut app = notepad::Notepad::new();
+                crate::gui::run_gui_app(&mut app);
+                kprintln!("CIBOS kernel: notepad GUI demo exited");
+            }
+
+            // IPC demo: open a local channel and round-trip a message through
+            // the *real* syscall dispatch path (OpenChannel -> ChannelSend ->
+            // ChannelRecv against KernelSyscallEnv). Proves the Track 2 ABI works
+            // end to end on the booted kernel, including bounded back-pressure.
+            #[cfg(all(target_arch = "x86_64", feature = "channel-demo"))]
+            demonstrate_channel();
 
             kprintln!("CIBOS kernel: boot complete");
         }
@@ -569,42 +602,58 @@ fn run_ring3_demo(
                     Err(e) => kprintln!("CIBOS kernel: login(create) launch failed: {e}"),
                 }
 
-                // Second run: log in as "alice" with the correct password.
+                // Second run: authenticate as "alice". The login `.capp` returns
+                // 0 when access is GRANTED and 1 when DENIED, so its exit code is
+                // the session gate: the shell is launched ONLY on a granted login.
                 kprintln!("CIBOS kernel: --- login app: login run ---");
                 inject_text("alice");
                 inject_enter();
                 inject_text("pw123");
                 inject_enter();
-                match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
-                    Ok(code) => kprintln!("CIBOS kernel: login(auth) exited with code {code}"),
-                    Err(e) => kprintln!("CIBOS kernel: login(auth) launch failed: {e}"),
-                }
-            }
-
-            // Run the REAL shell (shell::dispatch composing the existing
-            // package-manager) in ring 3, driving it with a scripted command
-            // sequence (sendkey is unreliable, so inject programmatically). This
-            // exercises the whole shell stack — ReadKey -> read_line, the generic
-            // dispatch, the Fs* syscalls (write/read/ls/rm), Now -> uptime, and a
-            // composed app program (`pkg`) — all on the booted kernel. Opt-in via
-            // `app-shell` (the `--with-apps` flavor flag).
-            #[cfg(feature = "app-shell")]
-            {
-                const SHELL_RS_CAPP: &[u8] =
-                    include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
-                if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
-                    kprintln!("CIBOS kernel: --- shell app run ---");
-                    inject_text("store browse");
-                    inject_enter();
-                    inject_text("store install welcome");
-                    inject_enter();
-                    inject_text("store installed");
-                    inject_enter();
-                    inject_text("exit");
-                    inject_enter();
+                let login_granted =
                     match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
-                        Ok(code) => kprintln!("CIBOS kernel: shell exited with code {code}"),
-                        Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+                        Ok(0) => {
+                            kprintln!("CIBOS kernel: login GRANTED — starting session");
+                            true
+                        }
+                        Ok(code) => {
+                            kprintln!(
+                                "CIBOS kernel: login DENIED (code {code}) — no session"
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            kprintln!("CIBOS kernel: login(auth) launch failed: {e}");
+                            false
+                        }
+                    };
+
+                // Run the REAL shell (shell::dispatch composing the existing apps)
+                // as the user's session — but ONLY if login was granted. This is
+                // the gated boot->login->session flow: a denied login never
+                // reaches the shell. The session is driven here with injected
+                // commands (deterministic; sendkey is unreliable); a live boot
+                // reads the real keyboard. Opt-in via `app-shell`.
+                #[cfg(feature = "app-shell")]
+                if login_granted {
+                    const SHELL_RS_CAPP: &[u8] =
+                        include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
+                    if let Ok(image) = shared::AppImage::parse(SHELL_RS_CAPP) {
+                        kprintln!("CIBOS kernel: --- shell session (user: alice) ---");
+                        inject_text("store browse");
+                        inject_enter();
+                        inject_text("store install welcome");
+                        inject_enter();
+                        inject_text("store installed");
+                        inject_enter();
+                        inject_text("exit");
+                        inject_enter();
+                        match crate::loader::run_app_image_isolated(frames, &image, phys_to_ptr) {
+                            Ok(code) => {
+                                kprintln!("CIBOS kernel: shell session ended (code {code})")
+                            }
+                            Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+                        }
                     }
                 }
             }
@@ -871,6 +920,161 @@ fn demonstrate_storage() {
     }
 }
 
+/// IPC self-test: open a local channel and round-trip a message through the
+/// real syscall ABI (`OpenChannel` -> `ChannelSend` -> `ChannelRecv`), then
+/// prove bounded back-pressure (`WouldBlock` on a full buffer). Drives
+/// [`handle_syscall`] directly with ABI registers — the same entry the ring-3
+/// trap stub uses — so this exercises number decoding, argument marshalling, the
+/// user-buffer copy, and the kernel channel table end to end.
+/// Portable in-kernel channel demo, runnable on EVERY architecture.
+///
+/// Unlike [`demonstrate_channel`] (x86_64-only, which drives the ring-3 syscall
+/// ABI), this exercises the canonical cross-lane IPC model entirely inside the
+/// kernel: two cooperative lanes share a bounded [`Channel`] and are driven by
+/// the single selector's `run_until_idle` loop. It proves the Catch-and-Release
+/// model — bounded buffer, back-pressure parking, and resume-on-signal — works
+/// on aarch64/riscv64/i686 as well as x86_64, since it is pure `cibos-kernel`
+/// Rust with no arch-specific dependency.
+#[cfg(feature = "channel-demo")]
+fn demonstrate_kernel_channel(kernel: &mut Kernel) {
+    use alloc::sync::Arc;
+    use shared::protocols::ipc::{ChannelDirection, ChannelTerms};
+
+    kprintln!("CIBOS kernel: --- in-kernel channel IPC demo (portable) ---");
+
+    // Capacity 1, max 64 bytes: the second send must park until the receiver
+    // drains the first message (proves back-pressure across lanes).
+    let terms = match ChannelTerms::new("kdemo", ChannelDirection::Bidirectional, 64, 1) {
+        Ok(t) => t,
+        Err(_) => {
+            kprintln!("CIBOS kernel: channel terms rejected (demo skipped)");
+            return;
+        }
+    };
+    let channel = Arc::new(kernel.create_channel(&terms));
+
+    let tx = Arc::clone(&channel);
+    let _ = kernel.spawn_with_lane(WeightClass::System, move |lane| async move {
+        // First message goes into the single free slot.
+        match tx.send(lane, alloc::vec![b'p', b'i', b'n', b'g']).await {
+            Ok(()) => kprintln!("CIBOS kernel:   tx lane: sent 'ping'"),
+            Err(_) => kprintln!("CIBOS kernel:   tx lane: send 1 failed"),
+        }
+        // Second message parks here (buffer full) until the rx lane drains a
+        // slot, then resumes — Catch-and-Release back-pressure, no busy-wait.
+        match tx.send(lane, alloc::vec![b'p', b'o', b'n', b'g']).await {
+            Ok(()) => kprintln!("CIBOS kernel:   tx lane: sent 'pong' (after back-pressure)"),
+            Err(_) => kprintln!("CIBOS kernel:   tx lane: send 2 failed"),
+        }
+    });
+
+    let rx = Arc::clone(&channel);
+    let _ = kernel.spawn_with_lane(WeightClass::User, move |lane| async move {
+        for _ in 0..2 {
+            match rx.recv(lane).await {
+                Ok(msg) => {
+                    let n = msg.len();
+                    // Show the bytes if they are the printable demo payloads.
+                    if msg.as_slice() == b"ping" {
+                        kprintln!("CIBOS kernel:   rx lane: received 'ping' ({n} bytes)");
+                    } else if msg.as_slice() == b"pong" {
+                        kprintln!("CIBOS kernel:   rx lane: received 'pong' ({n} bytes)");
+                    } else {
+                        kprintln!("CIBOS kernel:   rx lane: received {n} bytes");
+                    }
+                }
+                Err(_) => kprintln!("CIBOS kernel:   rx lane: recv failed"),
+            }
+        }
+    });
+
+    kprintln!("CIBOS kernel: in-kernel channel demo lanes spawned");
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "channel-demo"))]
+fn demonstrate_channel() {
+    use shared::protocols::syscall::{Syscall, SyscallError};
+
+    kprintln!("CIBOS kernel: --- local channel IPC demo ---");
+
+    // Open a channel with capacity 1 message of up to 64 bytes.
+    let handle = handle_syscall(Syscall::OpenChannel.number(), 1, 64, 0);
+    if handle < 0 {
+        kprintln!("CIBOS kernel: channel demo — open failed ({})", handle);
+        return;
+    }
+    kprintln!("CIBOS kernel: channel opened (handle {})", handle);
+
+    // Send "ping" through the channel. The payload lives on the kernel stack;
+    // its address serves as the user pointer (copy_from_user reads kernel-mapped
+    // memory in this pre-ring-3 step).
+    let msg = b"ping";
+    let send = handle_syscall(
+        Syscall::ChannelSend.number(),
+        handle as u64,
+        msg.as_ptr() as u64,
+        msg.len() as u64,
+    );
+    kprintln!(
+        "CIBOS kernel: channel send -> {}",
+        if send == 0 { "OK" } else { "ERR" }
+    );
+
+    // A second send must hit back-pressure (capacity 1, buffer full) -> WouldBlock.
+    let send2 = handle_syscall(
+        Syscall::ChannelSend.number(),
+        handle as u64,
+        msg.as_ptr() as u64,
+        msg.len() as u64,
+    );
+    let blocked = SyscallError::from_return(send2) == Some(SyscallError::WouldBlock);
+    kprintln!(
+        "CIBOS kernel: channel send (full) -> {}",
+        if blocked {
+            "WouldBlock (back-pressure OK)"
+        } else {
+            "UNEXPECTED"
+        }
+    );
+
+    // Receive into a stack buffer and report what came back.
+    let mut buf = [0u8; 64];
+    let n = handle_syscall(
+        Syscall::ChannelRecv.number(),
+        handle as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    if n >= 0 {
+        let got = &buf[..n as usize];
+        kprintln!(
+            "CIBOS kernel: channel recv -> {} byte(s): {}",
+            n,
+            core::str::from_utf8(got).unwrap_or("<non-utf8>")
+        );
+    } else {
+        kprintln!("CIBOS kernel: channel recv failed ({})", n);
+    }
+
+    // After draining, a further recv must report WouldBlock (empty but open).
+    let n2 = handle_syscall(
+        Syscall::ChannelRecv.number(),
+        handle as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    );
+    let empty = SyscallError::from_return(n2) == Some(SyscallError::WouldBlock);
+    kprintln!(
+        "CIBOS kernel: channel recv (empty) -> {}",
+        if empty {
+            "WouldBlock (drained OK)"
+        } else {
+            "UNEXPECTED"
+        }
+    );
+    kprintln!("CIBOS kernel: local channel IPC demo exited");
+}
+
 /// Enable interrupts and poll the keyboard queue briefly to prove that a real
 /// hardware keystroke reaches the kernel through the IRQ1 → scancode-decode →
 /// key-queue path. Reports the first key seen (or that none arrived within the
@@ -966,6 +1170,34 @@ static ROOT_FS: cibos_kernel::sync::SpinLock<
 static KERNEL_RNG: cibos_kernel::sync::SpinLock<Option<cibos_kernel::entropy::Csprng>> =
     cibos_kernel::sync::SpinLock::new(None);
 
+/// A single local (intra-boundary) bounded channel: a FIFO of buffered messages
+/// with a fixed message capacity. This is the `Channel::new_local` contract from
+/// the canonical API reference — point-to-point, bounded, back-pressured. A full
+/// buffer surfaces as `WouldBlock` (Catch-and-Release back-pressure); an empty
+/// open buffer also surfaces as `WouldBlock` so a cooperative caller parks.
+#[cfg(target_arch = "x86_64")]
+struct LocalChannel {
+    capacity: usize,
+    max_message_bytes: usize,
+    queue: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+}
+
+/// The kernel's local channel table: opaque handle -> channel. Mirrors the
+/// `ROOT_FS` pattern (spinlock-guarded, single owner — no global lock held
+/// across a wait). Handles are allocated by a monotonic counter.
+///
+/// HONEST BOUNDARY: this backs ring-3 `OpenChannel`/`ChannelSend`/`ChannelRecv`
+/// for the local intra-boundary case. Cross-boundary channels (with the
+/// requester-proposes / receiver-accepts-or-rejects policy from the API
+/// reference) and `.await`-parking of a *live* ring-3 lane both depend on the
+/// live-session work (apps still run one-at-a-time via `run_app_image_isolated`),
+/// and are deferred — flagged, not faked. The `WouldBlock` return is the correct
+/// contract for when that cooperative parking lands.
+#[cfg(target_arch = "x86_64")]
+static CHANNEL_TABLE: cibos_kernel::sync::SpinLock<
+    Option<(u64, alloc::collections::BTreeMap<u64, LocalChannel>)>,
+> = cibos_kernel::sync::SpinLock::new(None);
+
 /// Seed the kernel CSPRNG from the firmware entropy seed. Called once at boot.
 #[cfg(target_arch = "x86_64")]
 fn seed_kernel_rng(seed: [u8; 32]) {
@@ -1018,6 +1250,27 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
         // A real monotonic clock is wired with the timer subsystem; for now the
         // syscall reports zero rather than a fabricated value.
         0
+    }
+
+    fn sleep_nanos(&self, nanos: u64) -> Result<(), shared::protocols::syscall::SyscallError> {
+        // Back the sleep with the PIT monotonic millisecond counter (10 ms
+        // resolution). Busy-wait until the deadline: the timer IRQ advances the
+        // tick counter, so `hlt` between checks lets the CPU idle until the next
+        // interrupt rather than spinning hot. A future cooperative version will
+        // yield the lane to the scheduler instead of waiting in-kernel.
+        let millis = nanos / 1_000_000;
+        if millis == 0 {
+            return Ok(());
+        }
+        let start = crate::timer::now_millis();
+        while crate::timer::now_millis().wrapping_sub(start) < millis {
+            // SAFETY: enable interrupts and halt until the next (timer) IRQ, so
+            // the monotonic counter keeps advancing while we wait.
+            unsafe {
+                core::arch::asm!("sti; hlt", options(nomem, nostack));
+            }
+        }
+        Ok(())
     }
 
     fn copy_to_user(
@@ -1186,6 +1439,87 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
         };
         rng.fill_bytes(out);
         Ok(())
+    }
+
+    fn open_channel(
+        &self,
+        _boundary: shared::BoundaryId,
+        capacity: usize,
+        max_message_bytes: usize,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        let mut guard = CHANNEL_TABLE.lock();
+        // Lazily initialise the table on first use (handle counter, map).
+        let table = guard.get_or_insert_with(|| (0, alloc::collections::BTreeMap::new()));
+        let handle = table.0;
+        table.0 += 1;
+        table.1.insert(
+            handle,
+            LocalChannel {
+                capacity,
+                max_message_bytes,
+                queue: alloc::collections::VecDeque::new(),
+            },
+        );
+        Ok(handle)
+    }
+
+    fn channel_send(
+        &self,
+        _boundary: shared::BoundaryId,
+        handle: u64,
+        data: &[u8],
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let Some(table) = guard.as_mut() else {
+            return Err(SyscallError::NotFound);
+        };
+        let chan = table.1.get_mut(&handle).ok_or(SyscallError::NotFound)?;
+        if data.len() > chan.max_message_bytes {
+            return Err(SyscallError::InvalidArgument);
+        }
+        // Full buffer => Catch-and-Release back-pressure, surfaced as WouldBlock.
+        if chan.queue.len() >= chan.capacity {
+            return Err(SyscallError::WouldBlock);
+        }
+        chan.queue.push_back(data.to_vec());
+        Ok(())
+    }
+
+    fn channel_recv(
+        &self,
+        _boundary: shared::BoundaryId,
+        handle: u64,
+    ) -> Result<alloc::vec::Vec<u8>, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let Some(table) = guard.as_mut() else {
+            return Err(SyscallError::NotFound);
+        };
+        let chan = table.1.get_mut(&handle).ok_or(SyscallError::NotFound)?;
+        // Empty but open => park (WouldBlock). A drained, closed channel would be
+        // NotFound; local channels here have no separate close yet (deferred with
+        // the live-session work), so an empty buffer always parks.
+        chan.queue.pop_front().ok_or(SyscallError::WouldBlock)
+    }
+
+    fn spawn(
+        &self,
+        _boundary: shared::BoundaryId,
+        _entry: u64,
+        _arg: u64,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        // HONEST BOUNDARY: spawning a *live* ring-3 lane requires the cooperative
+        // multi-context loader — a second user context entered via the existing
+        // ring-3 entry path and driven by the single-selector executor. Today a
+        // `.capp` runs synchronously one-at-a-time via `run_app_image_isolated`,
+        // so there is no live ring-3 lane surface to spawn onto yet. Rather than
+        // fabricate a lane id that runs nothing, this reports NotPermitted. The
+        // ABI number, dispatch arm, and ring-3 wrapper are in place so wiring the
+        // real spawn is a localised change once the live session lands.
+        let _ = (_entry, _arg);
+        Err(SyscallError::NotPermitted)
     }
 }
 

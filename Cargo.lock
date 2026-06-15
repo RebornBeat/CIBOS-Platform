@@ -274,6 +274,8 @@ dependencies = [
  "cibos-input",
  "cibos-kernel",
  "linked_list_allocator",
+ "notepad",
+ "platform-gui",
  "shared",
 ]
 

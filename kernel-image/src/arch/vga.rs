@@ -75,6 +75,39 @@ fn cell(byte: u8) -> u16 {
     (u16::from(DEFAULT_ATTR) << 8) | u16::from(byte)
 }
 
+/// Console width in cells (mode 3 is 80×25). Exposed so a higher layer (the GUI
+/// runner) can size a [`Surface`](super::super) to match the screen.
+#[allow(dead_code)] // used by the `gui` module under the `gui-demo` feature
+pub const fn width() -> usize {
+    WIDTH
+}
+
+/// Console height in cells.
+#[allow(dead_code)] // used by the `gui` module under the `gui-demo` feature
+pub const fn height() -> usize {
+    HEIGHT
+}
+
+/// Write a single character + attribute at `(col, row)`, bypassing the cursor.
+///
+/// This is the low-level primitive the GUI display driver uses to blit a
+/// `Surface` cell grid onto the screen: it does not move the text cursor or
+/// scroll, so a full-screen repaint writes every cell directly. `attr` is a VGA
+/// text attribute byte (foreground in the low nibble, background in the high
+/// nibble). Out-of-range coordinates are ignored.
+#[allow(dead_code)] // used by the `gui` module under the `gui-demo` feature
+pub fn put_cell(col: usize, row: usize, ch: u8, attr: u8) {
+    if col >= WIDTH || row >= HEIGHT {
+        return;
+    }
+    let word = (u16::from(attr) << 8) | u16::from(ch);
+    // SAFETY: bounds checked above; the buffer at 0xB8000 is identity-mapped and
+    // writable in text mode.
+    unsafe {
+        cell_ptr(col, row).write_volatile(word);
+    }
+}
+
 /// Write one byte to the VGA console, advancing the cursor and scrolling as
 /// needed. Handles `\n` (newline), `\r` (carriage return), and `\t` (tab to the
 /// next 8-column stop). Other control bytes are rendered as spaces to avoid

@@ -8,7 +8,7 @@
 //! later step.
 
 #[cfg(target_arch = "x86_64")]
-mod vga;
+pub(crate) mod vga;
 #[cfg(target_arch = "x86_64")]
 pub mod gdt;
 #[cfg(target_arch = "x86_64")]

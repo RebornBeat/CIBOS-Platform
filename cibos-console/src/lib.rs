@@ -58,14 +58,23 @@ pub trait ShellFs {
     fn write(&self, path: &str, data: &[u8]) -> bool;
     /// Read the whole file at `path`, or `None` if it does not exist.
     fn read(&self, path: &str) -> Option<Vec<u8>>;
-    /// List entries under `path` (a directory or prefix).
+    /// List the immediate child names under directory `path`.
+    ///
+    /// Contract: returns the IMMEDIATE CHILD NAMES of the directory — bare names,
+    /// not full paths, and not recursive. Both backends honor this: the kernel
+    /// `SyscallFs` returns CIBOSFS `list_dir` names directly; the host SDK derives
+    /// child names from its flat key space.
     fn list(&self, path: &str) -> Vec<String>;
     /// Delete the file at `path`; `true` if it was removed.
     fn delete(&self, path: &str) -> bool;
-    /// Whether `path` exists. The default checks via [`ShellFs::read`]; backends
-    /// with a cheaper existence probe may override it.
+    /// Whether `path` exists (as a file or a directory).
+    ///
+    /// The default treats `path` as existing if it can be read as a file OR if it
+    /// has any child entries (so directories are detected too). Backends with a
+    /// cheaper or more precise existence probe — the kernel `SyscallFs` and the
+    /// host SDK both do — override this.
     fn exists(&self, path: &str) -> bool {
-        self.read(path).is_some()
+        self.read(path).is_some() || !self.list(path).is_empty()
     }
     /// Ensure a directory at `path` exists. On a hierarchical filesystem this
     /// creates the directory (needed before writing files beneath it); on a flat

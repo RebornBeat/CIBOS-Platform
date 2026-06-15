@@ -18,6 +18,9 @@ shared = { workspace = true, default-features = false }
 cibos-async-runtime = { workspace = true }
 cibos-kernel = { workspace = true }
 cibos-input = { workspace = true }
+platform-gui = { workspace = true }
+# Optional: the notepad GuiApp, baked only for the `gui-demo` feature.
+notepad = { workspace = true, default-features = false, optional = true }
 linked_list_allocator = { version = "0.10", default-features = false }
 
 [build-dependencies]
@@ -53,6 +56,16 @@ storage-selftest = []
 app-hello = []
 app-login = []
 app-shell = ["app-login"]
+
+# Display-driver demo: run the notepad GuiApp on the VGA text console via the
+# kernel GUI runner (Surface -> VGA blit + PS/2 keyboard), proving the display
+# driver end to end. Opt-in (off by default); x86_64 BIOS only.
+gui-demo = ["dep:notepad"]
+
+# IPC demo: open a local channel and round-trip a message through the real
+# syscall ABI (OpenChannel -> ChannelSend -> ChannelRecv), proving the Track 2
+# channel path and bounded back-pressure on the booted kernel. Opt-in; x86_64.
+channel-demo = []
 
 # Operational profile bundles: forward to the kernel library's bundle so the
 # bootable image is built as exactly one profile (ADR-007). The build wrapper

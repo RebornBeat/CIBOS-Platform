@@ -10,8 +10,14 @@
 //! The display is four rows: a title bar, the text, a caret row marking the
 //! cursor column, and a hint line.
 
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use platform_gui::{Color, Flow, GuiApp, Surface};
 use cibos_input::{InputEvent, Key, PointerAction};

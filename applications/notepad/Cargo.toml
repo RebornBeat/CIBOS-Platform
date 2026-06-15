@@ -10,9 +10,17 @@ description = "Notepad — a keyboard-driven GUI text field for the CIBOS GUI pl
 name = "notepad"
 path = "src/lib.rs"
 
+# Host-only demo: renders the Surface to stdout. Gated behind `std` (a default
+# feature) so the no_std library still builds for bare targets, where this bin
+# is simply not built.
 [[bin]]
 name = "gui-demo"
 path = "src/gui_demo.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = []
 
 [dependencies]
 platform-gui = { workspace = true }
