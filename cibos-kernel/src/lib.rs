@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub mod address_space;
 pub mod block;
+pub mod net_device;
 pub mod channel;
 pub mod gate;
 pub mod fs;

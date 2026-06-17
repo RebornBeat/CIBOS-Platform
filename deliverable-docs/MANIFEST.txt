@@ -2,48 +2,48 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (41 crates) + design notes + fresh firmware ELFs.
 
-This archive adds TRACK 3A — the Lattice (Gate/Link/Warden) on the kernel,
-runtime-verified:
+This archive: Track 3 (Lattice on the kernel) + the virtio-net driver made
+PRODUCTION CODE (the key correction this session).
 
-  1. Kernel GateRegistry (cibos-kernel/src/gate.rs, host-tested, 7 tests):
-     bind/unbind/connect/accept/probe + a boundary-aware Warden (deny is TOTAL —
-     blocks bind AND connect). A Link is ONE canonical Channel (both halves share
-     its Arc inner) — REUSES the channel system, no parallel IPC. Resolved the
-     ChannelId visibility question (it lives in `shared`, pub).
+  1. Lattice on the kernel (Gate/Link/Warden over syscalls), loopback-backed:
+     - cibos-kernel/src/gate.rs: GateRegistry — bind/connect/accept/probe + a
+       boundary-aware Warden whose denial is TOTAL (blocks bind AND connect).
+       Links REUSE the canonical Channel (no parallel IPC). 7 host tests.
+     - shared: net syscalls 23-30 (GateBind/GateConnect/GateAccept/LinkSend/
+       LinkRecv/LinkClose/WardenSet/GateProbe) + dispatch + trait + KernelSyscall
+       Env impls. cibos-app/src/net.rs ring-3 wrappers. +3 dispatch tests.
+     - QEMU-verified: Warden-denied gate refuses bind+connect; probe Closed→Open;
+       connect→accept = two halves of one Channel; bidirectional bytes (GET / →
+       200 OK) across boundaries through the kernel.
 
-  2. Net syscalls 23-30 (GateBind/GateConnect/GateAccept/LinkSend/LinkRecv/
-     LinkClose/WardenSet/GateProbe): shared enum + from_number; cibos-kernel
-     SyscallEnv trait methods + dispatch arms (gate range-checked; caller boundary
-     from the trap); KernelSyscallEnv impls backed by the GateRegistry, Links
-     registered in the SAME handle table as channels. 3 dispatch tests.
+  2. NetDevice trait (cibos-kernel/src/net_device.rs) mirroring BlockDevice:
+     portable trait + coarse errors + in-memory LoopbackNic test impl. 6 tests.
 
-  3. Ring-3 SDK wrappers (cibos-app/src/net.rs): bind→Listener, connect→Link,
-     Listener::accept, Link::send/recv/close, warden_set, probe. Matches the SDK
-     Lattice vocabulary so the NIC layer can sit beneath the same surface.
+  3. virtio-net driver (kernel-image/src/arch/virtio_net.rs) — REAL driver for a
+     REAL interface (virtio-pci spec: PCI config 0xCF8/0xCFC, vendor 0x1AF4/dev
+     0x1000, the spec's init handshake, MAC+status read). NOT QEMU-specific.
 
-  4. Lattice QEMU demo (kernel-image/ring3.rs demonstrate_lattice), runtime-
-     verified with S=0x300 (binds gate 80) / C=0x400 (connects):
-       - Warden-denied gate 81: bind REFUSED + connect REFUSED (total denial)
-       - probe Closed -> (bind) -> Open
-       - connect -> accept (two halves of ONE Channel)
-       - C 'GET /' -> S received it; S '200 OK' -> C received it (bidirectional)
-     Runs alongside the cross-boundary channel handshake demo in one boot.
-
-Prior verified milestones in this archive: per-lane ring-3 context save/resume;
-selector-owned multi-lane dispatch; spawn + arg; channel unification;
-cross-boundary channel handshake (syscalls 18-22); F1 live login->shell session.
+  4. PRODUCTION-CORRECTNESS FIX (the important one): the virtio-net driver was
+     wrongly gated behind a `virtio-net-demo` feature (built for the demo, not
+     production). Now it is `pub mod virtio_net` — ALWAYS compiled on x86_64 and
+     probed at boot by `probe_nic_at_boot()`, exactly like the ATA storage probe.
+     `virtio-net-demo` now only adds a verbose log line. VERIFIED with the
+     PRODUCTION image (no demo feature): NIC present → real MAC 52:54:00:ab:cd:ef
+     read (matches the QEMU-assigned MAC — unfakeable); NIC absent → honest
+     "loopback only" fallback. Principle locked: drivers are production code
+     probed at boot; QEMU/cloud/bare-metal merely VERIFY them.
 
 Status at archive time:
-  * 347 workspace tests passing, 0 failing.
-  * Clippy clean; default + interactive-session + ring3-multilane-demo + aarch64 +
-    riscv64 + cibos-app all build clean; i686 via build-std.
-  * compute profile boots in QEMU and runs: the cross-boundary handshake demo,
-    the Lattice (Gate/Link/Warden) demo, spawn+arg, and the .capp app flow.
+  * 353 workspace tests passing, 0 failing.
+  * Clippy clean; default(production) + virtio-net-demo + interactive-session +
+    ring3-multilane-demo + aarch64 + riscv64 build clean; i686 via build-std.
+  * compute profile boots in QEMU and runs the Lattice demo, the cross-boundary
+    channel handshake, spawn+arg, the gated login→shell session, AND the
+    production NIC probe (real MAC), then boot complete.
 
 Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
-Key docs: FINALIZATION-INVENTORY.md (full cross-platform capability map + the
-languages/JS analysis + per-platform app list), TRACK3-LATTICE-PLAN.md (3A done;
-3B = NetDevice + virtio-net next), F1-INTERACTIVE-SESSION-PLAN.md.
 
-Next: Track 3B — NetDevice trait + virtio-net driver (real interface, QEMU-
-verifiable) + smoltcp TCP/IP beneath the Lattice (same surface, apps unchanged).
+Next (Track 3B): e1000 driver (bare-metal boxes without virtio); virtio-net
+TX/RX over the virtqueues; wire the NIC under the Lattice's NIC-backed transport
+(same Gate/Link/Warden surface, apps unchanged). Then Surface v2, CLI app ports,
+on-kernel GUI, per-arch ring-3, mobile, new apps, scripting/Boa, Track 4.

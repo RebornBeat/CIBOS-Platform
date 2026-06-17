@@ -15,6 +15,12 @@ pub mod gdt;
 pub mod idt;
 #[cfg(target_arch = "x86_64")]
 pub mod ata;
+// Production NIC driver: always compiled on x86_64 and probed at boot, exactly
+// like `ata`. virtio-net is a real, standardized interface (cloud VMs, bare-metal
+// SR-IOV); QEMU is only the test harness. The `virtio-net-demo` feature controls
+// verbose probe LOGGING, never whether this driver exists.
+#[cfg(target_arch = "x86_64")]
+pub mod virtio_net;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
