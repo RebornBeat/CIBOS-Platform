@@ -200,12 +200,8 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // back the boot medium to prove block I/O works against actual
             // hardware (the disk we booted from).
             #[cfg(target_arch = "x86_64")]
-            demonstrate_storage();
+            verify_storage();
 
-            // virtio-net device discovery demo: probe the PCI bus for a
-            // virtio-net NIC, negotiate, and print its MAC + link status. Proves
-            // the real device-discovery + negotiation path against the (emulated)
-            // virtio-net hardware QEMU provides.
             // Probe for a NIC at boot (production path, like the ATA storage
             // probe above). Always runs; honestly reports what hardware is present.
             #[cfg(target_arch = "x86_64")]
@@ -213,18 +209,16 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
 
             // Display-driver demo: run the notepad GuiApp on the VGA text
             // console via the kernel GUI runner. Proves the Surface -> VGA blit
-            // and keyboard-driven render loop on real (emulated) hardware.
+            // and keyboard-driven render loop on real hardware.
             #[cfg(all(target_arch = "x86_64", feature = "gui-demo"))]
             {
-                kprintln!("CIBOS kernel: --- notepad GUI demo (VGA) ---");
-                // Drive it programmatically (sendkey is unreliable): type a few
-                // characters, then Enter to exit. The text is blitted to VGA each
-                // render; the serial log proves the loop ran and exited.
-                inject_text("hello cibos");
-                inject_enter();
+                kprintln!("CIBOS kernel: --- notepad GUI (VGA) ---");
+                // The GUI runner reads the LIVE keyboard (IRQ1): type into the
+                // notepad; the text is blitted to VGA each render. A physical
+                // keypress drives this on real hardware.
                 let mut app = notepad::Notepad::new();
                 crate::gui::run_gui_app(&mut app);
-                kprintln!("CIBOS kernel: notepad GUI demo exited");
+                kprintln!("CIBOS kernel: notepad GUI exited");
             }
 
             // IPC demo: open a local channel and round-trip a message through
@@ -415,12 +409,12 @@ fn bring_up_mmu(handoff: &HandoffData) {
         // distinct boundaries get their own page tables; a page mapped in one is
         // physically absent in the other. Uses a borrowed frame allocator so the
         // allocator remains available for the ring-3 payload below.
-        demonstrate_container_isolation(&frames, &phys_to_ptr);
+        verify_container_isolation(&frames, &phys_to_ptr);
 
         // Drop to ring 3 and run unprivileged user payloads, each in its own
         // per-process address space, reaching the kernel only via int 0x80
         // syscalls — the full user/kernel boundary.
-        run_ring3_demo(&frames, &phys_to_ptr);
+        start_ring3_runtime(&frames, &phys_to_ptr);
 
         // `space` and `frames` back the live page tables (CR3) for the rest of
         // this boot. Neither type implements `Drop` and the page-table frames
@@ -432,7 +426,7 @@ fn bring_up_mmu(handoff: &HandoffData) {
 /// Show two boundaries with independent address spaces on the live MMU, using a
 /// borrowed frame allocator. Diagnostic demonstration of per-container isolation.
 #[cfg(target_arch = "x86_64")]
-fn demonstrate_container_isolation(
+fn verify_container_isolation(
     frames: &cibos_kernel::FrameAllocator,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) {
@@ -500,7 +494,13 @@ fn demonstrate_container_isolation(
 /// Install the GDT/TSS and the IDT, then drop to ring 3 to run the user payload.
 /// The payload logs a message and calls `exit`, both via `int 0x80`.
 #[cfg(target_arch = "x86_64")]
-fn run_ring3_demo(
+/// Bring up the ring-3 user runtime: install the GDT/TSS and IDT, remap the PIC,
+/// start the PIT, enable hardware IRQs, then load and run the system's `.capp`
+/// applications (the interactive login→shell surface, server services, etc.).
+/// This is the production path from kernel bring-up into user space. Opt-in
+/// `#[cfg]` blocks add verification routines (resume/multilane/etc.) without
+/// changing the production flow.
+fn start_ring3_runtime(
     frames: &cibos_kernel::FrameAllocator,
     phys_to_ptr: &impl Fn(u64) -> *mut u8,
 ) {
@@ -526,11 +526,27 @@ fn run_ring3_demo(
             crate::timer::TICK_HZ
         );
 
-        // Prove real hardware input reaches the kernel: enable interrupts and
-        // wait briefly for a keystroke (the IRQ1 handler decodes the scancode
-        // and enqueues a KeyEvent). In QEMU a key can be injected via the
-        // monitor `sendkey`; on real hardware, a physical keypress.
-        demonstrate_keyboard_input();
+        // Enable interrupts and confirm the keyboard line is live: the IRQ1
+        // handler decodes scancodes into KeyEvents that the input syscalls
+        // consume. A physical keypress drives this on real hardware.
+        arm_keyboard_input();
+
+        // Install the channel + Lattice (Gate/Link/Warden) handle table for the
+        // production runtime, backed by a scheduler that drives back-pressure
+        // wakeups. This makes the IPC syscalls (OpenChannel/Channel*, the
+        // cross-boundary handshake) and the net syscalls (GateBind/GateConnect/
+        // Link*/Warden*/GateProbe) available to every `.capp` in a NORMAL boot —
+        // not only inside a demo. The demos install their own table when they run
+        // their own selector; this is the always-on production install.
+        #[cfg(not(feature = "ring3-multilane-demo"))]
+        {
+            let sched = alloc::sync::Arc::new(cibos_kernel::Scheduler::new(
+                1,
+                multilane_seed(),
+                cibos_kernel::compiled_profile().unwrap_or(shared::CibosProfile::Balanced),
+            ));
+            install_channel_table(sched);
+        }
 
         // Ring-3 park/resume demonstration (proves the per-lane context
         // mechanism: trap saves full user state -> park -> resume from the trap
@@ -760,7 +776,7 @@ fn run_interactive_session(
         }
     }
 }
-#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest", feature = "app-login"))]
 fn inject_text(s: &str) {
     for c in s.chars() {
         crate::keyboard::inject_key(cibos_input::KeyEvent::ch(c));
@@ -768,7 +784,7 @@ fn inject_text(s: &str) {
 }
 
 /// Inject an Enter key (selftest only).
-#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+#[cfg(all(target_arch = "x86_64", feature = "storage-selftest", feature = "app-login"))]
 fn inject_enter() {
     crate::keyboard::inject_key(cibos_input::KeyEvent::new(cibos_input::Key::Enter));
 }
@@ -927,7 +943,7 @@ fn probe_nic_at_boot() -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn demonstrate_storage() {
+fn verify_storage() {
     use cibos_kernel::block::{BlockDevice, BLOCK_SIZE};
 
     // SAFETY: single-threaded bring-up; probes the fixed primary-bus ATA ports.
@@ -1222,7 +1238,7 @@ fn demonstrate_channel() {
 /// The IDT and remapped PIC must already be initialised with the keyboard line
 /// unmasked and a handler at vector 0x21.
 #[cfg(target_arch = "x86_64")]
-unsafe fn demonstrate_keyboard_input() {
+unsafe fn arm_keyboard_input() {
     use core::arch::asm;
 
     // Enable interrupts (set IF). From here the timer (IRQ0) and keyboard (IRQ1)
@@ -1337,7 +1353,6 @@ struct ChannelHandleTable {
 
 #[cfg(target_arch = "x86_64")]
 impl ChannelHandleTable {
-    #[cfg(feature = "ring3-multilane-demo")]
     fn new(kernel: alloc::sync::Arc<dyn shared::KernelInterface>) -> Self {
         Self {
             next_handle: 0,
@@ -1383,7 +1398,7 @@ pub fn kernel_syscall_env() -> KernelSyscallEnv {
 
 /// Install the channel handle table, backed by `kernel` (the selector's
 /// scheduler) for back-pressure wakeups. Idempotent for a run.
-#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+#[cfg(target_arch = "x86_64")]
 pub fn install_channel_table(kernel: alloc::sync::Arc<dyn shared::KernelInterface>) {
     *CHANNEL_TABLE.lock() = Some(ChannelHandleTable::new(kernel));
 }
@@ -1404,7 +1419,7 @@ fn seed_kernel_rng(seed: [u8; 32]) {
 /// (the Scheduler seeds its weighted-entropy CSPRNG from this). Falls back to a
 /// fixed seed if the RNG is unavailable — the demo's correctness does not depend
 /// on the seed value, only on the selector's Ready/Stalled mechanics.
-#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+#[cfg(target_arch = "x86_64")]
 pub fn multilane_seed() -> [u8; 32] {
     let mut seed = [0x5Au8; 32];
     if let Some(rng) = KERNEL_RNG.lock().as_mut() {

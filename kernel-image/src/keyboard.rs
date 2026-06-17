@@ -67,10 +67,11 @@ pub fn has_key() -> bool {
 
 /// Inject a key event directly into the input queue, as if it had arrived from
 /// the keyboard IRQ. This drives the real `ReadKey` syscall path from a
-/// deterministic source (QEMU's `sendkey` injection is unreliable against a
-/// headless guest), so the interactive applications can be verified end to end.
-/// Only built for the storage-selftest configuration.
-#[cfg(feature = "storage-selftest")]
+/// deterministic source so the interactive applications can be verified end to
+/// end without a human at the keyboard. This is SELFTEST scaffolding only — the
+/// production interactive surface (`interactive-session`) reads the live IRQ1
+/// keyboard. Built only for the selftest configuration.
+#[cfg(all(feature = "storage-selftest", feature = "app-login"))]
 pub fn inject_key(ev: KeyEvent) {
     KEYBOARD.lock().queue.push(ev);
 }

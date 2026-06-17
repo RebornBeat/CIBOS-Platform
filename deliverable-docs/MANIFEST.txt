@@ -2,48 +2,47 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (41 crates) + design notes + fresh firmware ELFs.
 
-This archive: Track 3 (Lattice on the kernel) + the virtio-net driver made
-PRODUCTION CODE (the key correction this session).
+This archive: the PRODUCTION CLEANUP (remove QEMU-orientation, bare-metal-first)
++ the reflection/action-plan checked against the 18-doc vision.
 
-  1. Lattice on the kernel (Gate/Link/Warden over syscalls), loopback-backed:
-     - cibos-kernel/src/gate.rs: GateRegistry — bind/connect/accept/probe + a
-       boundary-aware Warden whose denial is TOTAL (blocks bind AND connect).
-       Links REUSE the canonical Channel (no parallel IPC). 7 host tests.
-     - shared: net syscalls 23-30 (GateBind/GateConnect/GateAccept/LinkSend/
-       LinkRecv/LinkClose/WardenSet/GateProbe) + dispatch + trait + KernelSyscall
-       Env impls. cibos-app/src/net.rs ring-3 wrappers. +3 dispatch tests.
-     - QEMU-verified: Warden-denied gate refuses bind+connect; probe Closed→Open;
-       connect→accept = two halves of one Channel; bidirectional bytes (GET / →
-       200 OK) across boundaries through the kernel.
+  1. Production cleanup (PRODUCTION-CLEANUP-AUDIT.md — classified every demo-gate
+     and QEMU reference, then fixed):
+     - RENAME mis-named production code: `run_ring3_demo` → `start_ring3_runtime`
+       (the real ring-3 bring-up), `demonstrate_keyboard_input` →
+       `arm_keyboard_input`, `demonstrate_storage` → `verify_storage`,
+       `demonstrate_container_isolation` → `verify_container_isolation`.
+     - PROMOTE the channel + Lattice (Gate/Link/Warden) handle table install into
+       the PRODUCTION boot (`start_ring3_runtime`), backed by a production
+       Scheduler. Un-gated `install_channel_table`/`multilane_seed`/
+       `ChannelHandleTable::new` from `ring3-multilane-demo`. The IPC + net
+       syscalls now work in a NORMAL boot, not only inside a demo.
+     - FIX `gui-demo` to drive the notepad from the LIVE keyboard (production),
+       not the injected-input test double; confined inject_text/enter/key to
+       `all(storage-selftest, app-login)` with de-QEMU'd docs.
+     - virtio-net driver (prior step) is production: always compiled + boot-probed.
+     - Confirmed already-correct: DEFAULT build is bare-metal-first (reads the REAL
+       CIBIOS handoff; only `self-boot` synthesizes for `-kernel`).
 
-  2. NetDevice trait (cibos-kernel/src/net_device.rs) mirroring BlockDevice:
-     portable trait + coarse errors + in-memory LoopbackNic test impl. 6 tests.
-
-  3. virtio-net driver (kernel-image/src/arch/virtio_net.rs) — REAL driver for a
-     REAL interface (virtio-pci spec: PCI config 0xCF8/0xCFC, vendor 0x1AF4/dev
-     0x1000, the spec's init handshake, MAC+status read). NOT QEMU-specific.
-
-  4. PRODUCTION-CORRECTNESS FIX (the important one): the virtio-net driver was
-     wrongly gated behind a `virtio-net-demo` feature (built for the demo, not
-     production). Now it is `pub mod virtio_net` — ALWAYS compiled on x86_64 and
-     probed at boot by `probe_nic_at_boot()`, exactly like the ATA storage probe.
-     `virtio-net-demo` now only adds a verbose log line. VERIFIED with the
-     PRODUCTION image (no demo feature): NIC present → real MAC 52:54:00:ab:cd:ef
-     read (matches the QEMU-assigned MAC — unfakeable); NIC absent → honest
-     "loopback only" fallback. Principle locked: drivers are production code
-     probed at boot; QEMU/cloud/bare-metal merely VERIFY them.
+  2. REFLECTION-AND-ACTION-PLAN.md — confirms the cleanup SERVED the 18-doc vision
+     ("real, no fakes, honest hardware boundary, production default") rather than
+     drifting, with an action-by-action alignment table; and lays out the
+     remaining work (GUI driver promote; Track 3B virtio TX/RX + e1000 + NIC under
+     the Lattice + smoltcp; Surface v2; on-kernel app ports; per-arch ring-3;
+     new apps; orchestrator; Boa scripting; behavioral flags) — each checked
+     against a canonical goal with a faithful approach. NO drift on the list;
+     Electron/JS-as-platform explicitly ruled out in favor of the native path.
 
 Status at archive time:
   * 353 workspace tests passing, 0 failing.
-  * Clippy clean; default(production) + virtio-net-demo + interactive-session +
-    ring3-multilane-demo + aarch64 + riscv64 build clean; i686 via build-std.
-  * compute profile boots in QEMU and runs the Lattice demo, the cross-boundary
-    channel handshake, spawn+arg, the gated login→shell session, AND the
-    production NIC probe (real MAC), then boot complete.
+  * Clippy clean (production). default + storage-selftest(+apps) + interactive-
+    session + ring3-multilane-demo + ring3-resume-demo + gui-demo + channel-demo
+    + aarch64 + riscv64 all build clean; i686 via build-std.
+  * PRODUCTION image (no demo features) boots in QEMU: runs a `.capp` in ring 3,
+    installs the channel/Lattice table, probes the NIC (real MAC), boot complete.
 
 Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
 
-Next (Track 3B): e1000 driver (bare-metal boxes without virtio); virtio-net
-TX/RX over the virtqueues; wire the NIC under the Lattice's NIC-backed transport
-(same Gate/Link/Warden surface, apps unchanged). Then Surface v2, CLI app ports,
-on-kernel GUI, per-arch ring-3, mobile, new apps, scripting/Boa, Track 4.
+Next (per REFLECTION-AND-ACTION-PLAN §2): finish the cleanup tail (promote the
+GUI display driver to production), then Track 3B (virtio-net TX/RX → e1000 → NIC
+under the Lattice transport / smoltcp), then Surface v2, app ports, per-arch
+ring-3, new apps, orchestrator, Boa scripting, behavioral flags.

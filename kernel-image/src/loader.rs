@@ -588,7 +588,7 @@ pub unsafe fn install_space(space: &AddressSpace) {
 //
 // `KernelSyscallEnv::spawn` must map a fresh stack for the new lane into the
 // CALLER'S currently-installed address space (same boundary -> same space). The
-// frame allocator is a local in `run_ring3_demo`; we expose it to the syscall
+// frame allocator is a local in `start_ring3_runtime`; we expose it to the syscall
 // path for the demo's duration via a raw pointer (set before the run, cleared
 // after), mirroring how RING3_TABLE is installed. phys_to_ptr on the booted
 // kernel is the identity map, so it is reconstructed here rather than stored.
@@ -600,7 +600,7 @@ static SPAWN_FRAMES: core::sync::atomic::AtomicPtr<FrameAllocator> =
 /// Publish the frame allocator for the spawn syscall (demo-run lifetime).
 ///
 /// # Safety
-/// `frames` must outlive the run (it is a local in `run_ring3_demo`, which spans
+/// `frames` must outlive the run (it is a local in `start_ring3_runtime`, which spans
 /// the whole demo). Must be cleared with `clear_spawn_frames` before it drops.
 #[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
 pub unsafe fn set_spawn_frames(frames: &FrameAllocator) {
