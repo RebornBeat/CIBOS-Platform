@@ -115,3 +115,59 @@ REMAINING (next):
 9. Confirm the production interactive image runs login→shell on the LIVE keyboard
    as the default posture (interactive-session), with the injected path used only
    for CI-style selftest.
+
+---
+
+## GUI DISPLAY DRIVER PROMOTION (item 5) — analysis
+
+TRUE STATE (reviewed, not assumed):
+- `kernel-image/src/gui.rs` (Surface→VGA blit + live-keyboard GuiApp runner) is
+  NOT gated — `mod gui;` is unconditional (only `#![cfg(target_arch=x86_64)]`).
+  So the display DRIVER is ALREADY production-compiled.
+- `kernel-image/src/arch/vga.rs` (writes the standard 0xB8000 text buffer — works
+  on any x86 BIOS machine, real or emulated) is `pub(crate) mod vga` — production.
+- The ONLY thing gated on `gui-demo` is the boot-time INVOCATION (hardcodes the
+  notepad app). So the driver isn't demo-trapped; only its reachability is.
+
+CANON CHECK (PLATFORMS.md): the GUI is a `platform-gui` cell-grid `Surface` driven
+by a runner; "a hardware display driver renders the same Surface" the host runner
+renders virtually. The Surface→VGA blit IS that driver. cell-grid (not a web
+stack) — aligned. No drift.
+
+FAITHFUL PROMOTION (mirror the virtio-net fix; minimal, no over-engineering):
+- Keep the driver/runner as production (already true); make the boot REACHABILITY
+  production via a clear surface-selection, with `gui-demo` reduced to "launch the
+  notepad GuiApp on the production GUI runner" (an app choice), not the home of
+  the driver. Rename the boot block from "demo" to a production GUI surface
+  launch; the live keyboard already drives it (fixed last session).
+- One real improvement owed to production-correctness: the runner's input wait
+  uses `core::hint::spin_loop()` (busy-spin). Production should `hlt`-wait like the
+  blocking ReadKey path (HIP: time-as-trigger, idle the CPU). Switch the GUI input
+  wait to the same `hlt`-based wait used by the keyboard syscall. (No semantic
+  change; just stop busy-spinning.)
+
+NON-GOALS (anti-drift): no pixel Surface here (that's the separate Surface-v2
+item); no web/Electron renderer (would be drift). Character-cell VGA is the
+correct production display tier today.
+
+### GUI PROMOTION — DONE + verified
+- Confirmed `gui` + `vga` are already production-compiled (driver was never demo-
+  trapped; only its boot reachability was). Reframed the boot block from "demo" to
+  a production GUI surface launch (notepad as the selected app; `gui-demo` is now
+  an app-selection over the production runner, mirroring virtio-net).
+- Fixed the runner's input wait: `core::hint::spin_loop()` busy-spin → the
+  production `timer::wait_for(has_key)` `hlt`-wait (HIP time-as-trigger; idles the
+  CPU). VERIFIED in QEMU: GUI surface starts and correctly `hlt`-blocks for live
+  input (no busy-spin, no hang, no fault).
+- Confirmed `run_interactive_session` (live login→gated shell on the real
+  keyboard) is the production interactive posture; the injected path is
+  storage-selftest-only.
+- 353 tests green; production + gui-demo + interactive + multilane + selftest +
+  aarch64 + riscv64 all build clean.
+
+## CLEANUP COMPLETE
+All audit items resolved. The shipping kernel is production-named, real drivers
+are always-compiled and probed/reachable in production, no injected-input fakes in
+production paths, and QEMU is purely a verification harness. The default build is
+bare-metal-first (reads the real CIBIOS handoff). Next: Track 3B (virtio-net
+TX/RX → e1000 → NIC under the Lattice via smoltcp).

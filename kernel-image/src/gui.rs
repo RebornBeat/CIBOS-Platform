@@ -81,13 +81,16 @@ pub fn run_gui_app(app: &mut dyn GuiApp) {
     blit(&surface);
 
     loop {
-        // Block until a key is available (the keyboard fills its queue from the
-        // IRQ1 handler). Yield to the CPU between polls.
+        // Block until a key is available, idling the CPU with `hlt` between PIT
+        // ticks (no busy-spin) — the same time-as-trigger wait the blocking
+        // ReadKey syscall uses. The IRQ1 handler fills the queue.
         let ev = loop {
+            // SAFETY: interrupts are enabled and the keyboard IRQ is live while a
+            // GUI app runs, so a keystroke will wake the `hlt`.
+            unsafe { crate::timer::wait_for(crate::keyboard::has_key) };
             if let Some(k) = crate::keyboard::poll_key() {
                 break k;
             }
-            core::hint::spin_loop();
         };
 
         match app.handle(InputEvent::Key(ev)) {

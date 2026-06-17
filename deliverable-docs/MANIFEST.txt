@@ -2,47 +2,36 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (41 crates) + design notes + fresh firmware ELFs.
 
-This archive: the PRODUCTION CLEANUP (remove QEMU-orientation, bare-metal-first)
-+ the reflection/action-plan checked against the 18-doc vision.
+This archive: GUI display-driver promotion (cleanup tail complete) + Track 3B
+foundation (contiguous DMA frames for the virtqueues).
 
-  1. Production cleanup (PRODUCTION-CLEANUP-AUDIT.md — classified every demo-gate
-     and QEMU reference, then fixed):
-     - RENAME mis-named production code: `run_ring3_demo` → `start_ring3_runtime`
-       (the real ring-3 bring-up), `demonstrate_keyboard_input` →
-       `arm_keyboard_input`, `demonstrate_storage` → `verify_storage`,
-       `demonstrate_container_isolation` → `verify_container_isolation`.
-     - PROMOTE the channel + Lattice (Gate/Link/Warden) handle table install into
-       the PRODUCTION boot (`start_ring3_runtime`), backed by a production
-       Scheduler. Un-gated `install_channel_table`/`multilane_seed`/
-       `ChannelHandleTable::new` from `ring3-multilane-demo`. The IPC + net
-       syscalls now work in a NORMAL boot, not only inside a demo.
-     - FIX `gui-demo` to drive the notepad from the LIVE keyboard (production),
-       not the injected-input test double; confined inject_text/enter/key to
-       `all(storage-selftest, app-login)` with de-QEMU'd docs.
-     - virtio-net driver (prior step) is production: always compiled + boot-probed.
-     - Confirmed already-correct: DEFAULT build is bare-metal-first (reads the REAL
-       CIBIOS handoff; only `self-boot` synthesizes for `-kernel`).
+  1. GUI display driver promoted to production:
+     - kernel-image/src/gui.rs (Surface→VGA) + arch/vga.rs confirmed always-
+       compiled production; boot block reframed from "demo" to a production GUI
+       surface launch (notepad as the app choice on the production runner).
+     - Runner input wait: busy-spin → production hlt-wait (timer::wait_for).
+       Verified in QEMU: GUI surface starts and hlt-blocks for live input.
+     - Confirmed run_interactive_session (live login→gated shell) is the
+       production interactive posture; injected path is selftest-only.
+     => PRODUCTION CLEANUP COMPLETE (see PRODUCTION-CLEANUP-AUDIT.md).
 
-  2. REFLECTION-AND-ACTION-PLAN.md — confirms the cleanup SERVED the 18-doc vision
-     ("real, no fakes, honest hardware boundary, production default") rather than
-     drifting, with an action-by-action alignment table; and lays out the
-     remaining work (GUI driver promote; Track 3B virtio TX/RX + e1000 + NIC under
-     the Lattice + smoltcp; Surface v2; on-kernel app ports; per-arch ring-3;
-     new apps; orchestrator; Boa scripting; behavioral flags) — each checked
-     against a canonical goal with a faithful approach. NO drift on the list;
-     Electron/JS-as-platform explicitly ruled out in favor of the native path.
+  2. Track 3B foundation (TRACK3B-VIRTIO-TXRX-PLAN.md):
+     - FrameAllocator::allocate_contiguous(n) — allocates n physically-contiguous
+       frames, the DMA-memory primitive virtio virtqueues require (identity map:
+       phys==virt). +2 host tests. This unblocks the virtqueue TX/RX work (B3a-d),
+       which is fully designed in the plan (legacy split virtqueue layout, the
+       virtio-pci I/O registers, the 10-byte virtio_net_hdr, RX fill/poll + TX).
 
 Status at archive time:
-  * 353 workspace tests passing, 0 failing.
-  * Clippy clean (production). default + storage-selftest(+apps) + interactive-
-    session + ring3-multilane-demo + ring3-resume-demo + gui-demo + channel-demo
-    + aarch64 + riscv64 all build clean; i686 via build-std.
-  * PRODUCTION image (no demo features) boots in QEMU: runs a `.capp` in ring 3,
-    installs the channel/Lattice table, probes the NIC (real MAC), boot complete.
+  * 355 workspace tests passing, 0 failing.
+  * Clippy clean; production(default) + gui-demo + interactive-session +
+    multilane + storage-selftest + channel-demo + ring3-resume-demo + aarch64 +
+    riscv64 all build clean; i686 via build-std.
+  * Production image boots in QEMU (real handoff path): .capp in ring 3, channel/
+    Lattice table installed, NIC probed (real MAC), GUI surface hlt-blocks.
 
 Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
 
-Next (per REFLECTION-AND-ACTION-PLAN §2): finish the cleanup tail (promote the
-GUI display driver to production), then Track 3B (virtio-net TX/RX → e1000 → NIC
-under the Lattice transport / smoltcp), then Surface v2, app ports, per-arch
-ring-3, new apps, orchestrator, Boa scripting, behavioral flags.
+Next: Track 3B B3a — allocate + set up the RX (queue 0) and TX (queue 1)
+virtqueues via allocate_contiguous + QUEUE_SELECT/QUEUE_PFN, then RX/TX paths,
+then QEMU -filter-dump verification; then B4 (NIC under the Lattice via smoltcp).

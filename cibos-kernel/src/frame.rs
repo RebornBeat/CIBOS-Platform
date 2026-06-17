@@ -146,6 +146,58 @@ impl FrameAllocator {
     /// # Errors
     ///
     /// [`KernelError::LimitExceeded`] if no free frame remains.
+    /// Allocate `n` physically-CONTIGUOUS free frames, returning the first frame
+    /// (the run is `[first, first+n)` in frame-index space, i.e. `n * FRAME_SIZE`
+    /// contiguous bytes). Required for device DMA regions that must be one
+    /// physically-contiguous area whose base physical address is handed to the
+    /// device (e.g. virtio virtqueues). `n == 0` is treated as `1`.
+    ///
+    /// # Errors
+    /// [`KernelError::LimitExceeded`] if no run of `n` consecutive free frames
+    /// exists.
+    pub fn allocate_contiguous(&self, n: u64) -> KernelResult<PhysFrame> {
+        let n = n.max(1);
+        let mut s = self.state.lock();
+        let count = s.frame_count;
+        if n > count {
+            return Err(KernelError::LimitExceeded {
+                resource: "physical frames",
+            });
+        }
+        // Scan for the first run of `n` consecutive clear bits.
+        let mut run_start = 0u64;
+        let mut run_len = 0u64;
+        for f in 0..count {
+            let word = (f / 64) as usize;
+            let bit = 1u64 << (f % 64);
+            if s.bitmap[word] & bit == 0 {
+                if run_len == 0 {
+                    run_start = f;
+                }
+                run_len += 1;
+                if run_len == n {
+                    // Mark the whole run allocated.
+                    for g in run_start..run_start + n {
+                        let w = (g / 64) as usize;
+                        let b = 1u64 << (g % 64);
+                        s.bitmap[w] |= b;
+                    }
+                    s.allocated += n;
+                    return Ok(PhysFrame::from_index(run_start));
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        Err(KernelError::LimitExceeded {
+            resource: "contiguous physical frames",
+        })
+    }
+
+    /// Allocate one free frame, searching from the rotating hint and wrapping.
+    ///
+    /// # Errors
+    /// [`KernelError::LimitExceeded`] if no free frame remains.
     pub fn allocate(&self) -> KernelResult<PhysFrame> {
         let mut s = self.state.lock();
         let count = s.frame_count;
@@ -338,5 +390,29 @@ mod tests {
         // The hint moves back, so the next allocation reuses the freed frame.
         let b = fa.allocate().unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn allocate_contiguous_gives_consecutive_frames() {
+        let fa = FrameAllocator::from_regions(&regions(), 0x10_0000);
+        let first = fa.allocate_contiguous(4).unwrap();
+        // The run is [first, first+4) in frame-index space — physically contiguous.
+        let base = first.index();
+        for i in 1..4 {
+            assert!(fa.is_allocated(PhysFrame::from_index(base + i)));
+        }
+        // A subsequent single allocation must not overlap the run.
+        let next = fa.allocate().unwrap();
+        assert!(next.index() < base || next.index() >= base + 4);
+    }
+
+    #[test]
+    fn allocate_contiguous_too_large_fails() {
+        let fa = FrameAllocator::from_regions(&regions(), 0x10_0000);
+        let total = fa.usable_frames();
+        assert!(matches!(
+            fa.allocate_contiguous(total + 1),
+            Err(KernelError::LimitExceeded { .. })
+        ));
     }
 }

@@ -207,18 +207,19 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             #[cfg(target_arch = "x86_64")]
             let _nic_present = probe_nic_at_boot();
 
-            // Display-driver demo: run the notepad GuiApp on the VGA text
-            // console via the kernel GUI runner. Proves the Surface -> VGA blit
-            // and keyboard-driven render loop on real hardware.
+            // Production GUI surface: the kernel GUI runner (a real display
+            // driver — see `crate::gui`/`crate::arch::vga`) renders a
+            // `platform-gui` cell-grid Surface to the screen and drives a GuiApp
+            // from the live keyboard. The driver is always-compiled production
+            // code; the `gui-demo` feature selects which app the boot surface
+            // launches (here, the notepad). A different image can launch a
+            // different GuiApp on the same runner.
             #[cfg(all(target_arch = "x86_64", feature = "gui-demo"))]
             {
-                kprintln!("CIBOS kernel: --- notepad GUI (VGA) ---");
-                // The GUI runner reads the LIVE keyboard (IRQ1): type into the
-                // notepad; the text is blitted to VGA each render. A physical
-                // keypress drives this on real hardware.
+                kprintln!("CIBOS kernel: starting GUI surface (notepad)");
                 let mut app = notepad::Notepad::new();
                 crate::gui::run_gui_app(&mut app);
-                kprintln!("CIBOS kernel: notepad GUI exited");
+                kprintln!("CIBOS kernel: GUI surface exited");
             }
 
             // IPC demo: open a local channel and round-trip a message through
