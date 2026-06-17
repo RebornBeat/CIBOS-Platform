@@ -95,3 +95,21 @@ pub unsafe fn wait_ticks_or(ticks: u64, mut pred: impl FnMut() -> bool) -> bool 
         core::arch::asm!("hlt", options(nomem, nostack));
     }
 }
+
+/// Block until `pred` becomes true, sleeping the CPU with `hlt` between PIT
+/// ticks (no busy-spin). Unlike [`wait_ticks_or`] there is NO deadline — this is
+/// for a TRULY blocking wait (e.g. an interactive `ReadKey` that must wait for a
+/// real keystroke however long the user pauses). Honors the HIP "time as trigger,
+/// not coordinator" stance: the CPU idles in `hlt` and only wakes on an IRQ.
+///
+/// # Safety
+/// Interrupts must be enabled and the relevant IRQ (e.g. keyboard) live, or this
+/// will sleep forever. Use only where an interrupt is guaranteed to fire.
+pub unsafe fn wait_for(mut pred: impl FnMut() -> bool) {
+    loop {
+        if pred() {
+            return;
+        }
+        core::arch::asm!("hlt", options(nomem, nostack));
+    }
+}

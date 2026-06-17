@@ -99,3 +99,11 @@ pub fn current_root() -> u64 {
     }
     cr3 & ADDR_MASK
 }
+
+/// The active page-table root as a [`PhysFrame`] (for adopting the current space
+/// to map additional pages into it, e.g. a `spawn`ed lane's stack).
+#[cfg(feature = "ring3-multilane-demo")]
+#[must_use]
+pub fn current_root_frame() -> cibos_kernel::PhysFrame {
+    cibos_kernel::PhysFrame::containing(current_root())
+}

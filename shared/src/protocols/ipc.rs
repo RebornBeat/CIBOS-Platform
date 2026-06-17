@@ -178,3 +178,132 @@ pub enum ChannelAcceptance {
     /// The receiver rejected the request.
     Rejected,
 }
+
+/// Wire length of [`ChannelTermsWire`]: purpose(64) + purpose_len(1) +
+/// direction(1) + pad(2) + max_message_bytes(4) + buffer_capacity(4) = 76 bytes.
+pub const CHANNEL_TERMS_WIRE_LEN: usize = MAX_CHANNEL_PURPOSE + 1 + 1 + 2 + 4 + 4;
+
+/// Fixed-size little-endian encoding of [`ChannelTerms`] for passing across the
+/// syscall boundary by pointer (the 3-register ABI cannot carry the struct).
+/// Mirrors the `FsRwArgs` wire convention. All multi-byte fields little-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelTermsWire {
+    /// UTF-8 purpose bytes (only the first `purpose_len` are meaningful).
+    pub purpose: [u8; MAX_CHANNEL_PURPOSE],
+    /// Number of valid bytes in `purpose`.
+    pub purpose_len: u8,
+    /// `ChannelDirection` as its discriminant (1/2/3).
+    pub direction: u8,
+    /// Max bytes per message.
+    pub max_message_bytes: u32,
+    /// Buffered messages before back-pressure.
+    pub buffer_capacity: u32,
+}
+
+impl ChannelTermsWire {
+    /// Encode `terms` into the fixed wire layout.
+    #[must_use]
+    pub fn from_terms(terms: &ChannelTerms) -> Self {
+        let mut purpose = [0u8; MAX_CHANNEL_PURPOSE];
+        let bytes = terms.purpose.as_bytes();
+        let n = bytes.len().min(MAX_CHANNEL_PURPOSE);
+        purpose[..n].copy_from_slice(&bytes[..n]);
+        Self {
+            purpose,
+            purpose_len: n as u8,
+            direction: terms.direction as u8,
+            max_message_bytes: terms.max_message_bytes,
+            buffer_capacity: terms.buffer_capacity,
+        }
+    }
+
+    /// Decode into validated [`ChannelTerms`]. Returns `None` if the purpose is
+    /// not valid UTF-8/too long, the direction is unknown, or capacity is zero.
+    #[must_use]
+    pub fn to_terms(&self) -> Option<ChannelTerms> {
+        let len = (self.purpose_len as usize).min(MAX_CHANNEL_PURPOSE);
+        let purpose = core::str::from_utf8(&self.purpose[..len]).ok()?;
+        let direction = match self.direction {
+            1 => ChannelDirection::RequesterToReceiver,
+            2 => ChannelDirection::ReceiverToRequester,
+            3 => ChannelDirection::Bidirectional,
+            _ => return None,
+        };
+        ChannelTerms::new(purpose, direction, self.max_message_bytes, self.buffer_capacity).ok()
+    }
+
+    /// Encode to the fixed little-endian byte layout.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; CHANNEL_TERMS_WIRE_LEN] {
+        let mut b = [0u8; CHANNEL_TERMS_WIRE_LEN];
+        b[..MAX_CHANNEL_PURPOSE].copy_from_slice(&self.purpose);
+        let mut o = MAX_CHANNEL_PURPOSE;
+        b[o] = self.purpose_len;
+        o += 1;
+        b[o] = self.direction;
+        o += 3; // direction + 2 pad
+        b[o..o + 4].copy_from_slice(&self.max_message_bytes.to_le_bytes());
+        o += 4;
+        b[o..o + 4].copy_from_slice(&self.buffer_capacity.to_le_bytes());
+        b
+    }
+
+    /// Decode from the fixed little-endian byte layout.
+    #[must_use]
+    pub fn from_bytes(b: &[u8; CHANNEL_TERMS_WIRE_LEN]) -> Self {
+        let mut purpose = [0u8; MAX_CHANNEL_PURPOSE];
+        purpose.copy_from_slice(&b[..MAX_CHANNEL_PURPOSE]);
+        let mut o = MAX_CHANNEL_PURPOSE;
+        let purpose_len = b[o];
+        o += 1;
+        let direction = b[o];
+        o += 3;
+        let max_message_bytes = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        o += 4;
+        let buffer_capacity = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        Self {
+            purpose,
+            purpose_len,
+            direction,
+            max_message_bytes,
+            buffer_capacity,
+        }
+    }
+}
+
+/// Wire length of [`ChannelRequestWire`]: requester/target boundary (8) + terms.
+pub const CHANNEL_REQUEST_WIRE_LEN: usize = 8 + CHANNEL_TERMS_WIRE_LEN;
+
+/// What `poll_channel_request` writes into the receiver's buffer: the requesting
+/// boundary plus the proposed terms, so the receiver can decide whether to
+/// accept. Little-endian; the leading `u64` is the requester's boundary id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelRequestWire {
+    /// The boundary that issued the request.
+    pub requester: u64,
+    /// The proposed terms.
+    pub terms: ChannelTermsWire,
+}
+
+impl ChannelRequestWire {
+    /// Encode to the fixed little-endian byte layout.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; CHANNEL_REQUEST_WIRE_LEN] {
+        let mut b = [0u8; CHANNEL_REQUEST_WIRE_LEN];
+        b[..8].copy_from_slice(&self.requester.to_le_bytes());
+        b[8..].copy_from_slice(&self.terms.to_bytes());
+        b
+    }
+
+    /// Decode from the fixed little-endian byte layout.
+    #[must_use]
+    pub fn from_bytes(b: &[u8; CHANNEL_REQUEST_WIRE_LEN]) -> Self {
+        let requester = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let mut terms_bytes = [0u8; CHANNEL_TERMS_WIRE_LEN];
+        terms_bytes.copy_from_slice(&b[8..]);
+        Self {
+            requester,
+            terms: ChannelTermsWire::from_bytes(&terms_bytes),
+        }
+    }
+}

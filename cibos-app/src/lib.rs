@@ -31,6 +31,7 @@ pub mod channel;
 pub mod fs;
 pub mod heap;
 pub mod input;
+pub mod net;
 pub mod rand;
 pub mod syscall;
 pub mod system_backend;

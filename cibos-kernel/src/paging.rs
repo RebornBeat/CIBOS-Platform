@@ -160,6 +160,17 @@ impl AddressSpace {
         self.root
     }
 
+    /// Adopt an EXISTING root table (do not allocate a new one) so additional
+    /// pages can be mapped into an already-installed address space. The dual of
+    /// [`new`](Self::new): `new` creates a fresh space; `adopt` wraps the current
+    /// one. Used when a `spawn` adds a lane stack to the caller's live space
+    /// (same boundary -> same space). The caller is responsible for `root` being
+    /// a valid PML4/root frame for the intended space.
+    #[must_use]
+    pub fn adopt(root: PhysFrame) -> Self {
+        Self { root }
+    }
+
     /// Split a 48-bit virtual address into its four 9-bit level indices,
     /// most-significant level first (`[PML4, PDPT, PD, PT]`).
     fn indices(virt: u64) -> [usize; LEVELS] {

@@ -193,6 +193,105 @@ pub trait SyscallEnv {
     ) -> Result<u64, SyscallError> {
         Err(SyscallError::NotPermitted)
     }
+
+    /// Propose a cross-boundary channel from `requester` to `target` with the
+    /// proposed `terms`. Returns a request id (>= 0) the requester later polls.
+    /// The default reports no IPC surface.
+    fn request_channel(
+        &self,
+        _requester: BoundaryId,
+        _target: BoundaryId,
+        _terms: &shared::protocols::ipc::ChannelTerms,
+    ) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// The next pending request aimed at `target` (the caller). Returns the
+    /// request id and fills `out` with the encoded [`ChannelRequestWire`].
+    /// `NotFound` if none. The default reports no IPC surface.
+    fn poll_channel_request(
+        &self,
+        _target: BoundaryId,
+        _out: &mut [u8],
+    ) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Accept the pending request `request_id` (the caller `target` must be its
+    /// target). Returns a channel handle (>= 0) for the accepting boundary. The
+    /// default reports no IPC surface.
+    fn accept_channel(
+        &self,
+        _target: BoundaryId,
+        _request_id: u64,
+    ) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Reject the pending request `request_id` (the caller must be its target).
+    /// The default reports no IPC surface.
+    fn reject_channel(
+        &self,
+        _target: BoundaryId,
+        _request_id: u64,
+    ) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// The requester polls the outcome of its `request_id`: a channel handle
+    /// (>= 0) once accepted, `WouldBlock` while pending, `NotFound` if rejected.
+    /// The default reports no IPC surface.
+    fn poll_channel_outcome(
+        &self,
+        _requester: BoundaryId,
+        _request_id: u64,
+    ) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Bind the caller's boundary as the listener on Lattice `gate`. Returns a
+    /// listener handle. The default reports no networking surface.
+    fn gate_bind(&self, _owner: BoundaryId, _gate: u16) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Open a Link from the caller's boundary to whatever is bound on `gate`.
+    /// Returns the connector's Link handle. The default reports no surface.
+    fn gate_connect(&self, _from: BoundaryId, _gate: u16) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// The listener on `gate` accepts the next pending connect, returning its Link
+    /// handle. The default reports no surface.
+    fn gate_accept(&self, _owner: BoundaryId, _gate: u16) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Send `data` on the Link `handle`. The default reports no surface.
+    fn link_send(&self, _boundary: BoundaryId, _handle: u64, _data: &[u8]) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Receive a message from the Link `handle`. The default reports no surface.
+    fn link_recv(&self, _boundary: BoundaryId, _handle: u64) -> Result<alloc::vec::Vec<u8>, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Close the Link `handle`. The default reports no surface.
+    fn link_close(&self, _boundary: BoundaryId, _handle: u64) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Set the Warden policy for `gate` (`allow` false = total denial). The
+    /// default reports no surface.
+    fn warden_set(&self, _boundary: BoundaryId, _gate: u16, _allow: bool) -> Result<(), SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
+
+    /// Probe `gate`: 0 Closed, 1 Open, 2 Blocked. The default reports no surface.
+    fn gate_probe(&self, _boundary: BoundaryId, _gate: u16) -> Result<u64, SyscallError> {
+        Err(SyscallError::NotPermitted)
+    }
 }
 
 /// Handle one syscall request against `env`, returning the outcome.
@@ -290,6 +389,153 @@ pub fn dispatch<E: SyscallEnv>(req: &SyscallRequest, env: &E) -> SyscallOutcome 
             // arg0 = user entry pointer, arg1 = argument word.
             match env.spawn(req.boundary, req.arg0, req.arg1) {
                 Ok(lane) => SyscallOutcome::Return((lane & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::RequestChannel => {
+            // arg0 = target boundary, arg1 = terms_ptr, arg2 = terms_len.
+            use shared::protocols::ipc::{ChannelTermsWire, CHANNEL_TERMS_WIRE_LEN};
+            let target = BoundaryId(req.arg0);
+            if (req.arg2 as usize) < CHANNEL_TERMS_WIRE_LEN {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            }
+            let mut buf = [0u8; CHANNEL_TERMS_WIRE_LEN];
+            if let Err(e) =
+                env.copy_from_user(req.boundary, req.arg1, CHANNEL_TERMS_WIRE_LEN, &mut buf)
+            {
+                return SyscallOutcome::Return(e.as_return());
+            }
+            let Some(terms) = ChannelTermsWire::from_bytes(&buf).to_terms() else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            // A boundary cannot request a channel TO ITSELF via the cross-boundary
+            // handshake (that is what OpenChannel is for); keep them distinct.
+            if target == req.boundary {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            }
+            match env.request_channel(req.boundary, target, &terms) {
+                Ok(id) => SyscallOutcome::Return((id & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::PollChannelRequest => {
+            // arg0 = out_ptr, arg1 = out_len. The CALLER's boundary is the target.
+            use shared::protocols::ipc::CHANNEL_REQUEST_WIRE_LEN;
+            if (req.arg1 as usize) < CHANNEL_REQUEST_WIRE_LEN {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            }
+            let mut out = [0u8; CHANNEL_REQUEST_WIRE_LEN];
+            match env.poll_channel_request(req.boundary, &mut out) {
+                Ok(id) => match env.copy_to_user(req.boundary, req.arg0, &out) {
+                    Ok(()) => SyscallOutcome::Return((id & (i64::MAX as u64)) as i64),
+                    Err(e) => SyscallOutcome::Return(e.as_return()),
+                },
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::AcceptChannel => {
+            // arg0 = request_id. The CALLER's boundary must be the target.
+            match env.accept_channel(req.boundary, req.arg0) {
+                Ok(handle) => SyscallOutcome::Return((handle & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::RejectChannel => {
+            // arg0 = request_id. The CALLER's boundary must be the target.
+            match env.reject_channel(req.boundary, req.arg0) {
+                Ok(()) => SyscallOutcome::Return(0),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::PollChannelOutcome => {
+            // arg0 = request_id. The CALLER is the requester.
+            match env.poll_channel_outcome(req.boundary, req.arg0) {
+                Ok(handle) => SyscallOutcome::Return((handle & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::GateBind => {
+            // arg0 = gate (u16). Caller boundary (trap) becomes the owner.
+            let Ok(gate) = u16::try_from(req.arg0) else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            match env.gate_bind(req.boundary, gate) {
+                Ok(h) => SyscallOutcome::Return((h & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::GateConnect => {
+            // arg0 = gate (u16). Caller boundary (trap) is the connector.
+            let Ok(gate) = u16::try_from(req.arg0) else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            match env.gate_connect(req.boundary, gate) {
+                Ok(h) => SyscallOutcome::Return((h & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::GateAccept => {
+            // arg0 = gate (u16). Caller must own the Gate.
+            let Ok(gate) = u16::try_from(req.arg0) else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            match env.gate_accept(req.boundary, gate) {
+                Ok(h) => SyscallOutcome::Return((h & (i64::MAX as u64)) as i64),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::LinkSend => {
+            // arg0 = handle, arg1 = ptr, arg2 = len.
+            let len = req.arg2 as usize;
+            let mut buf = alloc::vec![0u8; len];
+            if let Err(e) = env.copy_from_user(req.boundary, req.arg1, len, &mut buf) {
+                return SyscallOutcome::Return(e.as_return());
+            }
+            match env.link_send(req.boundary, req.arg0, &buf) {
+                Ok(()) => SyscallOutcome::Return(0),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::LinkRecv => {
+            // arg0 = handle, arg1 = ptr, arg2 = cap.
+            match env.link_recv(req.boundary, req.arg0) {
+                Ok(bytes) => {
+                    let cap = req.arg2 as usize;
+                    if bytes.len() > cap {
+                        return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+                    }
+                    match env.copy_to_user(req.boundary, req.arg1, &bytes) {
+                        Ok(()) => SyscallOutcome::Return((bytes.len() & (i64::MAX as usize)) as i64),
+                        Err(e) => SyscallOutcome::Return(e.as_return()),
+                    }
+                }
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::LinkClose => {
+            // arg0 = handle.
+            match env.link_close(req.boundary, req.arg0) {
+                Ok(()) => SyscallOutcome::Return(0),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::WardenSet => {
+            // arg0 = gate (u16), arg1 = allow (0 = deny).
+            let Ok(gate) = u16::try_from(req.arg0) else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            match env.warden_set(req.boundary, gate, req.arg1 != 0) {
+                Ok(()) => SyscallOutcome::Return(0),
+                Err(e) => SyscallOutcome::Return(e.as_return()),
+            }
+        }
+        Syscall::GateProbe => {
+            // arg0 = gate (u16). 0 Closed, 1 Open, 2 Blocked.
+            let Ok(gate) = u16::try_from(req.arg0) else {
+                return SyscallOutcome::Return(SyscallError::InvalidArgument.as_return());
+            };
+            match env.gate_probe(req.boundary, gate) {
+                Ok(state) => SyscallOutcome::Return((state & (i64::MAX as u64)) as i64),
                 Err(e) => SyscallOutcome::Return(e.as_return()),
             }
         }
@@ -1153,6 +1399,142 @@ mod tests {
         assert_eq!(
             dispatch(&req(Syscall::Spawn.number(), 0, 0), &env),
             SyscallOutcome::Return(denied)
+        );
+    }
+
+    // ---- Handshake syscall dispatch (decode/validate + wire round-trip) -------
+
+    #[test]
+    fn channel_terms_wire_round_trips() {
+        use shared::protocols::ipc::{ChannelDirection, ChannelTerms, ChannelTermsWire};
+        let terms = ChannelTerms::new("telemetry", ChannelDirection::Bidirectional, 256, 8).unwrap();
+        let wire = ChannelTermsWire::from_terms(&terms);
+        let bytes = wire.to_bytes();
+        let back = ChannelTermsWire::from_bytes(&bytes).to_terms().unwrap();
+        assert_eq!(back, terms, "terms survive wire encode/decode unchanged");
+    }
+
+    #[test]
+    fn channel_request_wire_round_trips() {
+        use shared::protocols::ipc::{
+            ChannelDirection, ChannelRequestWire, ChannelTerms, ChannelTermsWire,
+        };
+        let terms = ChannelTerms::new("rpc", ChannelDirection::RequesterToReceiver, 64, 2).unwrap();
+        let wire = ChannelRequestWire {
+            requester: 0x100,
+            terms: ChannelTermsWire::from_terms(&terms),
+        };
+        let bytes = wire.to_bytes();
+        let back = ChannelRequestWire::from_bytes(&bytes);
+        assert_eq!(back.requester, 0x100);
+        assert_eq!(back.terms.to_terms().unwrap(), terms);
+    }
+
+    #[test]
+    fn request_channel_to_self_is_rejected() {
+        use shared::protocols::ipc::{ChannelDirection, ChannelTerms, ChannelTermsWire};
+        // Build a valid terms buffer in the mock's mapped region, then target the
+        // CALLER's own boundary (1) — dispatch must reject this as InvalidArgument
+        // (cross-boundary handshake is between DISTINCT boundaries).
+        let terms = ChannelTerms::new("x", ChannelDirection::Bidirectional, 32, 1).unwrap();
+        let bytes = ChannelTermsWire::from_terms(&terms).to_bytes();
+        let mut env = env_with("");
+        env.base = 0x1000;
+        *env.data.borrow_mut() = bytes.to_vec();
+        let r = req3(
+            Syscall::RequestChannel.number(),
+            1, /* target == caller boundary (1) */
+            0x1000,
+            bytes.len() as u64,
+        );
+        assert_eq!(
+            dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
+    }
+
+    #[test]
+    fn request_channel_short_terms_buffer_is_rejected() {
+        // terms_len below the wire length must be rejected before any copy.
+        let env = env_with("");
+        let r = req3(Syscall::RequestChannel.number(), 2, 0x1000, 4);
+        assert_eq!(
+            dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::InvalidArgument.as_return())
+        );
+    }
+
+    #[test]
+    fn handshake_calls_default_to_not_permitted_without_ipc() {
+        // The mock env uses trait defaults for the handshake methods, so a valid
+        // cross-boundary request (distinct target, full buffer) reaches the env
+        // and reports NotPermitted — confirming dispatch wiring reaches the env.
+        use shared::protocols::ipc::{ChannelDirection, ChannelTerms, ChannelTermsWire};
+        let terms = ChannelTerms::new("y", ChannelDirection::Bidirectional, 32, 1).unwrap();
+        let bytes = ChannelTermsWire::from_terms(&terms).to_bytes();
+        let mut env = env_with("");
+        env.base = 0x1000;
+        *env.data.borrow_mut() = bytes.to_vec();
+        let r = req3(Syscall::RequestChannel.number(), 2, 0x1000, bytes.len() as u64);
+        assert_eq!(
+            dispatch(&r, &env),
+            SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
+        );
+        // Accept/Reject/Outcome with default env also report NotPermitted.
+        assert_eq!(
+            dispatch(&req(Syscall::AcceptChannel.number(), 0, 0), &env),
+            SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
+        );
+        assert_eq!(
+            dispatch(&req(Syscall::PollChannelOutcome.number(), 0, 0), &env),
+            SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
+        );
+    }
+
+    // ---- Lattice net syscall dispatch (decode/validate + reaches env) ---------
+
+    #[test]
+    fn net_syscalls_reach_env_default_not_permitted() {
+        // MockEnv uses the trait defaults for the net methods, so a valid call
+        // (gate in range) reaches the env and reports NotPermitted — confirming
+        // dispatch wiring for each net syscall.
+        let env = env_with("");
+        for call in [
+            Syscall::GateBind,
+            Syscall::GateConnect,
+            Syscall::GateAccept,
+            Syscall::WardenSet,
+            Syscall::GateProbe,
+        ] {
+            assert_eq!(
+                dispatch(&req(call.number(), 80, 1), &env),
+                SyscallOutcome::Return(SyscallError::NotPermitted.as_return()),
+                "{call:?} should reach env and report NotPermitted",
+            );
+        }
+    }
+
+    #[test]
+    fn gate_out_of_range_is_invalid_argument() {
+        // A gate number above u16::MAX is rejected by dispatch BEFORE the env.
+        let env = env_with("");
+        let big = (u16::MAX as u64) + 1;
+        for call in [Syscall::GateBind, Syscall::GateConnect, Syscall::GateProbe] {
+            assert_eq!(
+                dispatch(&req(call.number(), big, 0), &env),
+                SyscallOutcome::Return(SyscallError::InvalidArgument.as_return()),
+                "{call:?} with out-of-range gate should be InvalidArgument",
+            );
+        }
+    }
+
+    #[test]
+    fn link_close_reaches_env() {
+        // LinkClose takes a scalar handle; default env reports NotPermitted.
+        let env = env_with("");
+        assert_eq!(
+            dispatch(&req(Syscall::LinkClose.number(), 0, 0), &env),
+            SyscallOutcome::Return(SyscallError::NotPermitted.as_return())
         );
     }
 }

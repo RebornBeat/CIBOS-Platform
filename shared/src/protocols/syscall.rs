@@ -118,6 +118,70 @@ pub enum Syscall {
     /// Lanes are the HIP unit of parallelism; this maps to the kernel's
     /// cooperative `spawn` onto the single-selector executor.
     Spawn = 17,
+    /// `request_channel(target_boundary: u64, terms_ptr: u64, terms_len: u64)
+    /// -> isize`. Propose a cross-boundary channel to `target_boundary` with the
+    /// terms encoded at `terms_ptr` (see [`ChannelTermsWire`]). The CALLER's
+    /// boundary (from the trap) is the requester. Returns a non-negative request
+    /// id the requester later polls with [`Syscall::PollChannelOutcome`], or a
+    /// negative error. No channel exists yet — only if the target accepts.
+    RequestChannel = 18,
+    /// `poll_channel_request(out_ptr: u64, out_len: u64) -> isize`. The CALLER's
+    /// boundary (from the trap) is the target: returns the next pending request
+    /// AIMED AT IT (request id, >= 0), writing the requester boundary and proposed
+    /// terms into the user buffer (see [`ChannelRequestWire`]) so the receiver can
+    /// decide. [`SyscallError::NotFound`] if none. Point-to-point: a boundary
+    /// never sees requests meant for another.
+    PollChannelRequest = 19,
+    /// `accept_channel(request_id: u64) -> isize`. Accept the pending request
+    /// `request_id` WHOLESALE (the caller's boundary must be its target). Creates
+    /// one channel from the exact proposed terms and returns a non-negative
+    /// channel handle for the accepting (target) boundary; the requester obtains
+    /// its handle via [`Syscall::PollChannelOutcome`]. Negative on error.
+    AcceptChannel = 20,
+    /// `reject_channel(request_id: u64) -> isize`. Reject the pending request
+    /// (the caller's boundary must be its target). Returns 0, or negative on
+    /// error. The requester learns of the rejection via
+    /// [`Syscall::PollChannelOutcome`] returning [`SyscallError::NotFound`].
+    RejectChannel = 21,
+    /// `poll_channel_outcome(request_id: u64) -> isize`. The REQUESTER polls the
+    /// outcome of its own request: a non-negative channel handle once the target
+    /// accepted, [`SyscallError::WouldBlock`] while still pending, or
+    /// [`SyscallError::NotFound`] if it was rejected or is unknown.
+    PollChannelOutcome = 22,
+    /// `gate_bind(gate: u64) -> isize`. Bind the calling boundary as the listener
+    /// on Lattice `gate` (a u16 port). Returns a non-negative listener handle, or
+    /// a negative error: `NotPermitted` if the Warden denies the Gate OR another
+    /// boundary already holds it; `InvalidArgument` if `gate` is out of range.
+    /// The caller's boundary (from the trap) becomes the Gate's owner.
+    GateBind = 23,
+    /// `gate_connect(gate: u64) -> isize`. Open a Link to whatever boundary is
+    /// bound on `gate`. Returns a non-negative Link handle for the connector;
+    /// the listener obtains its half via [`Syscall::GateAccept`]. Negative on
+    /// error (`NotPermitted` if the Warden denies it, `NotFound` if no listener).
+    GateConnect = 24,
+    /// `gate_accept(gate: u64) -> isize`. The listener bound on `gate` accepts the
+    /// next pending connect, returning a non-negative Link handle. Negative on
+    /// error (`WouldBlock` if none pending, `NotPermitted` if the caller is not
+    /// the owner).
+    GateAccept = 25,
+    /// `link_send(handle: u64, ptr: u64, len: u64) -> isize`. Send up to `len`
+    /// bytes from `ptr` on the Link `handle`. 0 on success, negative on error
+    /// (`WouldBlock` if the buffer is full, `NotFound` if the Link is closed).
+    LinkSend = 26,
+    /// `link_recv(handle: u64, ptr: u64, cap: u64) -> isize`. Receive into `ptr`
+    /// (capacity `cap`) from the Link `handle`. Returns the byte count (>= 0), or
+    /// negative (`WouldBlock` if empty, `NotFound` if closed/unknown).
+    LinkRecv = 27,
+    /// `link_close(handle: u64) -> isize`. Close the Link `handle`. 0 on success.
+    LinkClose = 28,
+    /// `warden_set(gate: u64, allow: u64) -> isize`. Set the Warden policy for
+    /// `gate`: `allow != 0` allows, `allow == 0` denies (total — blocks bind and
+    /// connect). 0 on success; negative on error. (Owner/SYSTEM policy applies.)
+    WardenSet = 29,
+    /// `gate_probe(gate: u64) -> isize`. Probe `gate`: 0 = Closed (allowed,
+    /// unbound), 1 = Open (bound), 2 = Blocked (Warden denies). Mirrors the SDK
+    /// `Probe`. Never negative for a valid call.
+    GateProbe = 30,
 }
 
 impl Syscall {
@@ -142,6 +206,19 @@ impl Syscall {
             15 => Some(Syscall::ChannelSend),
             16 => Some(Syscall::ChannelRecv),
             17 => Some(Syscall::Spawn),
+            18 => Some(Syscall::RequestChannel),
+            19 => Some(Syscall::PollChannelRequest),
+            20 => Some(Syscall::AcceptChannel),
+            21 => Some(Syscall::RejectChannel),
+            22 => Some(Syscall::PollChannelOutcome),
+            23 => Some(Syscall::GateBind),
+            24 => Some(Syscall::GateConnect),
+            25 => Some(Syscall::GateAccept),
+            26 => Some(Syscall::LinkSend),
+            27 => Some(Syscall::LinkRecv),
+            28 => Some(Syscall::LinkClose),
+            29 => Some(Syscall::WardenSet),
+            30 => Some(Syscall::GateProbe),
             _ => None,
         }
     }

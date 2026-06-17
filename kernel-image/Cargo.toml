@@ -56,6 +56,11 @@ storage-selftest = []
 app-hello = []
 app-login = []
 app-shell = ["app-login"]
+# `interactive-session` runs the gated login -> shell flow on the LIVE keyboard
+# (no injected commands): a real person types the profile/password and shell
+# commands. Distinct from the storage-selftest injected path (which stays
+# deterministic). Pulls in the login + shell .capps.
+interactive-session = ["app-login", "app-shell"]
 
 # Display-driver demo: run the notepad GuiApp on the VGA text console via the
 # kernel GUI runner (Surface -> VGA blit + PS/2 keyboard), proving the display
@@ -66,6 +71,16 @@ gui-demo = ["dep:notepad"]
 # syscall ABI (OpenChannel -> ChannelSend -> ChannelRecv), proving the Track 2
 # channel path and bounded back-pressure on the booted kernel. Opt-in; x86_64.
 channel-demo = []
+# `ring3-resume-demo` exercises the per-lane ring-3 context mechanism: a ring-3
+# payload traps via `yield`, the kernel saves its full context and parks it, then
+# `resume_ring3` continues it exactly where it trapped. Proves the load-bearing
+# prerequisite for live multi-context (spawn) + cross-boundary channels.
+ring3-resume-demo = []
+# `ring3-multilane-demo` exercises the selector-owned Ring3Lane table (step 3):
+# multiple ring-3 lanes, the canonical Scheduler picks the next ready one, a lane
+# that yields parks and another runs, then the parked lane resumes. Proves the
+# table-driven multi-context model that makes `spawn` real.
+ring3-multilane-demo = []
 
 # Operational profile bundles: forward to the kernel library's bundle so the
 # bootable image is built as exactly one profile (ADR-007). The build wrapper

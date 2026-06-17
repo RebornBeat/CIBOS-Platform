@@ -115,3 +115,49 @@ under-weighting relative to the project's OWN order are the **8 documented
 examples** and the **behavioral profile flags** — both are conformance/substance
 items the roadmap ranks ahead of breadth. The one thing to NOT do without a
 deliberate call is the server orchestrator.
+
+---
+
+## ADDENDUM: Track-2 live-context + cross-boundary IPC audit (this session)
+
+Re-audited the NEW Track-2 work (per-lane ring-3 context, selector-owned
+multi-lane dispatch, spawn syscall + real boundary, channel unification, the
+cross-boundary handshake) against the canonical 18-doc invariants. Verdict:
+ALIGNED, with one documentation gap fixed (see check 9). No code drift found.
+
+| Canonical invariant (source) | Our implementation | Verdict |
+|---|---|---|
+| Single selector owns Ready/Stalled; NO parallel selector (ADR-002, HIP-README) | Exactly one `Scheduler` (in `Ring3Table::new`), SHARED via `Arc` with the channel table — lane dispatch + channel back-pressure use the SAME selector | ALIGNED |
+| No global locks across user execution (HIP cardinal constraint) | `run_installed` releases the table lock BEFORE `resume_user_context`; brief locks only; verified no reentrant deadlock (boundary-lookup lock drops before dispatch) | ALIGNED |
+| Two-layer: Catch-and-Release eligibility + Dispatch weighted-entropy ONLY when N>C (HIP-README) | `selector::select`: `ready.len() <= contexts` → dispatch ALL; `> contexts` → weighted sampling without replacement | ALIGNED (exact) |
+| Channels point-to-point, mutual agreement, terms PROPOSED by requester, receiver accepts-ALL-or-rejects, NO counter-proposal (API-Reference, ADRs) | `ChannelRegistry` request/poll/accept/reject: one target; accept builds from EXACT proposed terms; reject drops; a wrong boundary cannot see/accept/reject (point-to-point isolation) — host-tested + QEMU-verified | ALIGNED |
+| Isolation is BINARY; the boundary is the principal (HIP defining invariant) | Syscalls attributed to the running lane's REAL boundary (`active_lane → boundary_of`); a third boundary cannot claim an accepted channel outcome; spawned lane runs in the CALLER's boundary | ALIGNED |
+| Cross-boundary bytes go THROUGH the kernel, never via shared user memory (isolation) | `channel_send`/`channel_recv` use the canonical `try_send`/`try_recv` (kernel-owned queue); both endpoints map to ONE `Channel`; lanes share no user memory | ALIGNED |
+| Cooperative, NOT preemptive time-slicing (HIP-README, ADR-005) | Lanes run until they trap/stall/exit; no preemption introduced | ALIGNED |
+| `arg` to a spawned lane via the SDK `spawn(entry, arg)` surface | `spawn_lane` sets `ctx.rdi = arg` (SysV first-arg reg); QEMU-verified (0x42 round-trip) | ALIGNED |
+
+### Check 9 — the one gap (FIXED, documentation only, not a code change to behavior)
+The canonical model distinguishes **cryptographic IPC** (Maximum-Isolation /
+Balanced) from a **lightweight handshake** (Compute) — these are documented
+profile BEHAVIORAL FLAGS (`cryptographic-ipc` / `lightweight-handshake`, roadmap
+2.2 item 5) that are declared-but-inert for ALL flags today. Our cross-boundary
+handshake is the LIGHTWEIGHT form, exercised in the Compute-profile demo — which
+is CORRECT for that profile. It was not LABELED as such, which could later read as
+drift. Fix: label it the lightweight-handshake form in the channel docs, so the
+future `cryptographic-ipc` mode is clearly the ADDITIVE layer the spec describes
+(crypto over the same request/accept structure), not a contradiction. This is the
+same honest-boundary discipline used elsewhere: the mechanism is real and correct
+for its profile; the higher-isolation crypto layer is deferred behavioral-flag
+work, flagged not faked.
+
+### No drift found in:
+- The HIP defining invariant (binary boundary isolation) — upheld at the trap.
+- The single-selector / no-global-lock constraints — upheld in the run loop.
+- The channel mutual-agreement model — upheld and tested.
+- The cooperative (non-preemptive) execution model — upheld.
+
+### Stale-doc corrections made this session
+- `PROGRESS-AND-ROADMAP.md` 1.11 said 225/0; added 1.12 with the true Track-2
+  progression and the current **338 / 0** verified state.
+- `README.md` said 298 tests; corrected to 338 and added the live multi-context +
+  cross-boundary IPC capability bullet.

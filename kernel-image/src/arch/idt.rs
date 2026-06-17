@@ -165,6 +165,11 @@ pub extern "C" fn cibos_fault_report(vector: u64, error_code: u64, rip: u64) {
 extern "C" {
     /// The assembly trap stub (defined in `syscall_entry.s`).
     fn syscall_trap_entry();
+    /// The context-saving trap stub (defined in `resume_user.s`). Saves the full
+    /// user register file into the current lane's context before calling the
+    /// Rust handler, enabling park/resume of a ring-3 lane.
+    #[cfg(any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo"))]
+    fn user_ctx_trap_entry();
 }
 
 /// The Rust trap handler the assembly stub tail-calls with the saved argument
@@ -174,4 +179,46 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn cibos_syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     crate::boot::handle_syscall(number, arg0, arg1, arg2)
+}
+
+/// The Rust handler for the context-saving trap path. By the time this is
+/// called, `user_ctx_trap_entry` has already saved the trapped lane's full
+/// register state into `USER_CTX_SAVE`. This handler may either:
+///   * return an `i64` — the trap stub writes it into the saved RAX and resumes
+///     the SAME lane inline (ordinary syscall semantics, unchanged), or
+///   * never return — `crate::boot::handle_user_trap` decides to PARK the lane,
+///     longjmping to the kernel via `return_to_kernel`, leaving `USER_CTX_SAVE`
+///     holding the resumable context for a later `resume_ring3`.
+#[cfg(any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo"))]
+#[no_mangle]
+pub extern "C" fn cibos_user_trap_handler(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    crate::boot::handle_user_trap(number, arg0, arg1, arg2)
+}
+
+/// Repoint the `0x80` syscall vector at the context-saving trap stub
+/// (`user_ctx_trap_entry`) instead of the default `syscall_trap_entry`. Used by
+/// the ring-3 park/resume demonstration; `set_default_syscall_vector` restores
+/// the original. Kept narrowly scoped so the default boot path is unaffected.
+///
+/// # Safety
+/// Must be called with the IDT installed (after `init`). Changing the live
+/// syscall vector affects all subsequent `int 0x80`s until restored.
+#[cfg(any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo"))]
+pub unsafe fn set_ctx_saving_syscall_vector() {
+    let cs: u16;
+    core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+    let handler = user_ctx_trap_entry as *const () as u64;
+    IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3, 0);
+}
+
+/// Restore the default (non-saving) syscall trap stub on vector `0x80`.
+///
+/// # Safety
+/// As `set_ctx_saving_syscall_vector`.
+#[cfg(any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo"))]
+pub unsafe fn set_default_syscall_vector() {
+    let cs: u16;
+    core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+    let handler = syscall_trap_entry as *const () as u64;
+    IDT[VECTOR_SYSCALL].set_handler(handler, cs, GATE_INT64_DPL3, 0);
 }

@@ -33,6 +33,8 @@ global_asm!(include_str!("boot/x86_64_handoff.s"));
 global_asm!(include_str!("arch/syscall_entry.s"));
 #[cfg(target_arch = "x86_64")]
 global_asm!(include_str!("arch/enter_user.s"));
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+global_asm!(include_str!("arch/resume_user.s"));
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot/aarch64.s"));
 #[cfg(target_arch = "riscv64")]
@@ -98,6 +100,7 @@ impl Write for Console {
 
 macro_rules! kprintln {
     ($($arg:tt)*) => {{
+        use ::core::fmt::Write as _;
         let mut console = $crate::boot::Console;
         let _ = ::core::writeln!(console, $($arg)*);
     }};
@@ -188,7 +191,7 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
                 seed_kernel_rng(seed);
             }
 
-            #[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+            #[cfg(all(target_arch = "x86_64", any(feature = "storage-selftest", feature = "interactive-session")))]
             mount_root_fs_early();
 
             bring_up_mmu(&handoff);
@@ -520,6 +523,28 @@ fn run_ring3_demo(
         // monitor `sendkey`; on real hardware, a physical keypress.
         demonstrate_keyboard_input();
 
+        // Ring-3 park/resume demonstration (proves the per-lane context
+        // mechanism: trap saves full user state -> park -> resume from the trap
+        // point). Install the context-saving syscall stub for the demo, then
+        // restore the default stub so the normal app flow below is unaffected.
+        #[cfg(feature = "ring3-resume-demo")]
+        {
+            crate::arch::idt::set_ctx_saving_syscall_vector();
+            crate::loader::run_resume_demo(frames, phys_to_ptr);
+            crate::arch::idt::set_default_syscall_vector();
+        }
+
+        // Ring-3 multilane demonstration (selector-owned Ring3Table): two ring-3
+        // lanes, the canonical Scheduler picks the next ready one, a lane that
+        // yields parks and another runs, then the parked lane resumes. Same
+        // vector-swap discipline so the normal app flow below is unaffected.
+        #[cfg(feature = "ring3-multilane-demo")]
+        {
+            crate::arch::idt::set_ctx_saving_syscall_vector();
+            crate::ring3::run_multilane_demo(frames, phys_to_ptr, multilane_seed());
+            crate::arch::idt::set_default_syscall_vector();
+        }
+
         // Load and run an EXTERNAL application image (.capp), not an embedded
         // code blob: the `hello` app is assembled and wrapped into a .capp at
         // build time (see build.rs) and embedded here via include_bytes!. The
@@ -658,10 +683,74 @@ fn run_ring3_demo(
                 }
             }
         }
+
+        // LIVE interactive session (no injected commands): a real person types
+        // the profile/password into login-rs, and on a GRANTED login, the shell
+        // commands into shell-rs. Same gated boot->login->session flow as the
+        // injected selftest above, but driven entirely by the live keyboard
+        // (blocking ReadKey -> IRQ1). Opt-in via `interactive-session`.
+        #[cfg(all(target_arch = "x86_64", feature = "interactive-session"))]
+        {
+            run_interactive_session(frames, phys_to_ptr);
+        }
     }
 }
 
-/// Inject the characters of `s` into the keyboard queue (selftest only).
+/// Run the live login -> gated shell session on the real keyboard (no injection).
+/// login-rs and shell-rs are the same `.capp`s the injected selftest runs; here
+/// they read live keystrokes. The shell starts ONLY on a granted login.
+#[cfg(all(target_arch = "x86_64", feature = "interactive-session"))]
+fn run_interactive_session(
+    frames: &cibos_kernel::FrameAllocator,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) {
+    const LOGIN_RS_CAPP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/login-rs.capp"));
+    const SHELL_RS_CAPP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shell-rs.capp"));
+
+    kprintln!("");
+    kprintln!("CIBOS kernel: === live interactive session ===");
+    kprintln!("CIBOS kernel: type at the prompts below (real keyboard).");
+
+    let Ok(login_image) = shared::AppImage::parse(LOGIN_RS_CAPP) else {
+        kprintln!("CIBOS kernel: interactive: login image parse failed");
+        return;
+    };
+
+    // Run the login gate on the live keyboard. A granted login returns 0.
+    // SAFETY: single-threaded bring-up; GDT/TSS+IDT installed, IRQs live, and the
+    // frame allocator + identity phys map are valid (same preconditions as the
+    // injected selftest's launches).
+    let granted = match unsafe {
+        crate::loader::run_app_image_isolated(frames, &login_image, phys_to_ptr)
+    } {
+        Ok(0) => {
+            kprintln!("CIBOS kernel: login GRANTED — starting your session");
+            true
+        }
+        Ok(code) => {
+            kprintln!("CIBOS kernel: login DENIED (code {code})");
+            false
+        }
+        Err(e) => {
+            kprintln!("CIBOS kernel: login launch failed: {e}");
+            false
+        }
+    };
+
+    // The shell is the user's session — launched ONLY on a granted login.
+    if granted {
+        if let Ok(shell_image) = shared::AppImage::parse(SHELL_RS_CAPP) {
+            kprintln!("CIBOS kernel: --- shell session ---");
+            // SAFETY: as above.
+            match unsafe {
+                crate::loader::run_app_image_isolated(frames, &shell_image, phys_to_ptr)
+            } {
+                Ok(code) => kprintln!("CIBOS kernel: shell session ended (code {code})"),
+                Err(e) => kprintln!("CIBOS kernel: shell launch failed: {e}"),
+            }
+        }
+    }
+}
 #[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
 fn inject_text(s: &str) {
     for c in s.chars() {
@@ -723,7 +812,7 @@ fn demonstrate_fs_syscalls() {
 /// Probe the slave data disk, format a fresh CIBOSFS, seed `/etc/`, and install
 /// it as the kernel's root filesystem (`ROOT_FS`) — done before the user apps
 /// run so a ring-3 `.capp` can issue filesystem syscalls against it.
-#[cfg(all(target_arch = "x86_64", feature = "storage-selftest"))]
+#[cfg(all(target_arch = "x86_64", any(feature = "storage-selftest", feature = "interactive-session")))]
 fn mount_root_fs_early() {
     use cibos_kernel::fs::{Fs, FsError};
     // SAFETY: single-threaded bring-up; probes the primary slave ATA ports.
@@ -1153,7 +1242,7 @@ fn bring_up_mmu(_handoff: &HandoffData) {
 /// [`cibos_kernel::AddressSpaceManager`] before copying — the dispatcher and ABI
 /// are unchanged by that.
 #[cfg(target_arch = "x86_64")]
-struct KernelSyscallEnv;
+pub(crate) struct KernelSyscallEnv;
 
 /// The kernel's optionally-mounted root filesystem (CIBOSFS over the ATA data
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they
@@ -1170,38 +1259,111 @@ static ROOT_FS: cibos_kernel::sync::SpinLock<
 static KERNEL_RNG: cibos_kernel::sync::SpinLock<Option<cibos_kernel::entropy::Csprng>> =
     cibos_kernel::sync::SpinLock::new(None);
 
-/// A single local (intra-boundary) bounded channel: a FIFO of buffered messages
-/// with a fixed message capacity. This is the `Channel::new_local` contract from
-/// the canonical API reference — point-to-point, bounded, back-pressured. A full
-/// buffer surfaces as `WouldBlock` (Catch-and-Release back-pressure); an empty
-/// open buffer also surfaces as `WouldBlock` so a cooperative caller parks.
+/// A boundary-aware handle table over the CANONICAL `Channel` (the real channel
+/// system: terms, sender/receiver waiters, KernelInterface back-pressure). Maps
+/// `(boundary, handle) -> Channel`. Both endpoints of a cross-boundary channel
+/// register a handle pointing at the SAME `Channel` (the canonical handle is a
+/// cheap Arc-backed clone), so bytes sent by one boundary are received by the
+/// other THROUGH THE KERNEL — never via shared user memory. This unifies the
+/// syscall channel path onto the canonical Channel (no separate LocalChannel).
 #[cfg(target_arch = "x86_64")]
-struct LocalChannel {
-    capacity: usize,
-    max_message_bytes: usize,
-    queue: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+struct ChannelHandleTable {
+    next_handle: u64,
+    /// (boundary, handle) -> the shared canonical channel.
+    handles: alloc::collections::BTreeMap<(u64, u64), cibos_kernel::channel::Channel>,
+    /// The registry that mints channels and runs the request/accept handshake.
+    registry: cibos_kernel::channel::ChannelRegistry,
+    /// Accepted requests awaiting the requester's outcome poll: request_id ->
+    /// (requester boundary, the handle minted for the requester). Populated by
+    /// `accept_channel`, consumed by `poll_channel_outcome`. This is how the
+    /// REQUESTER learns its endpoint handle after the target accepted.
+    accepted: alloc::collections::BTreeMap<u64, (u64, u64)>,
+    /// The kernel-side Lattice: Gate registry (bind/connect/accept/Warden) whose
+    /// Links are canonical Channels registered in `handles` like any other.
+    gates: cibos_kernel::gate::GateRegistry,
+    /// Monotonic source of ChannelIds for Lattice Links (each Link is one Channel).
+    next_channel_id: u64,
+    /// The scheduler used as the channels' KernelInterface for back-pressure
+    /// wakeups (the SAME selector that dispatches the ring-3 lanes).
+    kernel: alloc::sync::Arc<dyn shared::KernelInterface>,
 }
 
-/// The kernel's local channel table: opaque handle -> channel. Mirrors the
-/// `ROOT_FS` pattern (spinlock-guarded, single owner — no global lock held
-/// across a wait). Handles are allocated by a monotonic counter.
-///
-/// HONEST BOUNDARY: this backs ring-3 `OpenChannel`/`ChannelSend`/`ChannelRecv`
-/// for the local intra-boundary case. Cross-boundary channels (with the
-/// requester-proposes / receiver-accepts-or-rejects policy from the API
-/// reference) and `.await`-parking of a *live* ring-3 lane both depend on the
-/// live-session work (apps still run one-at-a-time via `run_app_image_isolated`),
-/// and are deferred — flagged, not faked. The `WouldBlock` return is the correct
-/// contract for when that cooperative parking lands.
 #[cfg(target_arch = "x86_64")]
-static CHANNEL_TABLE: cibos_kernel::sync::SpinLock<
-    Option<(u64, alloc::collections::BTreeMap<u64, LocalChannel>)>,
-> = cibos_kernel::sync::SpinLock::new(None);
+impl ChannelHandleTable {
+    #[cfg(feature = "ring3-multilane-demo")]
+    fn new(kernel: alloc::sync::Arc<dyn shared::KernelInterface>) -> Self {
+        Self {
+            next_handle: 0,
+            handles: alloc::collections::BTreeMap::new(),
+            registry: cibos_kernel::channel::ChannelRegistry::new(),
+            accepted: alloc::collections::BTreeMap::new(),
+            gates: cibos_kernel::gate::GateRegistry::new(),
+            next_channel_id: 0x1000_0000,
+            kernel,
+        }
+    }
+
+    /// Register `channel` under `boundary`, returning the new handle.
+    #[cfg_attr(not(feature = "ring3-multilane-demo"), allow(dead_code))]
+    fn register(&mut self, boundary: u64, channel: cibos_kernel::channel::Channel) -> u64 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.handles.insert((boundary, handle), channel);
+        handle
+    }
+
+    /// Resolve a `(boundary, handle)` to its channel (a cheap clone-handle).
+    fn resolve(&self, boundary: u64, handle: u64) -> Option<cibos_kernel::channel::Channel> {
+        self.handles.get(&(boundary, handle)).cloned()
+    }
+}
+
+/// The kernel's channel handle table (boundary-aware, over the canonical Channel).
+/// Mirrors the `ROOT_FS` static pattern (spinlock-guarded, brief locks — never
+/// held across a wait). Installed once the scheduler is available.
+#[cfg(target_arch = "x86_64")]
+static CHANNEL_TABLE: cibos_kernel::sync::SpinLock<Option<ChannelHandleTable>> =
+    cibos_kernel::sync::SpinLock::new(None);
+
+/// A handle to the kernel's syscall environment (a unit struct). Lets in-kernel
+/// demonstrations exercise the SAME `SyscallEnv` methods the ring-3 dispatch
+/// calls (e.g. the cross-boundary channel handshake), without a ring-3 trap.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+#[must_use]
+pub fn kernel_syscall_env() -> KernelSyscallEnv {
+    KernelSyscallEnv
+}
+
+/// Install the channel handle table, backed by `kernel` (the selector's
+/// scheduler) for back-pressure wakeups. Idempotent for a run.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn install_channel_table(kernel: alloc::sync::Arc<dyn shared::KernelInterface>) {
+    *CHANNEL_TABLE.lock() = Some(ChannelHandleTable::new(kernel));
+}
+
+/// Tear down the channel handle table after a run.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn clear_channel_table() {
+    *CHANNEL_TABLE.lock() = None;
+}
 
 /// Seed the kernel CSPRNG from the firmware entropy seed. Called once at boot.
 #[cfg(target_arch = "x86_64")]
 fn seed_kernel_rng(seed: [u8; 32]) {
     *KERNEL_RNG.lock() = Some(cibos_kernel::entropy::Csprng::from_seed(seed));
+}
+
+/// Draw a 32-byte entropy seed from the kernel RNG for the multilane selector
+/// (the Scheduler seeds its weighted-entropy CSPRNG from this). Falls back to a
+/// fixed seed if the RNG is unavailable — the demo's correctness does not depend
+/// on the seed value, only on the selector's Ready/Stalled mechanics.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn multilane_seed() -> [u8; 32] {
+    let mut seed = [0x5Au8; 32];
+    if let Some(rng) = KERNEL_RNG.lock().as_mut() {
+        rng.fill_bytes(&mut seed);
+    }
+    seed
 }
 
 /// Map a filesystem error onto the syscall ABI error set.
@@ -1411,22 +1573,17 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
         if !blocking {
             return SyscallError::NotFound.as_return();
         }
-        // Block efficiently using the timer's bounded wait primitive: sleep via
-        // `hlt` until a key arrives or the timeout elapses. `wait_ticks_or` is
-        // the established building block for "wait for input up to a deadline";
-        // the steady PIT tick guarantees this always terminates.
-        // SAFETY: interrupts are enabled and the timer/keyboard IRQs are live by
-        // the time user code runs.
-        let got = unsafe {
-            crate::timer::wait_ticks_or(
-                crate::timer::millis_to_ticks(30_000),
-                crate::keyboard::has_key,
-            )
-        };
-        if got {
-            if let Some(ev) = crate::keyboard::poll_key() {
-                return map(ev);
-            }
+        // True blocking read: sleep the CPU with `hlt` until a key actually
+        // arrives, however long the user pauses (no deadline) — required for a
+        // live interactive session. The injected selftest path never reaches here
+        // because it pre-fills the queue, so `poll_key` above returns immediately.
+        // SAFETY: interrupts are enabled and the keyboard IRQ is live by the time
+        // user code runs, so a keystroke will eventually wake the `hlt`.
+        unsafe {
+            crate::timer::wait_for(crate::keyboard::has_key);
+        }
+        if let Some(ev) = crate::keyboard::poll_key() {
+            return map(ev);
         }
         SyscallError::NotFound.as_return()
     }
@@ -1443,83 +1600,375 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
 
     fn open_channel(
         &self,
-        _boundary: shared::BoundaryId,
+        boundary: shared::BoundaryId,
         capacity: usize,
         max_message_bytes: usize,
     ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::ipc::{ChannelDirection, ChannelTerms};
+        use shared::protocols::syscall::SyscallError;
+
         let mut guard = CHANNEL_TABLE.lock();
-        // Lazily initialise the table on first use (handle counter, map).
-        let table = guard.get_or_insert_with(|| (0, alloc::collections::BTreeMap::new()));
-        let handle = table.0;
-        table.0 += 1;
-        table.1.insert(
-            handle,
-            LocalChannel {
-                capacity,
-                max_message_bytes,
-                queue: alloc::collections::VecDeque::new(),
-            },
-        );
-        Ok(handle)
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+
+        // A same-boundary channel: build canonical terms and mint a real Channel
+        // (the same kind cross-boundary accept produces), registered under the
+        // caller's boundary. `OpenChannel` is the intra-boundary convenience; the
+        // cross-boundary path goes through request/accept (see request_channel).
+        let terms = ChannelTerms::new(
+            "syscall",
+            ChannelDirection::Bidirectional,
+            max_message_bytes as u32,
+            capacity.max(1) as u32,
+        )
+        .map_err(|_| SyscallError::InvalidArgument)?;
+        let channel = table.registry.create(&terms, table.kernel.clone());
+        Ok(table.register(boundary.0, channel))
     }
 
     fn channel_send(
         &self,
-        _boundary: shared::BoundaryId,
+        boundary: shared::BoundaryId,
         handle: u64,
         data: &[u8],
     ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::channel::SendStep;
         use shared::protocols::syscall::SyscallError;
-        let mut guard = CHANNEL_TABLE.lock();
-        let Some(table) = guard.as_mut() else {
-            return Err(SyscallError::NotFound);
+
+        // Resolve (caller boundary, handle) -> the shared canonical channel under
+        // a brief lock, then release before try_send (which takes the channel's
+        // own lock and may register a back-pressure wait via the scheduler).
+        let channel = {
+            let guard = CHANNEL_TABLE.lock();
+            let table = guard.as_ref().ok_or(SyscallError::NotFound)?;
+            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
         };
-        let chan = table.1.get_mut(&handle).ok_or(SyscallError::NotFound)?;
-        if data.len() > chan.max_message_bytes {
-            return Err(SyscallError::InvalidArgument);
+
+        // The sending lane is whichever ring-3 lane issued the syscall.
+        let lane = current_syscall_lane();
+        match channel.try_send(lane, data) {
+            SendStep::Sent => Ok(()),
+            // Full buffer: the lane is registered to wait (Catch-and-Release);
+            // surface WouldBlock so a cooperative caller parks/retries.
+            SendStep::Full => Err(SyscallError::WouldBlock),
+            SendStep::Closed => Err(SyscallError::NotFound),
+            SendStep::TooLarge => Err(SyscallError::InvalidArgument),
         }
-        // Full buffer => Catch-and-Release back-pressure, surfaced as WouldBlock.
-        if chan.queue.len() >= chan.capacity {
-            return Err(SyscallError::WouldBlock);
-        }
-        chan.queue.push_back(data.to_vec());
-        Ok(())
     }
 
     fn channel_recv(
         &self,
-        _boundary: shared::BoundaryId,
+        boundary: shared::BoundaryId,
         handle: u64,
     ) -> Result<alloc::vec::Vec<u8>, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::channel::RecvStep;
         use shared::protocols::syscall::SyscallError;
-        let mut guard = CHANNEL_TABLE.lock();
-        let Some(table) = guard.as_mut() else {
-            return Err(SyscallError::NotFound);
+
+        let channel = {
+            let guard = CHANNEL_TABLE.lock();
+            let table = guard.as_ref().ok_or(SyscallError::NotFound)?;
+            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
         };
-        let chan = table.1.get_mut(&handle).ok_or(SyscallError::NotFound)?;
-        // Empty but open => park (WouldBlock). A drained, closed channel would be
-        // NotFound; local channels here have no separate close yet (deferred with
-        // the live-session work), so an empty buffer always parks.
-        chan.queue.pop_front().ok_or(SyscallError::WouldBlock)
+
+        let lane = current_syscall_lane();
+        match channel.try_recv(lane) {
+            RecvStep::Message(bytes) => Ok(bytes),
+            // Empty but open: the lane is registered to wait; surface WouldBlock.
+            RecvStep::Empty => Err(SyscallError::WouldBlock),
+            RecvStep::Closed => Err(SyscallError::NotFound),
+        }
     }
 
     fn spawn(
         &self,
-        _boundary: shared::BoundaryId,
-        _entry: u64,
-        _arg: u64,
+        boundary: shared::BoundaryId,
+        entry: u64,
+        arg: u64,
     ) -> Result<u64, shared::protocols::syscall::SyscallError> {
         use shared::protocols::syscall::SyscallError;
-        // HONEST BOUNDARY: spawning a *live* ring-3 lane requires the cooperative
-        // multi-context loader — a second user context entered via the existing
-        // ring-3 entry path and driven by the single-selector executor. Today a
-        // `.capp` runs synchronously one-at-a-time via `run_app_image_isolated`,
-        // so there is no live ring-3 lane surface to spawn onto yet. Rather than
-        // fabricate a lane id that runs nothing, this reports NotPermitted. The
-        // ABI number, dispatch arm, and ring-3 wrapper are in place so wiring the
-        // real spawn is a localised change once the live session lands.
-        let _ = (_entry, _arg);
-        Err(SyscallError::NotPermitted)
+
+        // With the selector-owned Ring3Table installed (multilane), a ring-3
+        // `spawn` creates a NEW cooperative lane in the CALLER'S boundary,
+        // starting at `entry` (an address already mapped in the caller's space)
+        // with a freshly-mapped stack. This is the join of roadmap 2a (the spawn
+        // syscall) and 2b (the cooperative multi-context loop).
+        #[cfg(feature = "ring3-multilane-demo")]
+        {
+            // Distinct stack per spawned lane (above the two seed lanes' region).
+            static SPAWN_STACK_NEXT: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0x0000_5000_0200_0000);
+            let stack_virt =
+                SPAWN_STACK_NEXT.fetch_add(0x10_0000, core::sync::atomic::Ordering::SeqCst);
+
+            // SAFETY: booted kernel, identity phys map, frames published for the
+            // demo run. Maps into the current (caller's) space.
+            let stack_top = match unsafe { crate::loader::map_spawn_stack(stack_virt) } {
+                Ok(top) => top,
+                Err(_) => return Err(SyscallError::NotPermitted),
+            };
+
+            let mut guard = crate::ring3::RING3_TABLE.lock();
+            let Some(table) = guard.as_mut() else {
+                return Err(SyscallError::NotPermitted);
+            };
+            let lane =
+                table.spawn_lane(entry, stack_top, arg, boundary, shared::WeightClass::User);
+            // `arg` is now marshaled into the new lane's rdi (see spawn_lane).
+            #[allow(clippy::needless_return)]
+            return Ok(lane.0 & (i64::MAX as u64));
+        }
+
+        // HONEST BOUNDARY (no multilane table): without the cooperative loop
+        // installed there is no live ring-3 lane surface to spawn onto, so this
+        // reports NotPermitted rather than fabricating a lane that runs nothing.
+        #[cfg(not(feature = "ring3-multilane-demo"))]
+        {
+            let _ = (boundary, entry, arg);
+            Err(SyscallError::NotPermitted)
+        }
+    }
+
+    fn request_channel(
+        &self,
+        requester: shared::BoundaryId,
+        target: shared::BoundaryId,
+        terms: &shared::protocols::ipc::ChannelTerms,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::ipc::ChannelRequest;
+        use shared::protocols::syscall::SyscallError;
+        let guard = CHANNEL_TABLE.lock();
+        let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+        let req = ChannelRequest { target, terms: terms.clone() };
+        Ok(table.registry.request(requester, &req))
+    }
+
+    fn poll_channel_request(
+        &self,
+        target: shared::BoundaryId,
+        out: &mut [u8],
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::ipc::{ChannelRequestWire, ChannelTermsWire, CHANNEL_REQUEST_WIRE_LEN};
+        use shared::protocols::syscall::SyscallError;
+        let guard = CHANNEL_TABLE.lock();
+        let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+        let (id, requester, terms) = table.registry.poll(target).ok_or(SyscallError::NotFound)?;
+        let wire = ChannelRequestWire {
+            requester: requester.0,
+            terms: ChannelTermsWire::from_terms(&terms),
+        };
+        let bytes = wire.to_bytes();
+        if out.len() < CHANNEL_REQUEST_WIRE_LEN {
+            return Err(SyscallError::InvalidArgument);
+        }
+        out[..CHANNEL_REQUEST_WIRE_LEN].copy_from_slice(&bytes);
+        Ok(id)
+    }
+
+    fn accept_channel(
+        &self,
+        target: shared::BoundaryId,
+        request_id: u64,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+        // Accept WHOLESALE: create the one canonical channel; register a handle
+        // for BOTH the target (returned now) and the requester (stored for its
+        // outcome poll). Both handles point at the SAME channel.
+        let kernel = table.kernel.clone();
+        let (channel, requester) = table
+            .registry
+            .accept(request_id, target, kernel)
+            .ok_or(SyscallError::NotPermitted)?;
+        let target_handle = table.register(target.0, channel.clone());
+        let requester_handle = table.register(requester.0, channel);
+        table.accepted.insert(request_id, (requester.0, requester_handle));
+        Ok(target_handle)
+    }
+
+    fn reject_channel(
+        &self,
+        target: shared::BoundaryId,
+        request_id: u64,
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let guard = CHANNEL_TABLE.lock();
+        let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+        if table.registry.reject(request_id, target) {
+            Ok(())
+        } else {
+            Err(SyscallError::NotFound)
+        }
+    }
+
+    fn poll_channel_outcome(
+        &self,
+        requester: shared::BoundaryId,
+        request_id: u64,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+        // Accepted: hand the requester its stored handle (consume the record).
+        if let Some(&(req_boundary, handle)) = table.accepted.get(&request_id) {
+            if req_boundary == requester.0 {
+                table.accepted.remove(&request_id);
+                return Ok(handle);
+            }
+            // A different boundary cannot claim this outcome.
+            return Err(SyscallError::NotPermitted);
+        }
+        // Still pending -> WouldBlock; otherwise rejected/unknown -> NotFound.
+        if table.registry.is_pending(request_id) {
+            Err(SyscallError::WouldBlock)
+        } else {
+            Err(SyscallError::NotFound)
+        }
+    }
+
+    fn gate_bind(
+        &self,
+        owner: shared::BoundaryId,
+        gate: u16,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::gate::GateError;
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+        match table.gates.bind(owner, gate) {
+            Ok(()) => Ok(u64::from(gate)), // the listener handle IS the gate number
+            Err(GateError::Blocked) | Err(GateError::AlreadyBound) => Err(SyscallError::NotPermitted),
+            Err(_) => Err(SyscallError::InvalidArgument),
+        }
+    }
+
+    fn gate_connect(
+        &self,
+        from: shared::BoundaryId,
+        gate: u16,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::gate::GateError;
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+        // Mint a fresh ChannelId for this Link and connect.
+        let cid = shared::ChannelId::new(table.next_channel_id);
+        table.next_channel_id += 1;
+        let kernel = table.kernel.clone();
+        let link = match table.gates.connect(from, gate, kernel, cid) {
+            Ok(l) => l,
+            Err(GateError::Blocked) => return Err(SyscallError::NotPermitted),
+            Err(GateError::Refused) => return Err(SyscallError::NotFound),
+            Err(_) => return Err(SyscallError::InvalidArgument),
+        };
+        // Register the connector's half as a Link handle in this boundary.
+        Ok(table.register(from.0, link))
+    }
+
+    fn gate_accept(
+        &self,
+        owner: shared::BoundaryId,
+        gate: u16,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::gate::GateError;
+        use shared::protocols::syscall::SyscallError;
+        let mut guard = CHANNEL_TABLE.lock();
+        let table = guard.as_mut().ok_or(SyscallError::NotPermitted)?;
+        let (link, _from) = match table.gates.accept(owner, gate) {
+            Ok(v) => v,
+            Err(GateError::WouldBlock) => return Err(SyscallError::WouldBlock),
+            Err(GateError::NotOwner) => return Err(SyscallError::NotPermitted),
+            Err(_) => return Err(SyscallError::NotFound),
+        };
+        // Register the listener's half as a Link handle in the owner's boundary.
+        Ok(table.register(owner.0, link))
+    }
+
+    fn link_send(
+        &self,
+        boundary: shared::BoundaryId,
+        handle: u64,
+        data: &[u8],
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::channel::SendStep;
+        use shared::protocols::syscall::SyscallError;
+        let link = {
+            let guard = CHANNEL_TABLE.lock();
+            let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
+        };
+        match link.try_send(current_syscall_lane(), data) {
+            SendStep::Sent => Ok(()),
+            SendStep::Full => Err(SyscallError::WouldBlock),
+            SendStep::Closed => Err(SyscallError::NotFound),
+            SendStep::TooLarge => Err(SyscallError::InvalidArgument),
+        }
+    }
+
+    fn link_recv(
+        &self,
+        boundary: shared::BoundaryId,
+        handle: u64,
+    ) -> Result<alloc::vec::Vec<u8>, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::channel::RecvStep;
+        use shared::protocols::syscall::SyscallError;
+        let link = {
+            let guard = CHANNEL_TABLE.lock();
+            let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
+        };
+        match link.try_recv(current_syscall_lane()) {
+            RecvStep::Message(bytes) => Ok(bytes),
+            RecvStep::Empty => Err(SyscallError::WouldBlock),
+            RecvStep::Closed => Err(SyscallError::NotFound),
+        }
+    }
+
+    fn link_close(
+        &self,
+        boundary: shared::BoundaryId,
+        handle: u64,
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let link = {
+            let guard = CHANNEL_TABLE.lock();
+            let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
+        };
+        link.close();
+        Ok(())
+    }
+
+    fn warden_set(
+        &self,
+        _boundary: shared::BoundaryId,
+        gate: u16,
+        allow: bool,
+    ) -> Result<(), shared::protocols::syscall::SyscallError> {
+        use shared::protocols::syscall::SyscallError;
+        let guard = CHANNEL_TABLE.lock();
+        let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+        if allow {
+            table.gates.warden_allow(gate);
+        } else {
+            table.gates.warden_deny(gate);
+        }
+        Ok(())
+    }
+
+    fn gate_probe(
+        &self,
+        _boundary: shared::BoundaryId,
+        gate: u16,
+    ) -> Result<u64, shared::protocols::syscall::SyscallError> {
+        use cibos_kernel::gate::GateState;
+        use shared::protocols::syscall::SyscallError;
+        let guard = CHANNEL_TABLE.lock();
+        let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
+        Ok(match table.gates.probe(gate) {
+            GateState::Closed => 0,
+            GateState::Open => 1,
+            GateState::Blocked => 2,
+        })
     }
 }
 
@@ -1528,14 +1977,38 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
 #[cfg(target_arch = "x86_64")]
 pub fn handle_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     use cibos_kernel::{dispatch_syscall, SyscallOutcome, SyscallRequest};
+
+    // Attribute the syscall to the RUNNING ring-3 lane's real boundary when a
+    // selector-owned lane is active; otherwise (normal .capp / single-resume /
+    // kernel paths) attribute to the system boundary. This is what makes the
+    // dispatcher's boundary-aware calls (open_channel, spawn) enforce the real
+    // security principal instead of a stand-in.
+    let boundary = {
+        #[cfg(feature = "ring3-multilane-demo")]
+        {
+            let lane = active_lane();
+            if lane.0 != 0 {
+                crate::ring3::RING3_TABLE
+                    .lock()
+                    .as_ref()
+                    .and_then(|t| t.boundary_of(lane))
+                    .unwrap_or(shared::BoundaryId::SYSTEM)
+            } else {
+                shared::BoundaryId::SYSTEM
+            }
+        }
+        #[cfg(not(feature = "ring3-multilane-demo"))]
+        {
+            shared::BoundaryId::SYSTEM
+        }
+    };
+
     let req = SyscallRequest {
         number,
         arg0,
         arg1,
         arg2,
-        // Until ring-3 boundaries issue traps, attribute syscalls to the system
-        // boundary. The dispatcher does not rely on this for the current calls.
-        boundary: shared::BoundaryId::SYSTEM,
+        boundary,
     };
     match dispatch_syscall(&req, &KernelSyscallEnv) {
         SyscallOutcome::Return(v) => v,
@@ -1550,6 +2023,167 @@ pub fn handle_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
             unsafe { crate::loader::return_to_kernel(code as i64) }
         }
     }
+}
+
+// ---- Per-lane ring-3 context: park + resume (the live-context prerequisite) --
+//
+// The context-saving trap stub (`user_ctx_trap_entry` in resume_user.s) saves
+// the trapped lane's FULL register state into `USER_CTX_SAVE` before calling
+// `handle_user_trap`. This is the load-bearing mechanism the live-context design
+// note identifies as the shared prerequisite for `spawn` and cross-boundary
+// channels: a ring-3 lane the kernel can park and resume exactly where it
+// trapped.
+// ---- Per-lane ring-3 context: park + resume (the live-context prerequisite) --
+//
+// The context-saving trap stub (`user_ctx_trap_entry` in resume_user.s) saves
+// the trapped lane's FULL register state into `*CURRENT_USER_CTX` before calling
+// `handle_user_trap`. This is the load-bearing mechanism the live-context design
+// note identifies as the shared prerequisite for `spawn` and cross-boundary
+// channels. Shared by both the single-lane resume demo and the multilane
+// (selector-owned table) demo.
+
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+extern "C" {
+    /// Set by the kernel to point at the running lane's `SavedUserContext`; the
+    /// trap stub saves into `*CURRENT_USER_CTX`. Switching lanes repoints this.
+    pub static mut CURRENT_USER_CTX: *mut arch::ring3_ctx::SavedUserContext;
+    /// Unwind a resumed lane's `exit` to the `resume_user_context` call site.
+    fn return_to_saved_kernel(code: i64) -> !;
+}
+
+/// The kernel-side register snapshot a `resume_user_context` saves so a resumed
+/// lane's `exit` can unwind back to the kernel. Caller-owned (one per in-flight
+/// resume) — mirrors `enter_user.s`'s KERNEL_CTX but without the single-global
+/// limitation, so nested/sequential resumes stay correct. Layout (8 quadwords):
+/// rsp, rbx, rbp, r12, r13, r14, r15, return_addr.
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KernelReturnContext {
+    slots: [u64; 8],
+}
+
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+impl KernelReturnContext {
+    pub const fn zeroed() -> Self {
+        Self { slots: [0; 8] }
+    }
+}
+
+/// Point `CURRENT_USER_CTX` at `ctx` (the running lane's context). The selector
+/// calls this before resuming each lane, so a trap saves back into that lane.
+///
+/// # Safety
+/// `ctx` must outlive the lane's run (the Ring3Table owns it for the demo).
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn set_current_user_ctx(ctx: *mut arch::ring3_ctx::SavedUserContext) {
+    CURRENT_USER_CTX = ctx;
+}
+
+/// In the multilane loop EVERY lane is entered via `resume_user_context`, so
+/// every lane's `exit` must unwind through `return_to_saved_kernel`. The table
+/// calls this before resuming a lane; `handle_user_trap` then routes that lane's
+/// `Exit` accordingly. `LaneId` recorded for the boundary lookup (step 4).
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+static ACTIVE_LANE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn set_active_lane(lane: shared::LaneId) {
+    ACTIVE_LANE_ID.store(lane.0, core::sync::atomic::Ordering::SeqCst);
+    // Every multilane lane is entered via resume_user_context: route its exit.
+    LANE_WAS_RESUMED.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Clear the active-lane record (0 = none) once a lane returns to the selector,
+/// so syscalls issued outside any ring-3 lane attribute to the system boundary.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn clear_active_lane() {
+    ACTIVE_LANE_ID.store(0, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// The lane the selector is currently running (0 = none). Read by the trap so
+/// per-lane decisions (boundary, exit routing) use the right lane. Used by
+/// step 4 to read the lane's real boundary instead of hardcoded SYSTEM.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+#[must_use]
+pub fn active_lane() -> shared::LaneId {
+    shared::LaneId(ACTIVE_LANE_ID.load(core::sync::atomic::Ordering::SeqCst))
+}
+
+/// The lane id to attribute a channel syscall to: the running ring-3 lane under
+/// the multilane selector, or lane 0 otherwise (single-run paths). Channels use
+/// this as the waiter id for back-pressure.
+#[cfg(target_arch = "x86_64")]
+fn current_syscall_lane() -> shared::LaneId {
+    #[cfg(feature = "ring3-multilane-demo")]
+    {
+        let l = active_lane();
+        if l.0 != 0 {
+            return l;
+        }
+    }
+    shared::LaneId(0)
+}
+
+/// Whether the next `Yield` should PARK the lane (true once, for the single-lane
+/// resume demo). The multilane loop parks on every yield via its own handler.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-resume-demo"))]
+static PARK_NEXT_YIELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Set true once a lane has been resumed via `resume_user_context`, so its
+/// `exit` unwinds through `return_to_saved_kernel` (the per-resume kernel
+/// context) rather than the original `enter_user_context` slot.
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+static LANE_WAS_RESUMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Mark that a lane has been resumed, so its `exit` routes through
+/// `return_to_saved_kernel`. Called just before `resume_user_context`.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-resume-demo"))]
+pub fn mark_lane_resumed() {
+    LANE_WAS_RESUMED.store(true, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Rust handler for the context-saving trap path. Mirrors `handle_syscall` but
+/// adds the park decision. On `Yield` the lane parks (its full context is saved
+/// in `*CURRENT_USER_CTX`); the kernel resumes it later. A lane entered via
+/// `resume_user_context` routes its `Exit` through `return_to_saved_kernel`.
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+pub fn handle_user_trap(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    use core::sync::atomic::Ordering;
+    use shared::protocols::syscall::Syscall;
+
+    // Single-lane demo: park only on the FIRST yield (one round-trip proof).
+    #[cfg(feature = "ring3-resume-demo")]
+    if number == Syscall::Yield.number() && PARK_NEXT_YIELD.swap(false, Ordering::SeqCst) {
+        // SAFETY: reached from a ring-3 trap; the user context is already saved.
+        unsafe { crate::loader::return_to_kernel(crate::loader::PARKED_SENTINEL) }
+    }
+
+    // Multilane demo: EVERY yield parks the lane and returns to the selector,
+    // which then dispatches the next ready lane. The lane was entered via
+    // resume_user_context, so we unwind through ITS saved kernel frame
+    // (return_to_saved_kernel) — NOT return_to_kernel (whose KERNEL_CTX is unset
+    // on this path). The PARKED_SENTINEL tells the selector the lane parked.
+    #[cfg(feature = "ring3-multilane-demo")]
+    if number == Syscall::Yield.number() {
+        // SAFETY: the lane was entered via resume_user_context (ACTIVE_KERNEL_CTX
+        // points at its saved frame); the user context is saved in
+        // *CURRENT_USER_CTX by the trap stub.
+        unsafe { return_to_saved_kernel(crate::loader::PARKED_SENTINEL) }
+    }
+
+    // A lane entered via resume_user_context must unwind its exit to that call
+    // site (return_to_saved_kernel), not the original enter_user_context slot.
+    if number == Syscall::Exit.number() && LANE_WAS_RESUMED.load(Ordering::SeqCst) {
+        // SAFETY: a resume_user_context is live, so ACTIVE_KERNEL_CTX points at
+        // its saved frame.
+        unsafe { return_to_saved_kernel(arg0 as i64) }
+    }
+
+    // Otherwise: ordinary syscall semantics (resumes the same lane inline).
+    handle_syscall(number, arg0, arg1, arg2)
 }
 
 #[panic_handler]

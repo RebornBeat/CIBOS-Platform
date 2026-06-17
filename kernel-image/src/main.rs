@@ -15,9 +15,12 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 mod arch;
 #[cfg(target_os = "none")]
+#[macro_use]
 mod boot;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod loader;
+#[cfg(all(target_os = "none", target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+mod ring3;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod keyboard;
 #[cfg(all(target_os = "none", target_arch = "x86_64", feature = "gui-demo"))]

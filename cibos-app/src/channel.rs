@@ -121,3 +121,127 @@ pub fn spawn(entry: u64, arg: u64) -> Result<LaneHandle, SyscallError> {
     let ret = unsafe { syscall3(Syscall::Spawn, entry, arg, 0) };
     decode(ret).map(|l| LaneHandle(l as u64))
 }
+
+// ---- Cross-boundary channel handshake ---------------------------------------
+//
+// These map the canonical request/accept-or-reject model onto ring-3:
+//   * `request_channel` proposes terms to a TARGET boundary; returns a request
+//     id. No channel exists yet.
+//   * the target `poll_channel_request`s to see pending proposals aimed at it,
+//     then `accept_channel` (accept-ALL) or `reject_channel`.
+//   * the requester `poll_channel_outcome`s its request id to learn its channel
+//     handle once accepted (WouldBlock while pending, NotFound if rejected).
+// On accept BOTH ends hold a handle to the SAME kernel channel; bytes flow
+// through the kernel via the normal `send`/`recv`.
+
+use shared::protocols::ipc::{
+    ChannelDirection, ChannelRequestWire, ChannelTerms, ChannelTermsWire,
+    CHANNEL_REQUEST_WIRE_LEN, CHANNEL_TERMS_WIRE_LEN,
+};
+
+/// A pending cross-boundary request identifier (returned by [`request_channel`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    /// The raw request id.
+    #[must_use]
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// What a receiver learns about a pending request: who asked, and the proposed
+/// terms (which it accepts wholesale or rejects).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IncomingRequest {
+    /// The request id to accept or reject.
+    pub id: RequestId,
+    /// The boundary that issued the request.
+    pub requester: u64,
+    /// The maximum message size proposed.
+    pub max_message_bytes: u32,
+    /// The buffer capacity proposed.
+    pub buffer_capacity: u32,
+}
+
+/// Propose a cross-boundary channel to `target_boundary` with the given terms.
+/// Returns a [`RequestId`]; poll its outcome with [`poll_channel_outcome`].
+pub fn request_channel(
+    target_boundary: u64,
+    purpose: &str,
+    direction: ChannelDirection,
+    max_message_bytes: u32,
+    buffer_capacity: u32,
+) -> Result<RequestId, SyscallError> {
+    let terms = ChannelTerms::new(purpose, direction, max_message_bytes, buffer_capacity)
+        .map_err(|_| SyscallError::InvalidArgument)?;
+    let bytes = ChannelTermsWire::from_terms(&terms).to_bytes();
+    // SAFETY: bytes is a valid readable buffer of exactly CHANNEL_TERMS_WIRE_LEN;
+    // the kernel validates the pointer against the calling boundary and copies it.
+    let ret = unsafe {
+        syscall3(
+            Syscall::RequestChannel,
+            target_boundary,
+            bytes.as_ptr() as u64,
+            CHANNEL_TERMS_WIRE_LEN as u64,
+        )
+    };
+    decode(ret).map(|id| RequestId(id as u64))
+}
+
+/// Poll for the next pending request aimed at THIS boundary. Returns
+/// `Ok(Some(..))` with the request to decide, `Ok(None)` if none is pending.
+pub fn poll_channel_request() -> Result<Option<IncomingRequest>, SyscallError> {
+    let mut buf = [0u8; CHANNEL_REQUEST_WIRE_LEN];
+    // SAFETY: buf is a valid writable buffer of exactly CHANNEL_REQUEST_WIRE_LEN;
+    // the kernel writes the encoded request into it.
+    let ret = unsafe {
+        syscall3(
+            Syscall::PollChannelRequest,
+            buf.as_mut_ptr() as u64,
+            CHANNEL_REQUEST_WIRE_LEN as u64,
+            0,
+        )
+    };
+    match decode(ret) {
+        Ok(id) => {
+            let wire = ChannelRequestWire::from_bytes(&buf);
+            Ok(Some(IncomingRequest {
+                id: RequestId(id as u64),
+                requester: wire.requester,
+                max_message_bytes: wire.terms.max_message_bytes,
+                buffer_capacity: wire.terms.buffer_capacity,
+            }))
+        }
+        Err(SyscallError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Accept a pending request WHOLESALE, returning this end's channel handle.
+pub fn accept_channel(id: RequestId) -> Result<ChannelHandle, SyscallError> {
+    // SAFETY: AcceptChannel takes a scalar request id and no pointers.
+    let ret = unsafe { syscall3(Syscall::AcceptChannel, id.0, 0, 0) };
+    decode(ret).map(|h| ChannelHandle(h as u64))
+}
+
+/// Reject a pending request.
+pub fn reject_channel(id: RequestId) -> Result<(), SyscallError> {
+    // SAFETY: RejectChannel takes a scalar request id and no pointers.
+    let ret = unsafe { syscall3(Syscall::RejectChannel, id.0, 0, 0) };
+    decode(ret).map(|_| ())
+}
+
+/// Poll the outcome of a request this boundary made. `Ok(Some(handle))` once the
+/// target accepted; `Ok(None)` while still pending (WouldBlock); `Err(NotFound)`
+/// if the request was rejected or is unknown.
+pub fn poll_channel_outcome(id: RequestId) -> Result<Option<ChannelHandle>, SyscallError> {
+    // SAFETY: PollChannelOutcome takes a scalar request id and no pointers.
+    let ret = unsafe { syscall3(Syscall::PollChannelOutcome, id.0, 0, 0) };
+    match decode(ret) {
+        Ok(h) => Ok(Some(ChannelHandle(h as u64))),
+        Err(SyscallError::WouldBlock) => Ok(None),
+        Err(e) => Err(e),
+    }
+}

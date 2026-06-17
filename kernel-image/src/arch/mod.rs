@@ -19,6 +19,8 @@ pub mod ata;
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub mod paging;
+#[cfg(all(target_arch = "x86_64", any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo")))]
+pub mod ring3_ctx;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     halt, inb_port, init_pit, init_serial, inw, outb_port, outw, pic_eoi, putc, read_keyboard_data,

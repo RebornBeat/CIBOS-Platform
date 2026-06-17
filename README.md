@@ -6,7 +6,7 @@ microkernel OS, and **HIP** (Hybrid Isolation Paradigm) is its isolation model:
 the security principal is the *boundary*, not a user account, and isolation is
 binary — maximal or none, never tiered.
 
-Everything here is real, compiles, and is covered by **298 unit tests** plus
+Everything here is real, compiles, and is covered by **338 unit tests** plus
 doctests and the application/example suites. There are no placeholders or mocks.
 Where a capability genuinely depends on hardware, that boundary is called out
 honestly in the docs rather than faked.
@@ -48,6 +48,17 @@ runtime) loaded into ring 3 that reach the kernel through the syscall ABI.
   inodes + directories) over a portable `BlockDevice` trait; and a `.capp`
   external-application format whose images are loaded into ring 3 — including a
   **Rust** application built on the `cibos-app` `no_std` runtime.
+* **Live ring-3 multi-context + cross-boundary IPC (runtime-verified in QEMU)** —
+  a selector-owned table of cooperative ring-3 lanes, each with its own saved CPU
+  context: a lane that traps is parked with its full register state and resumed
+  later from the exact trap point, with the canonical single `Scheduler`
+  (Ready/Stalled + weighted entropy) choosing which lane runs. A ring-3 `spawn`
+  syscall creates a new lane in the caller's boundary; syscalls are attributed to
+  the running lane's real boundary. Channels are the canonical kernel-owned
+  `Channel` (one selector drives both lane dispatch and channel back-pressure); a
+  **cross-boundary channel handshake** (requester proposes terms → target accepts
+  wholesale or rejects, point-to-point) is exposed over syscalls 18–22, and bytes
+  cross boundaries THROUGH the kernel, never via shared user memory.
 * **`cibos-app`** — the `no_std` runtime a ring-3 `.capp` links against: console
   output, filesystem access, and exit, all over the syscall ABI.
 * **Storage** — **Live** (RAM-only, wiped on shutdown, no trace) and

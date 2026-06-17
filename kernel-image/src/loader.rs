@@ -70,6 +70,12 @@ pub unsafe fn return_to_kernel(code: i64) -> ! {
     return_to_kernel(code)
 }
 
+/// Sentinel `enter_user_context` "return" value meaning the lane was PARKED at a
+/// trap (not exited), so its context in `USER_CTX_SAVE` is resumable. Chosen
+/// distinct from any real exit code (apps exit with small non-negative codes).
+#[cfg(any(feature = "ring3-resume-demo", feature = "ring3-multilane-demo"))]
+pub const PARKED_SENTINEL: i64 = -0x7FFF_FFFF;
+
 /// Map the given user code bytes and a stack into `space` as user-accessible
 /// pages, then drop to ring 3 at the code entry. Does not return: the user code
 /// must `exit` (which the kernel handles) or run forever.
@@ -342,4 +348,320 @@ pub unsafe fn run_app_image_isolated(
     crate::arch::paging::install(cibos_kernel::PhysFrame::containing(kernel_root));
 
     Ok(code)
+}
+
+// ---- Ring-3 park/resume demonstration (feature: ring3-resume-demo) ----------
+//
+// Proves the per-lane ring-3 context mechanism end to end: launch a ring-3
+// payload that traps via `yield`; the context-saving trap stub saves its FULL
+// register state into the lane's `SavedUserContext` (pointed to by the kernel-
+// set CURRENT_USER_CTX), the handler PARKS it (returns to the kernel); the
+// kernel then resumes the *same parked context* via `resume_user_context`, and
+// the payload continues from exactly the instruction after `yield`, logs, and
+// exits. This is the load-bearing prerequisite for live multi-context (`spawn`)
+// and cross-boundary channel enforcement (see TRACK2-LIVE-CONTEXT-DESIGN.md).
+//
+// The demo uses ONE lane (one parked context at a time), but the mechanism is
+// arbitrary-lane by construction: the trap saves into *CURRENT_USER_CTX and
+// `resume_*` take the context pointer as an argument, so the selector-owned
+// Ring3Lane table (step 3) reuses this asm unchanged.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-resume-demo"))]
+pub unsafe fn run_resume_demo(
+    frames: &FrameAllocator,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) {
+    use crate::arch::ring3_ctx::SavedUserContext;
+
+    extern "C" {
+        fn enter_user_context(
+            entry: u64,
+            user_stack: u64,
+            user_code_sel: u64,
+            user_data_sel: u64,
+            heap_base: u64,
+            heap_size: u64,
+        ) -> i64;
+        fn resume_user_context(
+            ctx: *const SavedUserContext,
+            kctx: *mut crate::boot::KernelReturnContext,
+        ) -> i64;
+    }
+
+    // Tiny ring-3 payload (assembled from resume_payload2.s; see the design
+    // note). It: yield (rax=3,int 0x80) -> [resume point] -> log(msg) ->
+    // exit(0). Position-independent (msg reached via PC-relative lea).
+    const PAYLOAD: &[u8] = &[
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3   (Yield)
+        0x48, 0x31, 0xff, // xor rdi, rdi
+        0x48, 0x31, 0xf6, // xor rsi, rsi
+        0x48, 0x31, 0xd2, // xor rdx, rdx
+        0xcd, 0x80, // int 0x80   <- traps, saved + parked here
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1   (Log)
+        0x48, 0x8d, 0x3d, 0x20, 0x00, 0x00, 0x00, // lea rdi, [rip+0x20] (msg)
+        0x48, 0xc7, 0xc6, 0x3c, 0x00, 0x00, 0x00, // mov rsi, 0x3c (len 60)
+        0x48, 0x31, 0xd2, // xor rdx, rdx
+        0xcd, 0x80, // int 0x80   (log)
+        0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, // mov rax, 2   (Exit)
+        0x48, 0x31, 0xff, // xor rdi, rdi  (code 0)
+        0xcd, 0x80, // int 0x80   (exit)
+        0xeb, 0xfe, // 1: jmp 1b
+        0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, // nop padding to align msg @ 0x40
+        // msg @ offset 0x40 (60 bytes): "  [ring3] resumed after park, continued from the trap point\n"
+        0x20, 0x20, 0x5b, 0x72, 0x69, 0x6e, 0x67, 0x33, 0x5d, 0x20, 0x72, 0x65,
+        0x73, 0x75, 0x6d, 0x65, 0x64, 0x20, 0x61, 0x66, 0x74, 0x65, 0x72, 0x20,
+        0x70, 0x61, 0x72, 0x6b, 0x2c, 0x20, 0x63, 0x6f, 0x6e, 0x74, 0x69, 0x6e,
+        0x75, 0x65, 0x64, 0x20, 0x66, 0x72, 0x6f, 0x6d, 0x20, 0x74, 0x68, 0x65,
+        0x20, 0x74, 0x72, 0x61, 0x70, 0x20, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x0a,
+    ];
+
+    kprintln!("CIBOS kernel: ring-3 park/resume demo starting");
+
+    // Fresh per-lane address space (the lane's cr3), kernel range identity-mapped
+    // so the trap/handler run after the CR3 switch.
+    let kernel_root = crate::arch::paging::current_root();
+    let space = match AddressSpace::new(frames, phys_to_ptr) {
+        Ok(s) => s,
+        Err(_) => {
+            kprintln!("  resume demo: no frame for space root — skipping");
+            return;
+        }
+    };
+    let kernel_pages = KERNEL_IDENTITY_MAP_BYTES / FRAME_SIZE;
+    if space
+        .map_range::<X86PageTable>(
+            0,
+            0,
+            kernel_pages,
+            Permissions { read: true, write: true, execute: true, user: false },
+            frames,
+            phys_to_ptr,
+        )
+        .is_err()
+    {
+        kprintln!("  resume demo: kernel identity map failed — skipping");
+        return;
+    }
+
+    // Map the payload code page (user rx) and a user stack page (user rw).
+    if run_user_payload_map(&space, frames, PAYLOAD, phys_to_ptr).is_err() {
+        kprintln!("  resume demo: payload map failed — skipping");
+        return;
+    }
+    let user_stack_top = (USER_STACK_VIRT + FRAME_SIZE) & !0xF;
+
+    // The lane's saved context lives here (one lane for the demo). A static is
+    // used so its address is stable for CURRENT_USER_CTX; the selector-owned
+    // table will hold one of these per lane.
+    static mut LANE_CTX: SavedUserContext = SavedUserContext::empty();
+    static mut KRET: crate::boot::KernelReturnContext =
+        crate::boot::KernelReturnContext::zeroed();
+
+    // Point CURRENT_USER_CTX at this lane's context so the trap saves into it.
+    crate::boot::CURRENT_USER_CTX = core::ptr::addr_of_mut!(LANE_CTX);
+
+    // Switch to the lane's space and launch it. enter_user_context returns when
+    // the payload parks (PARKED_SENTINEL via return_to_kernel) or exits.
+    crate::arch::paging::install(space.root());
+    let r1 = enter_user_context(
+        USER_CODE_VIRT,
+        user_stack_top,
+        gdt::USER_CODE as u64,
+        gdt::USER_DATA as u64,
+        0,
+        0,
+    );
+
+    if r1 != PARKED_SENTINEL {
+        crate::arch::paging::install(cibos_kernel::PhysFrame::containing(kernel_root));
+        kprintln!("  resume demo: expected park, got {} — aborting", r1);
+        return;
+    }
+    kprintln!("  lane parked at trap (full user context saved); kernel back in control");
+
+    // Resume the SAME parked context. Mark resumed so its exit unwinds to the
+    // resume_user_context call site (return_to_saved_kernel).
+    crate::boot::mark_lane_resumed();
+    let code = resume_user_context(
+        core::ptr::addr_of!(LANE_CTX),
+        core::ptr::addr_of_mut!(KRET),
+    );
+
+    // Back from ring 3 (the resumed lane exited): restore the kernel's space.
+    crate::arch::paging::install(cibos_kernel::PhysFrame::containing(kernel_root));
+    kprintln!("  lane resumed from the trap point and exited (code {})", code);
+    kprintln!("CIBOS kernel: ring-3 park/resume demo OK");
+}
+
+/// Map a raw payload + a user stack into `space` (helper for the resume demo).
+/// Mirrors the mapping in `run_user_payload` but does not enter ring 3 (the
+/// caller drives entry via `enter_user_context` for park/resume).
+#[cfg(all(target_arch = "x86_64", feature = "ring3-resume-demo"))]
+unsafe fn run_user_payload_map(
+    space: &AddressSpace,
+    frames: &FrameAllocator,
+    code: &[u8],
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<(), &'static str> {
+    if code.len() as u64 > FRAME_SIZE {
+        return Err("payload exceeds one page");
+    }
+    let code_frame = frames.allocate().map_err(|_| "no frame for code")?;
+    let code_ptr = phys_to_ptr(code_frame.addr());
+    core::ptr::write_bytes(code_ptr, 0, FRAME_SIZE as usize);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
+    space
+        .map::<X86PageTable>(USER_CODE_VIRT, code_frame, Permissions::user_rx(), frames, phys_to_ptr)
+        .map_err(|_| "map code failed")?;
+
+    let stack_frame = frames.allocate().map_err(|_| "no frame for stack")?;
+    let stack_ptr = phys_to_ptr(stack_frame.addr());
+    core::ptr::write_bytes(stack_ptr, 0, FRAME_SIZE as usize);
+    space
+        .map::<X86PageTable>(USER_STACK_VIRT, stack_frame, Permissions::user_rw(), frames, phys_to_ptr)
+        .map_err(|_| "map stack failed")?;
+    crate::arch::paging::install(space.root());
+    Ok(())
+}
+
+/// Map a payload + stack for ONE ring-3 lane at caller-chosen virtual addresses
+/// (so multiple lanes coexist in one space). Returns the lane's stack top.
+/// Used by the selector-owned Ring3Table multilane demo.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn map_lane(
+    space: &AddressSpace,
+    frames: &FrameAllocator,
+    code: &[u8],
+    code_virt: u64,
+    stack_virt: u64,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<u64, &'static str> {
+    if code.len() as u64 > FRAME_SIZE {
+        return Err("payload exceeds one page");
+    }
+    let code_frame = frames.allocate().map_err(|_| "no frame for code")?;
+    let code_ptr = phys_to_ptr(code_frame.addr());
+    core::ptr::write_bytes(code_ptr, 0, FRAME_SIZE as usize);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
+    space
+        .map::<X86PageTable>(code_virt, code_frame, Permissions::user_rx(), frames, phys_to_ptr)
+        .map_err(|_| "map code failed")?;
+
+    let stack_frame = frames.allocate().map_err(|_| "no frame for stack")?;
+    let stack_ptr = phys_to_ptr(stack_frame.addr());
+    core::ptr::write_bytes(stack_ptr, 0, FRAME_SIZE as usize);
+    space
+        .map::<X86PageTable>(stack_virt, stack_frame, Permissions::user_rw(), frames, phys_to_ptr)
+        .map_err(|_| "map stack failed")?;
+    Ok((stack_virt + FRAME_SIZE) & !0xF)
+}
+
+/// Build a fresh per-boundary address space with the kernel range identity-mapped
+/// (so traps/handlers run after the CR3 switch). Returns the space.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn new_lane_space(
+    frames: &FrameAllocator,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<AddressSpace, &'static str> {
+    let space = AddressSpace::new(frames, phys_to_ptr).map_err(|_| "no frame for space root")?;
+    let kernel_pages = KERNEL_IDENTITY_MAP_BYTES / FRAME_SIZE;
+    space
+        .map_range::<X86PageTable>(
+            0,
+            0,
+            kernel_pages,
+            Permissions { read: true, write: true, execute: true, user: false },
+            frames,
+            phys_to_ptr,
+        )
+        .map_err(|_| "kernel identity map failed")?;
+    Ok(space)
+}
+
+/// Install a space's page tables as the active CR3 (exposed for the multilane
+/// demo, which maps all lanes into one space then switches to it).
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn install_space(space: &AddressSpace) {
+    crate::arch::paging::install(space.root());
+}
+
+// ---- spawn syscall support (feature: ring3-multilane-demo) ------------------
+//
+// `KernelSyscallEnv::spawn` must map a fresh stack for the new lane into the
+// CALLER'S currently-installed address space (same boundary -> same space). The
+// frame allocator is a local in `run_ring3_demo`; we expose it to the syscall
+// path for the demo's duration via a raw pointer (set before the run, cleared
+// after), mirroring how RING3_TABLE is installed. phys_to_ptr on the booted
+// kernel is the identity map, so it is reconstructed here rather than stored.
+
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+static SPAWN_FRAMES: core::sync::atomic::AtomicPtr<FrameAllocator> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Publish the frame allocator for the spawn syscall (demo-run lifetime).
+///
+/// # Safety
+/// `frames` must outlive the run (it is a local in `run_ring3_demo`, which spans
+/// the whole demo). Must be cleared with `clear_spawn_frames` before it drops.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn set_spawn_frames(frames: &FrameAllocator) {
+    SPAWN_FRAMES.store(
+        (frames as *const FrameAllocator) as *mut FrameAllocator,
+        core::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// Stop exposing the frame allocator to the spawn syscall.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub fn clear_spawn_frames() {
+    SPAWN_FRAMES.store(core::ptr::null_mut(), core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Map ONLY a payload's code page (no stack) at `code_virt` — for a `spawn`
+/// target whose stack the spawn syscall maps separately.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn map_lane_code(
+    space: &AddressSpace,
+    frames: &FrameAllocator,
+    code: &[u8],
+    code_virt: u64,
+    phys_to_ptr: &impl Fn(u64) -> *mut u8,
+) -> Result<(), &'static str> {
+    if code.len() as u64 > FRAME_SIZE {
+        return Err("payload exceeds one page");
+    }
+    let code_frame = frames.allocate().map_err(|_| "no frame for code")?;
+    let code_ptr = phys_to_ptr(code_frame.addr());
+    core::ptr::write_bytes(code_ptr, 0, FRAME_SIZE as usize);
+    core::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
+    space
+        .map::<X86PageTable>(code_virt, code_frame, Permissions::user_rx(), frames, phys_to_ptr)
+        .map_err(|_| "map code failed")?;
+    Ok(())
+}
+
+/// Map a fresh user stack page at `stack_virt` into the CURRENT address space
+/// (the caller's live space, adopted from `cr3`). Returns the 16-byte-aligned
+/// stack top. Used by the spawn syscall to give a new lane its own stack.
+///
+/// # Safety
+/// Must run on the booted kernel with the identity phys map and a frame
+/// allocator published via `set_spawn_frames`.
+#[cfg(all(target_arch = "x86_64", feature = "ring3-multilane-demo"))]
+pub unsafe fn map_spawn_stack(stack_virt: u64) -> Result<u64, &'static str> {
+    let frames_ptr = SPAWN_FRAMES.load(core::sync::atomic::Ordering::SeqCst);
+    if frames_ptr.is_null() {
+        return Err("spawn frames unavailable");
+    }
+    let frames = &*frames_ptr;
+    let phys_to_ptr = |phys: u64| phys as *mut u8;
+
+    // Adopt the current space (same boundary as the caller) and map one rw page.
+    let space = AddressSpace::adopt(crate::arch::paging::current_root_frame());
+    let stack_frame = frames.allocate().map_err(|_| "no frame for spawn stack")?;
+    let stack_ptr = phys_to_ptr(stack_frame.addr());
+    core::ptr::write_bytes(stack_ptr, 0, FRAME_SIZE as usize);
+    space
+        .map::<X86PageTable>(stack_virt, stack_frame, Permissions::user_rw(), frames, &phys_to_ptr)
+        .map_err(|_| "map spawn stack failed")?;
+    Ok((stack_virt + FRAME_SIZE) & !0xF)
 }

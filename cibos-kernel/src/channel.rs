@@ -277,10 +277,42 @@ impl Future for ChannelRecv {
     }
 }
 
-/// Assigns channel identifiers. Channels themselves are reference-counted
-/// handles shared between endpoints; the registry just hands out unique ids.
+/// Assigns channel identifiers and runs the cross-boundary request/accept-or-
+/// reject handshake. Channels themselves are reference-counted handles shared
+/// between endpoints; the registry just hands out unique ids.
+///
+/// HANDSHAKE MODE (profile behavioral flag, ADR-007 / roadmap 2.2): this is the
+/// canonical request/accept STRUCTURE — terms proposed by the requester, accepted
+/// wholesale or rejected, point-to-point. It is the **lightweight-handshake**
+/// form (correct for the Compute profile). The Maximum-Isolation / Balanced
+/// profiles additionally require **cryptographic-ipc**: the same request/accept
+/// structure with the proposal/acceptance authenticated and messages protected.
+/// That crypto layer is an ADDITIVE behavioral-flag mode over this same handshake
+/// (declared-but-inert today, deferred with the other profile flags) — NOT a
+/// different protocol. Labeling it here keeps the future crypto mode aligned with
+/// the canonical model rather than reading as drift.
 pub struct ChannelRegistry {
     next_id: SpinLock<u64>,
+    /// Pending cross-boundary channel requests awaiting the target boundary's
+    /// accept-or-reject decision. Keyed by request id. A channel only ever comes
+    /// into existence once the TARGET boundary explicitly accepts — a requester
+    /// can never force contact into another boundary (binary isolation: the
+    /// boundary is the principal, cross-boundary contact is mutual). Terms are
+    /// accepted WHOLESALE or rejected; there is no counter-proposal.
+    pending: SpinLock<alloc::collections::BTreeMap<u64, PendingRequest>>,
+    next_request: SpinLock<u64>,
+}
+
+/// A queued cross-boundary channel request: who asked, whom they want to reach,
+/// and the exact terms they proposed. Held until the target accepts or rejects.
+#[derive(Clone)]
+struct PendingRequest {
+    /// The boundary that issued the request.
+    from: shared::BoundaryId,
+    /// The boundary being asked to accept (point-to-point: exactly one target).
+    target: shared::BoundaryId,
+    /// The terms proposed by the requester (accepted wholesale or rejected).
+    terms: ChannelTerms,
 }
 
 impl ChannelRegistry {
@@ -289,6 +321,8 @@ impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             next_id: SpinLock::new(1),
+            pending: SpinLock::new(alloc::collections::BTreeMap::new()),
+            next_request: SpinLock::new(1),
         }
     }
 
@@ -302,6 +336,92 @@ impl ChannelRegistry {
             id
         };
         Channel::new(id, terms, kernel)
+    }
+
+    /// Queue a cross-boundary channel request from `from` to `request.target`
+    /// with the proposed `request.terms`. Returns a request id the requester can
+    /// later use to learn the outcome. The channel does NOT exist yet — it only
+    /// comes into being if the target boundary accepts.
+    #[must_use]
+    pub fn request(
+        &self,
+        from: shared::BoundaryId,
+        request: &shared::protocols::ipc::ChannelRequest,
+    ) -> u64 {
+        let id = {
+            let mut n = self.next_request.lock();
+            let id = *n;
+            *n += 1;
+            id
+        };
+        self.pending.lock().insert(
+            id,
+            PendingRequest {
+                from,
+                target: request.target,
+                terms: request.terms.clone(),
+            },
+        );
+        id
+    }
+
+    /// The next pending request TARGETING `target`, if any. Returns the request
+    /// id, the requesting boundary, and the proposed terms so the receiver can
+    /// decide. Only requests aimed at `target` are visible — a boundary can never
+    /// observe requests meant for another (point-to-point isolation).
+    #[must_use]
+    pub fn poll(
+        &self,
+        target: shared::BoundaryId,
+    ) -> Option<(u64, shared::BoundaryId, ChannelTerms)> {
+        let pending = self.pending.lock();
+        pending
+            .iter()
+            .find(|(_, r)| r.target == target)
+            .map(|(id, r)| (*id, r.from, r.terms.clone()))
+    }
+
+    /// Accept a pending request WHOLESALE, creating the channel from exactly the
+    /// proposed terms. Returns the created `Channel` together with the REQUESTER's
+    /// boundary, so the caller can register a handle for BOTH endpoints (both
+    /// point at this one Channel — one ChannelId reported to both ends). Returns
+    /// `None` if the request id is unknown or if `target` is not the request's
+    /// actual target — a boundary can only accept requests aimed at IT.
+    #[must_use]
+    pub fn accept(
+        &self,
+        request_id: u64,
+        target: shared::BoundaryId,
+        kernel: Arc<dyn KernelInterface>,
+    ) -> Option<(Channel, shared::BoundaryId)> {
+        let req = {
+            let mut pending = self.pending.lock();
+            match pending.get(&request_id) {
+                Some(r) if r.target == target => pending.remove(&request_id),
+                _ => None,
+            }
+        }?;
+        // Accept-ALL: the channel is built from the requester's proposed terms,
+        // unchanged. The receiver does not get to alter them.
+        let channel = self.create(&req.terms, kernel);
+        Some((channel, req.from))
+    }
+
+    /// Reject a pending request: drop it. The requester learns it was rejected.
+    /// Only the actual target may reject. Returns whether a request was removed.
+    pub fn reject(&self, request_id: u64, target: shared::BoundaryId) -> bool {
+        let mut pending = self.pending.lock();
+        match pending.get(&request_id) {
+            Some(r) if r.target == target => pending.remove(&request_id).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether a request id is still pending (neither accepted nor rejected).
+    /// The requester polls this to learn the outcome.
+    #[must_use]
+    pub fn is_pending(&self, request_id: u64) -> bool {
+        self.pending.lock().contains_key(&request_id)
     }
 }
 
@@ -422,5 +542,84 @@ mod tests {
         ch.close();
         assert_eq!(ch.try_send(LaneId::new(1), b"x"), SendStep::Closed);
         assert_eq!(ch.try_recv(LaneId::new(2)), RecvStep::Closed);
+    }
+
+    // ---- Cross-boundary handshake (request / poll / accept / reject) ----------
+
+    use shared::protocols::ipc::ChannelRequest;
+    use shared::BoundaryId;
+
+    fn channel_request(target: u64, cap: u32, max_msg: u32) -> ChannelRequest {
+        ChannelRequest {
+            target: BoundaryId(target),
+            terms: terms(cap, max_msg),
+        }
+    }
+
+    #[test]
+    fn handshake_accept_creates_channel_from_proposed_terms() {
+        let k = StubKernel::new();
+        let reg = ChannelRegistry::new();
+        let from = BoundaryId(0x100);
+        let req = channel_request(0x200, 4, 64);
+
+        let id = reg.request(from, &req);
+        assert!(reg.is_pending(id), "request should be pending until decided");
+
+        // The target boundary (0x200) sees the pending request and its terms.
+        let polled = reg.poll(BoundaryId(0x200)).expect("target should see request");
+        assert_eq!(polled.0, id);
+        assert_eq!(polled.1, from, "requester boundary reported to receiver");
+        assert_eq!(polled.2, req.terms, "exact proposed terms reported");
+
+        // Accept WHOLESALE -> a channel exists, same id usable by both ends, and
+        // the requester's boundary is reported so both endpoints can be wired.
+        let (channel, requester) = reg
+            .accept(id, BoundaryId(0x200), k.clone())
+            .expect("accept should create the channel");
+        assert!(!reg.is_pending(id), "accepted request no longer pending");
+        assert_eq!(channel.id(), ChannelId::new(1));
+        assert_eq!(requester, from, "requester boundary returned for endpoint wiring");
+    }
+
+    #[test]
+    fn handshake_reject_drops_request_no_channel() {
+        let k = StubKernel::new();
+        let reg = ChannelRegistry::new();
+        let id = reg.request(BoundaryId(0x100), &channel_request(0x200, 4, 64));
+
+        assert!(reg.reject(id, BoundaryId(0x200)), "target may reject");
+        assert!(!reg.is_pending(id), "rejected request is gone");
+        // A rejected request cannot then be accepted.
+        assert!(reg.accept(id, BoundaryId(0x200), k).is_none());
+    }
+
+    #[test]
+    fn handshake_is_point_to_point_wrong_boundary_cannot_see_or_accept() {
+        let k = StubKernel::new();
+        let reg = ChannelRegistry::new();
+        let id = reg.request(BoundaryId(0x100), &channel_request(0x200, 4, 64));
+
+        // A boundary that is NOT the target cannot observe the request...
+        assert!(reg.poll(BoundaryId(0x999)).is_none(), "non-target sees nothing");
+        // ...nor accept it (a requester cannot force contact into another boundary,
+        // and a third boundary cannot hijack the request).
+        assert!(reg.accept(id, BoundaryId(0x999), k.clone()).is_none());
+        assert!(!reg.reject(id, BoundaryId(0x999)));
+        // The legitimate target still can.
+        assert!(reg.is_pending(id));
+        assert!(reg.accept(id, BoundaryId(0x200), k).is_some());
+    }
+
+    #[test]
+    fn handshake_poll_only_returns_requests_for_that_target() {
+        let reg = ChannelRegistry::new();
+        let to_a = reg.request(BoundaryId(0x1), &channel_request(0xA, 4, 64));
+        let _to_b = reg.request(BoundaryId(0x2), &channel_request(0xB, 8, 32));
+
+        let pa = reg.poll(BoundaryId(0xA)).expect("A's request visible to A");
+        assert_eq!(pa.0, to_a);
+        // Boundary A only sees the request aimed at it, not the one aimed at B.
+        assert_eq!(pa.2.buffer_capacity, 4);
     }
 }

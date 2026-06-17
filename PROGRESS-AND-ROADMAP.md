@@ -109,6 +109,58 @@ image").
   x86_64/aarch64/riscv64 (+ i686 via build-std); `kernel-image` builds on
   x86_64/aarch64/riscv64. `compute`/`performance` boot to `boot complete` in QEMU.
 
+### 1.12 Track 2 — live ring-3 multi-context + cross-boundary IPC (later sessions)
+Built on top of the boot/runtime baseline above; each increment was kept host-green,
+bare-building on all arches, and runtime-verified in QEMU before moving on. Full
+detail (per-increment plans, bug-find/fix logs, lock-discipline + memory-safety
+analyses, and the production-reality analysis) lives in `TRACK2-LIVE-CONTEXT-DESIGN.md`.
+
+* **Per-lane ring-3 context save/resume (steps 1+2).** `SavedUserContext`
+  (`#[repr(C)]`, 160 bytes) + `resume_user.s`: the context-saving trap stub saves a
+  trapped lane's FULL register file into `*CURRENT_USER_CTX` (a kernel-set "current
+  lane" pointer — arbitrary-lane by construction, not a single slot); `resume_ring3`
+  / `resume_user_context` take the context pointer as an argument. Compile-time
+  `const` offset guards assert the asm offsets every bare build (proven to fail on
+  drift). QEMU-verified: a lane yields, the kernel parks it, then resumes it from the
+  exact trap point.
+* **Selector-owned `Ring3Table` (step 3).** A per-`LaneId` table `{ctx, boundary,
+  started, exited}` driven by the canonical `cibos_kernel::Scheduler` (Ready/Stalled +
+  weighted-entropy selection — single selector, no parallel one). QEMU-verified: two
+  lanes with distinct boundaries, selector picks one, a lane parks, the other runs,
+  the parked one resumes. Lock-safe static-table loop (`run_installed`) holds the
+  table lock only briefly, never across `resume_user_context`.
+* **`spawn` syscall + real boundary (step 4).** `KernelSyscallEnv::spawn` maps a
+  fresh stack into the caller's space (`AddressSpace::adopt`) and registers the new
+  lane in the caller's boundary; the trap reads the running lane's REAL boundary
+  (`active_lane → boundary_of`) instead of a hardcoded stand-in. No new ABI — the
+  dispatcher already routed `Spawn`/`OpenChannel` through `req.boundary`. QEMU-
+  verified: a ring-3 app calls `spawn(17)` at runtime, the child lane runs.
+  `arg` is marshaled into the spawned lane's `rdi` (verified: child spawned with
+  `0x42` exits `0x42`).
+* **Cross-boundary channel system unified onto the canonical `Channel`.** Replaced
+  the `LocalChannel` stand-in (which ignored boundary) with a boundary-aware handle
+  table `(boundary, handle) → Channel`; both endpoints of a cross-boundary channel
+  map to the SAME kernel-owned channel, so bytes pass THROUGH the kernel
+  (`try_send`/`try_recv`), never via shared user memory. The selector's `Scheduler`
+  is shared (`Arc`) as the channels' back-pressure `KernelInterface` — one selector
+  for both lane dispatch and channel wakeups.
+* **Cross-boundary channel handshake (request / accept-all-or-reject).**
+  `ChannelRegistry` request/poll/accept/reject (canonical: terms proposed by the
+  requester, accepted wholesale or rejected, point-to-point). Exposed over syscalls
+  18–22 (`RequestChannel`/`PollChannelRequest`/`AcceptChannel`/`RejectChannel`/
+  `PollChannelOutcome`) with fixed-size wire encodings, plus ring-3 SDK wrappers in
+  `cibos-app`. QEMU-verified end-to-end: X(0x100) requests → Y(0x200) accepts → X
+  sends `hello-Y` → Y receives the identical bytes; a wrong boundary (0x999) is
+  rejected on accept (point-to-point isolation); a channel exists only after the
+  target accepts.
+
+**Verified state now:** Host suite **338 / 0**. Clippy clean. `cibios` +
+`kernel-image` build bare on x86_64/aarch64/riscv64 (+ i686 via build-std). The
+`compute` profile boots in QEMU and runs, in one boot: the cross-boundary handshake
+demo, the spawn+arg multi-lane demo, and the normal `.capp` ring-3 app flow, then
+`boot complete`. The HIP invariants hold: binary boundary isolation, single selector,
+no global locks across user execution, cross-boundary contact only by mutual accept.
+
 ---
 
 ## PART 2 — EVERYTHING LEFT TO COMPLETE
@@ -224,10 +276,21 @@ alignment review plus this session's progress.
 7. **Input on the booted kernel**
    - Keyboard/mouse (and later touch) wired into the booted kernel so it is
      interactive (a shell/login surface). Today there is no input at the kernel.
+   - **DONE (keyboard).** IRQ1 → scancode decode → key queue → blocking `ReadKey`
+     syscall (sleeps the CPU via `hlt`, waits INDEFINITELY for a live keystroke);
+     `read_line` consumes it. Verified live in QEMU (`sendkey`): typed input
+     reaches the login app. Mouse/touch remain for the GUI/mobile surfaces.
 
 8. **A shell / login / first interactive surface**
    - The booted kernel currently prints `boot complete` and idles. A minimal
      interactive surface (CLI shell, then the login flow) makes it usable.
+   - **DONE.** `login-rs` + `shell-rs` (.capps) run the real shared `login`/
+     `accounts` gate and `shell::dispatch` over the actual package-manager/kvstore/
+     editor/trove crates. Boot → login → GATED shell (shell only on a granted
+     login) → app-store install → exit, with credentials persisted to CIBOSFS.
+     Available two ways: a deterministic INJECTED path (`storage-selftest`, for
+     regression) and a LIVE path (`interactive-session`, real keyboard). Both
+     runtime-verified in QEMU. (See `F1-INTERACTIVE-SESSION-PLAN.md`.)
 
 ### 2.2 Capability subsystems (documented flags, all absent — review T3-A)
 

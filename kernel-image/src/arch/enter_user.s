@@ -109,5 +109,6 @@ return_to_kernel:
 
 .section .bss
 .align 16
+.global KERNEL_CTX
 KERNEL_CTX:
     .skip 64
