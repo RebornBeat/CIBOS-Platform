@@ -1,45 +1,72 @@
 CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
-Full canonical workspace (41 crates) + design notes + fresh firmware ELFs.
+Full canonical workspace (42 crates) + design notes + fresh firmware ELFs.
 
-This archive: virtio-net TX/RX over the virtqueues + the #GP-fault fix.
+This archive: the N3-N5 networking sweep (e1000 + from-scratch cibos-net + NIC
+transport), verified end to end, plus the complete remaining-arc / per-arch /
+WiFi capture and refreshed top-level docs.
 
-  1. virtio-net TX/RX (kernel-image/src/arch/virtio_net.rs):
-     - Full legacy split virtqueue: descriptor table, avail ring, used ring,
-       10-byte virtio_net_hdr, RX pre-fill + buffer recycling, TX send, RX recv.
-     - Built on FrameAllocator::allocate_contiguous (physically-contiguous DMA
-       frames; identity-mapped phys==virt). Queues set up via QUEUE_SELECT/
-       QUEUE_SIZE/QUEUE_PFN; DRIVER_OK asserted after RX fill.
-     - VERIFIED real TX: a broadcast frame (payload CIBOS-HELLO!) was transmitted
-       through the TX virtqueue and captured in a QEMU filter-dump pcap.
+  1. N3 — e1000 driver (kernel-image/src/arch/e1000.rs): real Intel 82540EM
+     (vendor 0x8086, device 0x100E). PCI discovery, MMIO BAR (identity-mapped),
+     EEPROM MAC, legacy RX/TX descriptor rings, polled send/recv. Same NetDevice
+     trait. probe_nic_at_boot tries virtio-net first, then e1000; installs the
+     first present. Always-compiled production.
 
-  2. #GP fault fix (VIRTIO-GP-FAULT-DIAGNOSIS.md): with a NIC present the kernel
-     #GP'd (vector 13, err 0x17a = IDT gate 0x2F = IRQ15 spurious). Root cause: a
-     spurious/unhandled 8259 slave IRQ on a vector with no IDT gate. Faithful
-     two-part fix (no shortcut):
-       a) DRIVER: VRING_AVAIL_F_NO_INTERRUPT on both queues' avail rings (the
-          polled driver tells the device not to raise completion interrupts).
-       b) KERNEL: real 8259 spurious-IRQ handling — asm stubs + handler + IDT
-          gates for 0x27 (master IRQ7) and 0x2F (slave IRQ15); reads the PIC ISR
-          and does the correct conditional EOI (no EOI for true master spurious;
-          master-only EOI for slave spurious). Robust to spurious/unexpected PIC
-          interrupts that real hardware genuinely produces.
-     VERIFIED: NIC boot now reaches `boot complete` with TX working and NO fault;
-     no-NIC boot unchanged.
+  2. N4 — cibos-net (NEW workspace crate, no_std, ZERO external crates,
+     forbid(unsafe_code)): from-scratch Ethernet, ARP (+cache), IPv4 (+internet
+     checksum), UDP (+pseudo-header checksum), ICMP echo. 15 unit tests, clippy
+     clean. TCP deferred to its own milestone. (Aligned: the workspace uses
+     outside crates only for cryptography + foundational primitives; a network
+     stack is OS logic, written from scratch.)
 
-Both drivers + fix target standardized interfaces (virtio-pci spec, 8259 PIC);
-QEMU merely verifies them. No QEMU-conditional logic anywhere.
+  3. N5 — net_stack (kernel-image/src/net_stack.rs): NIC-backed UDP transport
+     (udp_send_to / poll_udp) over the stored NIC + cibos-net, with ARP resolve,
+     on-link/gateway next-hop, and inbound ARP-for-us + ICMP-echo answering
+     (the host is pingable). configure(mac) sets the host IP at boot.
+
+  4. VERIFIED end to end in QEMU (real device + real service):
+        virtio-net TX: ARP request sent
+        virtio-net RX: ARP reply — gw 10.0.2.2 is at 52:55:0a:00:02:02
+        net-stack UDP: DNS query sent to 10.0.2.3:53
+        net-stack UDP: DNS reply from 10.0.2.3:53 (52 bytes) — STACK OK
+        boot complete
+     The DNS round-trip exercises the WHOLE stack (ARP -> Ethernet/IPv4/UDP build
+     -> NIC TX -> NIC RX -> parse -> port match) against QEMU's real resolver.
+
+  5. REMAINING-ARC-AND-ARCH-WIFI-PLAN.md (NEW, the master capture):
+     - A1 wire the Lattice connect()/Link path to net_stack for REMOTE UDP Links
+       (surface/APIs unchanged); A2 from-scratch TCP.
+     - PART B: the FULL per-arch build flow with the HONEST current state —
+       CIBIOS firmware builds for all 4 arches and cibos-kernel core is arch-
+       independent, but ring-3 + ALL drivers + interactive surface + networking
+       are x86_64-ONLY today (aarch64 = 38-line serial backend; riscv64 = 34-line
+       SBI console; i686 shares x86 paths). The sweep brings each non-x86 arch
+       from serial+halt to a full runtime (traps, timer, intr controller, MMU,
+       console/input, ring-3) -> per-arch drivers (virtio-mmio) -> platforms ->
+       a per-arch verification matrix.
+     - PART C: WiFi — a from-scratch cibos-wifi 802.11/EAPOL state machine (vetted
+       crypto primitives) behind a Wifi/NetDevice surface, plus the connection
+       flow per platform (CLI wifi app, GUI network panel, mobile touch picker,
+       server declarative config), all behind the Lattice/Warden with encrypted
+       credential storage; staged verification.
+
+  6. Docs refreshed: README (370 tests; NIC networking now real), PROGRESS-AND-
+     ROADMAP (new 1.0 current-status + forward plan), NETWORKING.md (NIC layer
+     exists; remaining = remote-Link routing).
+
+Bare-metal-first throughout: e1000 / virtio-pci / 8259 PIC / cibos-net target
+standard interfaces; QEMU only verifies. No QEMU-conditional code; no invariant
+relaxed.
 
 Status at archive time:
-  * 355 workspace tests passing, 0 failing.
+  * 370 workspace tests passing, 0 failing (+15 cibos-net).
   * Clippy clean; production(default) + virtio-net-demo + interactive-session +
-    gui-demo + multilane + aarch64 + riscv64 all build clean; i686 via build-std.
-  * compute profile boots in QEMU with AND without a NIC: real TX verified, no
-    fault, boot complete.
+    gui-demo + ring3-multilane-demo build clean; aarch64 + riscv64 + i686 build
+    clean (minimal core on non-x86, per the honest per-arch state above).
+  * compute profile boots in QEMU with a NIC (ARP + DNS round-trips verified, no
+    fault) and without one (clean loopback-only boot).
 
 Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
 
-Next: verify RX (receive a frame — needs an injected/looped frame or the smoltcp
-stack to elicit replies); then e1000 (second NetDevice for non-virtio bare metal);
-then wire the NIC under the Lattice transport (smoltcp TCP/IP) beneath the same
-Gate/Link/Warden surface.
+Next: A1 (remote UDP Links over the Lattice) -> per-arch sweep (B) -> TCP (A2) ->
+WiFi (C), each archived per increment.

@@ -18,6 +18,7 @@ shared = { workspace = true, default-features = false }
 cibos-async-runtime = { workspace = true }
 cibos-kernel = { workspace = true }
 cibos-input = { workspace = true }
+cibos-net = { workspace = true }
 platform-gui = { workspace = true }
 # Optional: the notepad GuiApp, baked only for the `gui-demo` feature.
 notepad = { workspace = true, default-features = false, optional = true }

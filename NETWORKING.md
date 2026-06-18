@@ -30,14 +30,22 @@ system share one fabric.
 
 ## Transport and honesty
 
-The current Lattice is an **in-memory loopback fabric**: Links are backed by
-shared message queues, so all traffic stays inside one CIBOS instance. This is
-what is testable without hardware, and it is the genuine networking *model* and
-*API*. Real off-machine connectivity is a separate, hardware-dependent layer —
-a NIC driver plus a packet transport — that will implement the same
-Gate/Link/Warden surface beneath these APIs. Applications written against the
-Lattice will not change when that layer is added; only the fabric's backing
-transport does.
+The current Lattice **surface** is backed by an **in-memory loopback fabric**:
+Links are backed by shared message queues, so all traffic stays inside one CIBOS
+instance. This is the genuine networking *model* and *API*. The hardware layer
+beneath it now EXISTS: two real NIC drivers (virtio-net, e1000) behind a portable
+`NetDevice` trait, a from-scratch `cibos-net` stack (Ethernet/ARP/IPv4/UDP/ICMP),
+and a `net_stack` UDP transport — verified end to end against a real device and a
+real service (an ARP round-trip and a DNS round-trip in QEMU). The probed NIC is
+stored in a kernel-global.
+
+The one remaining step is to ROUTE a Link's bytes over that NIC transport for a
+REMOTE Gate (instead of the loopback Channel) — the Gate/Link/Warden surface and
+all app/SDK calls stay identical; only a Link's backing transport widens. Until
+that routing glue lands, the Lattice is loopback-backed and the NIC transport is
+exercised directly (`net_stack::udp_send_to` / `poll_udp`). Applications written
+against the Lattice will not change when remote Links are wired; only the fabric's
+backing transport does.
 
 This mirrors how a real OS is layered: the socket/port/firewall model is stable;
 the driver underneath is swappable.

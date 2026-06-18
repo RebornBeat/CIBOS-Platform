@@ -917,48 +917,156 @@ fn mount_root_fs_early() {
 /// Returns whether a NIC was found, so the caller can later bind it under the
 /// Lattice's NIC-backed transport.
 #[cfg(target_arch = "x86_64")]
+/// Send a real ARP request for the QEMU/LAN gateway and poll for the reply, to
+/// verify a NIC's TX and RX paths end to end against the actual device. Real
+/// frames only; honest reporting. Used by the boot NIC self-check (demo only).
+#[cfg(all(target_arch = "x86_64", feature = "virtio-net-demo"))]
+fn nic_arp_selfcheck(nic: &dyn cibos_kernel::net_device::NetDevice, label: &str) {
+    let m = nic.mac();
+    // Addressing: IP 10.0.2.15 (standard QEMU user-net guest), gateway 10.0.2.2.
+    let our_ip = [10u8, 0, 2, 15];
+    let gw_ip = [10u8, 0, 2, 2];
+    let mut arp = [0u8; 42]; // 14 Ethernet + 28 ARP
+    for b in arp.iter_mut().take(6) {
+        *b = 0xFF; // dst broadcast
+    }
+    arp[6..12].copy_from_slice(&m); // src MAC
+    arp[12] = 0x08;
+    arp[13] = 0x06; // EtherType ARP
+    arp[14] = 0x00;
+    arp[15] = 0x01; // HTYPE Ethernet
+    arp[16] = 0x08;
+    arp[17] = 0x00; // PTYPE IPv4
+    arp[18] = 6; // HLEN
+    arp[19] = 4; // PLEN
+    arp[20] = 0x00;
+    arp[21] = 0x01; // OPER request
+    arp[22..28].copy_from_slice(&m); // sender HW
+    arp[28..32].copy_from_slice(&our_ip); // sender IP
+    arp[38..42].copy_from_slice(&gw_ip); // target IP
+
+    match nic.send_frame(&arp) {
+        Ok(()) => kprintln!("CIBOS kernel: {label} TX: ARP request sent"),
+        Err(e) => kprintln!("CIBOS kernel: {label} TX: {:?}", e),
+    }
+
+    let mut rxbuf = [0u8; 1514];
+    let mut got_reply = false;
+    'rx: for _ in 0..2_000_000u64 {
+        if let Ok(Some(len)) = nic.recv_frame(&mut rxbuf) {
+            if len >= 42 {
+                let ethertype = u16::from_be_bytes([rxbuf[12], rxbuf[13]]);
+                let oper = u16::from_be_bytes([rxbuf[20], rxbuf[21]]);
+                if ethertype == 0x0806 && oper == 2 {
+                    kprintln!(
+                        "CIBOS kernel: {label} RX: ARP reply — gw {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        rxbuf[28], rxbuf[29], rxbuf[30], rxbuf[31],
+                        rxbuf[22], rxbuf[23], rxbuf[24], rxbuf[25], rxbuf[26], rxbuf[27]
+                    );
+                    got_reply = true;
+                    break 'rx;
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+    if !got_reply {
+        kprintln!("CIBOS kernel: {label} RX: no ARP reply within budget");
+    }
+}
+
+/// Exercise the NIC-backed UDP transport end to end: send a DNS query for a name
+/// to QEMU user-net's built-in resolver (10.0.2.3:53) and poll for the response.
+/// Proves the whole stack — ARP resolve, Ethernet/IPv4/UDP build, NIC TX, NIC RX,
+/// IPv4/UDP parse — works against a real service. Demo-only; honest reporting.
+#[cfg(all(target_arch = "x86_64", feature = "virtio-net-demo"))]
+fn net_stack_udp_selfcheck() {
+    use cibos_net::Ipv4Addr;
+    // A minimal DNS query for "a.root-servers.net" type A, id 0x1234. (12-byte
+    // header + QNAME + qtype + qclass.)
+    let query: &[u8] = &[
+        0x12, 0x34, // id
+        0x01, 0x00, // flags: standard query, recursion desired
+        0x00, 0x01, // QDCOUNT = 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR = 0
+        0x01, b'a', 0x0c, b'r', b'o', b'o', b't', b'-', b's', b'e', b'r', b'v', b'e', b'r', b's',
+        0x03, b'n', b'e', b't', 0x00, // QNAME
+        0x00, 0x01, // QTYPE = A
+        0x00, 0x01, // QCLASS = IN
+    ];
+    let dns = Ipv4Addr::new(10, 0, 2, 3);
+    match crate::net_stack::udp_send_to(dns, 53, 5353, query) {
+        Ok(_) => kprintln!("CIBOS kernel: net-stack UDP: DNS query sent to 10.0.2.3:53"),
+        Err(e) => {
+            kprintln!("CIBOS kernel: net-stack UDP: send failed: {:?}", e);
+            return;
+        }
+    }
+    let mut resp = [0u8; 512];
+    for _ in 0..3_000_000u64 {
+        match crate::net_stack::poll_udp(5353, &mut resp) {
+            Ok(Some((src, sport, len))) => {
+                kprintln!(
+                    "CIBOS kernel: net-stack UDP: DNS reply from {}.{}.{}.{}:{} ({} bytes) — STACK OK",
+                    src.0[0], src.0[1], src.0[2], src.0[3], sport, len
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        core::hint::spin_loop();
+    }
+    kprintln!("CIBOS kernel: net-stack UDP: no DNS reply within budget");
+}
+
+/// Probe for a NIC at boot (production path, like the ATA storage probe). Tries
+/// each supported driver in turn — virtio-net first (cloud/VM/SR-IOV), then the
+/// e1000 (ubiquitous physical NIC) — and installs the FIRST present device into
+/// the `NIC` kernel-global so the Lattice's transport can use it. Honestly
+/// reports when no supported NIC is found (loopback-only networking). Runs after
+/// the MMU is online (the drivers' DMA addresses must be stable).
+#[cfg(target_arch = "x86_64")]
 fn probe_nic_at_boot(frames: &cibos_kernel::FrameAllocator) -> bool {
     use cibos_kernel::net_device::NetDevice;
     // SAFETY: single-threaded bring-up; touches PCI config ports + the device
-    // I/O BAR once, and allocates virtqueue DMA memory from `frames`.
-    match unsafe { crate::arch::virtio_net::VirtioNet::probe(frames) } {
-        Some(nic) => {
-            let m = nic.mac();
-            kprintln!(
-                "CIBOS kernel: NIC: virtio-net MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
-                m[0], m[1], m[2], m[3], m[4], m[5],
-                if nic.link_up() { "up" } else { "down" }
-            );
-            // Verbose detail only under the demo feature; the driver is production.
-            #[cfg(feature = "virtio-net-demo")]
-            {
-                kprintln!("CIBOS kernel: virtio-net RX/TX virtqueues set up; DRIVER_OK asserted");
-                // TX self-check: transmit one broadcast Ethernet frame (dst
-                // ff:ff:ff:ff:ff:ff, src = our MAC, ethertype 0x88B5 = local
-                // experimental). Proves the TX virtqueue end to end; visible in a
-                // QEMU `-object filter-dump`. Real frame, no fake.
-                let mut eth = [0u8; 60]; // min Ethernet frame
-                for b in eth.iter_mut().take(6) {
-                    *b = 0xFF;
-                }
-                eth[6..12].copy_from_slice(&m);
-                eth[12] = 0x88;
-                eth[13] = 0xB5;
-                eth[14..26].copy_from_slice(b"CIBOS-HELLO!");
-                match nic.send_frame(&eth) {
-                    Ok(()) => kprintln!("CIBOS kernel: virtio-net TX self-check: frame sent OK"),
-                    Err(e) => kprintln!("CIBOS kernel: virtio-net TX self-check: {:?}", e),
-                }
-            }
-            true
+    // BARs once, and allocates DMA memory from `frames`.
+    // 1) virtio-net.
+    if let Some(nic) = unsafe { crate::arch::virtio_net::VirtioNet::probe(frames) } {
+        let m = nic.mac();
+        kprintln!(
+            "CIBOS kernel: NIC: virtio-net MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
+            m[0], m[1], m[2], m[3], m[4], m[5],
+            if nic.link_up() { "up" } else { "down" }
+        );
+        #[cfg(feature = "virtio-net-demo")]
+        {
+            kprintln!("CIBOS kernel: virtio-net RX/TX virtqueues set up; DRIVER_OK asserted");
+            nic_arp_selfcheck(&nic, "virtio-net");
         }
-        None => {
-            // No supported NIC present (e.g. a bare-metal box with an unsupported
-            // card, or no NIC). Honest report; networking falls back to loopback.
-            kprintln!("CIBOS kernel: NIC: no supported NIC found (loopback only)");
-            false
-        }
+        *NIC.lock() = Some(alloc::boxed::Box::new(nic));
+        crate::net_stack::configure(m);
+        #[cfg(feature = "virtio-net-demo")]
+        net_stack_udp_selfcheck();
+        return true;
     }
+    // 2) e1000 (Intel 82540EM) — for non-virtio bare metal.
+    if let Some(nic) = unsafe { crate::arch::e1000::E1000::probe(frames) } {
+        let m = nic.mac();
+        kprintln!(
+            "CIBOS kernel: NIC: e1000 MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
+            m[0], m[1], m[2], m[3], m[4], m[5],
+            if nic.link_up() { "up" } else { "down" }
+        );
+        #[cfg(feature = "virtio-net-demo")]
+        nic_arp_selfcheck(&nic, "e1000");
+        *NIC.lock() = Some(alloc::boxed::Box::new(nic));
+        crate::net_stack::configure(m);
+        return true;
+    }
+    // No supported NIC present. Honest report; networking falls back to loopback.
+    kprintln!("CIBOS kernel: NIC: no supported NIC found (loopback only)");
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1334,6 +1442,38 @@ pub(crate) struct KernelSyscallEnv;
 static ROOT_FS: cibos_kernel::sync::SpinLock<
     Option<cibos_kernel::fs::Fs<crate::arch::ata::AtaDisk>>,
 > = cibos_kernel::sync::SpinLock::new(None);
+
+/// The network interface discovered at boot, stored so the Lattice's NIC-backed
+/// transport can use it (mirrors the `ROOT_FS` kernel-global pattern). Held as a
+/// boxed `NetDevice` trait object so any driver (virtio-net, e1000, …) installs
+/// uniformly. `None` when no supported NIC is present (loopback-only networking).
+#[cfg(target_arch = "x86_64")]
+static NIC: cibos_kernel::sync::SpinLock<
+    Option<alloc::boxed::Box<dyn cibos_kernel::net_device::NetDevice + Send>>,
+> = cibos_kernel::sync::SpinLock::new(None);
+
+/// Run `f` against the installed NIC if one is present, returning its result (or
+/// `None` if no NIC is installed). The Lattice's NIC-backed transport uses this
+/// to send/receive frames over whatever driver was bound at boot. Brief lock
+/// hold; never hold across blocking work.
+///
+/// Wired into the Lattice transport in N5; defined now as the storage seam.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+pub fn with_nic<R>(
+    f: impl FnOnce(&dyn cibos_kernel::net_device::NetDevice) -> R,
+) -> Option<R> {
+    let guard = NIC.lock();
+    guard.as_ref().map(|nic| f(nic.as_ref()))
+}
+
+/// Whether a NIC is currently installed (a real interface was found at boot).
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[must_use]
+pub fn nic_present() -> bool {
+    NIC.lock().is_some()
+}
 
 /// The kernel CSPRNG backing the `get_random` syscall, seeded from the firmware
 /// entropy seed in the handoff at bring-up. `None` until seeded.

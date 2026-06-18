@@ -6,7 +6,7 @@ microkernel OS, and **HIP** (Hybrid Isolation Paradigm) is its isolation model:
 the security principal is the *boundary*, not a user account, and isolation is
 binary — maximal or none, never tiered.
 
-Everything here is real, compiles, and is covered by **338 unit tests** plus
+Everything here is real, compiles, and is covered by **370 unit tests** plus
 doctests and the application/example suites. There are no placeholders or mocks.
 Where a capability genuinely depends on hardware, that boundary is called out
 honestly in the docs rather than faked.
@@ -135,9 +135,12 @@ cargo run -p notepad --bin gui-demo
 ### QEMU / hardware
 
 Booting the firmware + kernel image under QEMU for each architecture is
-described in `BOOT.md` (and `kernel-image/QEMU.md`). Running on real hardware,
-real NIC-backed networking, and in-firmware PQC verification are the
-hardware/validation-gated items noted in `SECURITY-NOTES.md` and `NETWORKING.md`.
+described in `BOOT.md` (and `kernel-image/QEMU.md`). Running on real hardware
+and in-firmware PQC verification are the hardware-gated items noted in
+`SECURITY-NOTES.md`. NIC-backed networking is now real: virtio-net and e1000
+drivers, a from-scratch `cibos-net` stack (Ethernet/ARP/IPv4/UDP/ICMP), and a
+verified DNS round-trip over the NIC (see `NETWORKING.md` and
+`TRACK3-NETWORKING-COMPLETE-PLAN.md`).
 
 ## Design docs
 

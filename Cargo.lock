@@ -115,6 +115,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cibos-net"
+version = "0.1.0"
+
+[[package]]
 name = "cibos-sdk"
 version = "0.1.0"
 dependencies = [
@@ -273,6 +277,7 @@ dependencies = [
  "cibos-async-runtime",
  "cibos-input",
  "cibos-kernel",
+ "cibos-net",
  "linked_list_allocator",
  "notepad",
  "platform-gui",

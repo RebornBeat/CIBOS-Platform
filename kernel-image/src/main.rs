@@ -27,6 +27,8 @@ mod keyboard;
 mod gui;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod timer;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod net_stack;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

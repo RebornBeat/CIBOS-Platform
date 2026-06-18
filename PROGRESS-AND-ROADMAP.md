@@ -9,6 +9,43 @@ exhaustive — nothing knowingly omitted.
 
 ## PART 1 — PROGRESS THIS SESSION
 
+### 1.0 Current status (networking arc + the forward plan) — most recent
+**Networking is real and verified.** The kernel now has: a portable `NetDevice`
+trait; two real NIC drivers — virtio-net (virtio-pci, full split virtqueues,
+TX+RX verified, the #GP spurious-IRQ fault fixed) and e1000 (Intel 82540EM, MMIO
+descriptor rings) — both always-compiled production code probed at boot behind
+the same trait; a from-scratch `cibos-net` crate (Ethernet, ARP+cache, IPv4+
+checksum, UDP+pseudo-header checksum, ICMP echo; zero external crates; 15 tests);
+and a `net_stack` UDP transport tying the NIC + cibos-net together. Verified end
+to end in QEMU: a real DNS round-trip (`DNS reply ... 52 bytes — STACK OK`) plus
+an ARP round-trip, all against the real device/service. 370 workspace tests pass;
+all four arches and every config build clean.
+
+The probed NIC is stored in a kernel-global; the Lattice surface (Gate/Link/
+Warden) remains loopback-backed today, with the NIC transport seam in place.
+
+**Forward plan (captured in `REMAINING-ARC-AND-ARCH-WIFI-PLAN.md`):**
+- A1: wire the Lattice connect()/Link path to `net_stack` for remote UDP Links
+  (surface/APIs unchanged; only a Link's backing transport widens to the NIC).
+- A2: from-scratch TCP in cibos-net (the reliability milestone).
+- B: the FULL per-arch build flow. Honest current state — CIBIOS firmware builds
+  for all four arches and cibos-kernel core is arch-independent, but the ring-3
+  stack, all drivers, the interactive surface, and networking are x86_64-ONLY
+  today (aarch64 = 38-line serial backend; riscv64 = 34-line SBI console; i686
+  shares x86 paths). The sweep brings each non-x86 arch from "serial + halt" to a
+  full runtime (traps, timer, interrupt controller, MMU, console/input, ring-3),
+  then per-arch drivers (virtio-mmio for ARM/RISC-V), then the platforms, against
+  a per-arch verification matrix.
+- C: WiFi — a from-scratch `cibos-wifi` 802.11/EAPOL state machine (vetted crypto
+  primitives) behind a Wifi/NetDevice surface, plus the association/connection
+  flow per platform (CLI `wifi` app, GUI network panel, mobile touch picker,
+  server declarative config), all behind the Lattice/Warden with encrypted
+  credential storage; staged verification (state machine -> driver -> real hw).
+
+No drift: every item is bare-metal-first (QEMU verifies, never the target) and
+preserves the HIP invariants across all arches.
+
+
 The session goal was to take the project from "boots only under QEMU's multiboot
 loader (GRUB-style)" to a **from-scratch, self-contained bootable system** that
 starts from a BIOS power-on with no external loader, and to prove it runs. That

@@ -21,6 +21,10 @@ pub mod ata;
 // verbose probe LOGGING, never whether this driver exists.
 #[cfg(target_arch = "x86_64")]
 pub mod virtio_net;
+// Second production NIC driver: the Intel 82540EM (e1000), a ubiquitous physical
+// NIC, so a non-virtio bare-metal box still has networking. Same NetDevice trait.
+#[cfg(target_arch = "x86_64")]
+pub mod e1000;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
