@@ -106,7 +106,66 @@ keyboard_irq_entry:
     iretq
 
 
-// A common handler for CPU exceptions (vectors 0..31). Each per-vector entry
+// ---- PIC spurious / unhandled hardware IRQ stubs --------------------------
+// Real 8259 PICs raise SPURIOUS interrupts on the lowest-priority line of each
+// chip: IRQ7 (master -> vector 0x27) and IRQ15 (slave -> vector 0x2F). They can
+// also deliver an unexpected device IRQ on a vector the kernel has not claimed.
+// Without a gate, such an interrupt #GPs the kernel. These stubs save the
+// volatile registers, pass the vector to a Rust handler that performs the
+// CORRECT 8259 spurious check (ISR read; conditional EOI), restore, and iretq.
+.section .text
+.global pic_spurious_master_entry
+pic_spurious_master_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    mov rdi, 0x27           // vector that fired (master spurious / IRQ7)
+    call cibos_pic_spurious_irq
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
+.section .text
+.global pic_spurious_slave_entry
+pic_spurious_slave_entry:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    mov rdi, 0x2f           // vector that fired (slave spurious / IRQ15)
+    call cibos_pic_spurious_irq
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
+
 // pushes its vector number, then jumps here. We pass the vector and the faulting
 // RIP (from the interrupt frame) to a Rust reporter that prints and halts.
 // Because faults during this bring-up are fatal, this does not return.

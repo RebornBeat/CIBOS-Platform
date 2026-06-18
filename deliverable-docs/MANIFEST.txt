@@ -2,36 +2,44 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (41 crates) + design notes + fresh firmware ELFs.
 
-This archive: GUI display-driver promotion (cleanup tail complete) + Track 3B
-foundation (contiguous DMA frames for the virtqueues).
+This archive: virtio-net TX/RX over the virtqueues + the #GP-fault fix.
 
-  1. GUI display driver promoted to production:
-     - kernel-image/src/gui.rs (Surface→VGA) + arch/vga.rs confirmed always-
-       compiled production; boot block reframed from "demo" to a production GUI
-       surface launch (notepad as the app choice on the production runner).
-     - Runner input wait: busy-spin → production hlt-wait (timer::wait_for).
-       Verified in QEMU: GUI surface starts and hlt-blocks for live input.
-     - Confirmed run_interactive_session (live login→gated shell) is the
-       production interactive posture; injected path is selftest-only.
-     => PRODUCTION CLEANUP COMPLETE (see PRODUCTION-CLEANUP-AUDIT.md).
+  1. virtio-net TX/RX (kernel-image/src/arch/virtio_net.rs):
+     - Full legacy split virtqueue: descriptor table, avail ring, used ring,
+       10-byte virtio_net_hdr, RX pre-fill + buffer recycling, TX send, RX recv.
+     - Built on FrameAllocator::allocate_contiguous (physically-contiguous DMA
+       frames; identity-mapped phys==virt). Queues set up via QUEUE_SELECT/
+       QUEUE_SIZE/QUEUE_PFN; DRIVER_OK asserted after RX fill.
+     - VERIFIED real TX: a broadcast frame (payload CIBOS-HELLO!) was transmitted
+       through the TX virtqueue and captured in a QEMU filter-dump pcap.
 
-  2. Track 3B foundation (TRACK3B-VIRTIO-TXRX-PLAN.md):
-     - FrameAllocator::allocate_contiguous(n) — allocates n physically-contiguous
-       frames, the DMA-memory primitive virtio virtqueues require (identity map:
-       phys==virt). +2 host tests. This unblocks the virtqueue TX/RX work (B3a-d),
-       which is fully designed in the plan (legacy split virtqueue layout, the
-       virtio-pci I/O registers, the 10-byte virtio_net_hdr, RX fill/poll + TX).
+  2. #GP fault fix (VIRTIO-GP-FAULT-DIAGNOSIS.md): with a NIC present the kernel
+     #GP'd (vector 13, err 0x17a = IDT gate 0x2F = IRQ15 spurious). Root cause: a
+     spurious/unhandled 8259 slave IRQ on a vector with no IDT gate. Faithful
+     two-part fix (no shortcut):
+       a) DRIVER: VRING_AVAIL_F_NO_INTERRUPT on both queues' avail rings (the
+          polled driver tells the device not to raise completion interrupts).
+       b) KERNEL: real 8259 spurious-IRQ handling — asm stubs + handler + IDT
+          gates for 0x27 (master IRQ7) and 0x2F (slave IRQ15); reads the PIC ISR
+          and does the correct conditional EOI (no EOI for true master spurious;
+          master-only EOI for slave spurious). Robust to spurious/unexpected PIC
+          interrupts that real hardware genuinely produces.
+     VERIFIED: NIC boot now reaches `boot complete` with TX working and NO fault;
+     no-NIC boot unchanged.
+
+Both drivers + fix target standardized interfaces (virtio-pci spec, 8259 PIC);
+QEMU merely verifies them. No QEMU-conditional logic anywhere.
 
 Status at archive time:
   * 355 workspace tests passing, 0 failing.
-  * Clippy clean; production(default) + gui-demo + interactive-session +
-    multilane + storage-selftest + channel-demo + ring3-resume-demo + aarch64 +
-    riscv64 all build clean; i686 via build-std.
-  * Production image boots in QEMU (real handoff path): .capp in ring 3, channel/
-    Lattice table installed, NIC probed (real MAC), GUI surface hlt-blocks.
+  * Clippy clean; production(default) + virtio-net-demo + interactive-session +
+    gui-demo + multilane + aarch64 + riscv64 all build clean; i686 via build-std.
+  * compute profile boots in QEMU with AND without a NIC: real TX verified, no
+    fault, boot complete.
 
 Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
 
-Next: Track 3B B3a — allocate + set up the RX (queue 0) and TX (queue 1)
-virtqueues via allocate_contiguous + QUEUE_SELECT/QUEUE_PFN, then RX/TX paths,
-then QEMU -filter-dump verification; then B4 (NIC under the Lattice via smoltcp).
+Next: verify RX (receive a frame — needs an injected/looped frame or the smoltcp
+stack to elicit replies); then e1000 (second NetDevice for non-virtio bare metal);
+then wire the NIC under the Lattice transport (smoltcp TCP/IP) beneath the same
+Gate/Link/Warden surface.

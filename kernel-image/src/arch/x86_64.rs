@@ -181,6 +181,49 @@ pub unsafe fn pic_eoi(vector: u8) {
     outb(PIC1_CMD, EOI);
 }
 
+/// Handle a PIC interrupt that arrived on a spurious-capable line (vector 0x27 =
+/// master IRQ7, 0x2F = slave IRQ15), distinguishing a TRUE spurious interrupt
+/// from a real one per the 8259 rules. Returns nothing; performs the correct
+/// (possibly absent) EOI.
+///
+/// 8259 spurious handling: read the In-Service Register (OCW3 read-ISR). If the
+/// chip's top bit (the line in question) is NOT in service, the interrupt is
+/// spurious:
+///   - master spurious (0x27): send NO EOI at all.
+///   - slave spurious (0x2F): the master DID see a real cascade (IRQ2), so EOI
+///     the MASTER only, not the slave.
+/// If the bit IS set, it is a genuine IRQ on that line: EOI normally.
+///
+/// # Safety
+/// Call only from the spurious-IRQ interrupt stub.
+pub unsafe fn pic_spurious(vector: u8) {
+    const PIC1_CMD: u16 = 0x20;
+    const PIC2_CMD: u16 = 0xA0;
+    const EOI: u8 = 0x20;
+    const READ_ISR: u8 = 0x0B; // OCW3: select + read In-Service Register
+    if vector == 0x2F {
+        // Slave IRQ15: read the slave ISR; bit 7 = IRQ15 in service.
+        outb(PIC2_CMD, READ_ISR);
+        let isr = inb(PIC2_CMD);
+        if isr & 0x80 != 0 {
+            // Genuine IRQ15: EOI slave then master.
+            outb(PIC2_CMD, EOI);
+            outb(PIC1_CMD, EOI);
+        } else {
+            // Spurious slave IRQ: master saw a real cascade — EOI master only.
+            outb(PIC1_CMD, EOI);
+        }
+    } else {
+        // Master IRQ7 (0x27): read the master ISR; bit 7 = IRQ7 in service.
+        outb(PIC1_CMD, READ_ISR);
+        let isr = inb(PIC1_CMD);
+        if isr & 0x80 != 0 {
+            outb(PIC1_CMD, EOI);
+        }
+        // else: true spurious master IRQ — send NO EOI.
+    }
+}
+
 /// Read one byte from the PS/2 keyboard controller data port (0x60).
 ///
 /// # Safety

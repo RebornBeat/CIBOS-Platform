@@ -143,6 +143,30 @@ pub unsafe fn init() {
         0,
     );
 
+    // PIC spurious / unhandled hardware IRQ gates. Real 8259 PICs raise spurious
+    // interrupts on IRQ7 (master -> 0x27) and IRQ15 (slave -> 0x2F); a device may
+    // also assert an IRQ on a vector the kernel has not individually claimed.
+    // Without these gates such an interrupt #GPs the kernel. The stubs perform
+    // the correct 8259 spurious check + conditional EOI. DPL=0 interrupt gates.
+    extern "C" {
+        fn pic_spurious_master_entry();
+        fn pic_spurious_slave_entry();
+    }
+    const VECTOR_SPURIOUS_MASTER: usize = 0x27; // IRQ7
+    const VECTOR_SPURIOUS_SLAVE: usize = 0x2F; // IRQ15
+    IDT[VECTOR_SPURIOUS_MASTER].set_handler(
+        pic_spurious_master_entry as *const () as u64,
+        cs,
+        GATE_INT64_DPL0,
+        0,
+    );
+    IDT[VECTOR_SPURIOUS_SLAVE].set_handler(
+        pic_spurious_slave_entry as *const () as u64,
+        cs,
+        GATE_INT64_DPL0,
+        0,
+    );
+
     let ptr = IdtPointer {
         limit: (size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
@@ -160,6 +184,19 @@ pub extern "C" fn cibos_fault_report(vector: u64, error_code: u64, rip: u64) {
         console,
         "CIBOS kernel: [FAULT] vector {vector} err={error_code:#x} at RIP {rip:#x} — halting"
     );
+}
+
+/// Handler for a PIC spurious / unhandled hardware IRQ (vector 0x27 = master
+/// IRQ7, 0x2F = slave IRQ15), called by the asm stub with the vector in `rdi`.
+/// Performs the correct 8259 spurious check + conditional EOI so an unexpected
+/// or spurious device interrupt is acknowledged rather than faulting the kernel.
+/// `#[no_mangle]` so the asm can `call` it.
+#[no_mangle]
+pub extern "C" fn cibos_pic_spurious_irq(vector: u64) {
+    // SAFETY: invoked only from the spurious-IRQ stub; touches PIC command ports.
+    unsafe {
+        crate::arch::pic_spurious(vector as u8);
+    }
 }
 
 extern "C" {

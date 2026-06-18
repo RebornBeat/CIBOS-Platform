@@ -202,11 +202,6 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             #[cfg(target_arch = "x86_64")]
             verify_storage();
 
-            // Probe for a NIC at boot (production path, like the ATA storage
-            // probe above). Always runs; honestly reports what hardware is present.
-            #[cfg(target_arch = "x86_64")]
-            let _nic_present = probe_nic_at_boot();
-
             // Production GUI surface: the kernel GUI runner (a real display
             // driver — see `crate::gui`/`crate::arch::vga`) renders a
             // `platform-gui` cell-grid Surface to the screen and drives a GuiApp
@@ -411,6 +406,14 @@ fn bring_up_mmu(handoff: &HandoffData) {
         // physically absent in the other. Uses a borrowed frame allocator so the
         // allocator remains available for the ring-3 payload below.
         verify_container_isolation(&frames, &phys_to_ptr);
+
+        // Probe for a NIC now that the MMU is online: the device's virtqueue DMA
+        // addresses must be stable under the final page tables, so this runs
+        // AFTER the CR3 switch (not before). Production path, like ATA storage;
+        // the virtqueues use physically-contiguous DMA frames (identity-mapped
+        // within the 1 GiB kernel map). Honestly reports what hardware is present.
+        #[cfg(target_arch = "x86_64")]
+        let _nic_present = probe_nic_at_boot(&frames);
 
         // Drop to ring 3 and run unprivileged user payloads, each in its own
         // per-process address space, reaching the kernel only via int 0x80
@@ -914,11 +917,11 @@ fn mount_root_fs_early() {
 /// Returns whether a NIC was found, so the caller can later bind it under the
 /// Lattice's NIC-backed transport.
 #[cfg(target_arch = "x86_64")]
-fn probe_nic_at_boot() -> bool {
+fn probe_nic_at_boot(frames: &cibos_kernel::FrameAllocator) -> bool {
     use cibos_kernel::net_device::NetDevice;
     // SAFETY: single-threaded bring-up; touches PCI config ports + the device
-    // I/O BAR once.
-    match unsafe { crate::arch::virtio_net::VirtioNet::probe() } {
+    // I/O BAR once, and allocates virtqueue DMA memory from `frames`.
+    match unsafe { crate::arch::virtio_net::VirtioNet::probe(frames) } {
         Some(nic) => {
             let m = nic.mac();
             kprintln!(
@@ -926,12 +929,27 @@ fn probe_nic_at_boot() -> bool {
                 m[0], m[1], m[2], m[3], m[4], m[5],
                 if nic.link_up() { "up" } else { "down" }
             );
-            // Verbose probe detail only under the demo feature; the driver itself
-            // is production and always present.
+            // Verbose detail only under the demo feature; the driver is production.
             #[cfg(feature = "virtio-net-demo")]
-            kprintln!(
-                "CIBOS kernel: virtio-net negotiated (MAC+STATUS); TX/RX rings are the next increment"
-            );
+            {
+                kprintln!("CIBOS kernel: virtio-net RX/TX virtqueues set up; DRIVER_OK asserted");
+                // TX self-check: transmit one broadcast Ethernet frame (dst
+                // ff:ff:ff:ff:ff:ff, src = our MAC, ethertype 0x88B5 = local
+                // experimental). Proves the TX virtqueue end to end; visible in a
+                // QEMU `-object filter-dump`. Real frame, no fake.
+                let mut eth = [0u8; 60]; // min Ethernet frame
+                for b in eth.iter_mut().take(6) {
+                    *b = 0xFF;
+                }
+                eth[6..12].copy_from_slice(&m);
+                eth[12] = 0x88;
+                eth[13] = 0xB5;
+                eth[14..26].copy_from_slice(b"CIBOS-HELLO!");
+                match nic.send_frame(&eth) {
+                    Ok(()) => kprintln!("CIBOS kernel: virtio-net TX self-check: frame sent OK"),
+                    Err(e) => kprintln!("CIBOS kernel: virtio-net TX self-check: {:?}", e),
+                }
+            }
             true
         }
         None => {
