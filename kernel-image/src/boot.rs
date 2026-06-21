@@ -274,8 +274,20 @@ fn synth_handoff() -> HandoffData {
     };
 
     let topology = CoreTopology::new(1, 1, false).expect("valid topology");
+    // The usable RAM base differs by platform: the x86 PC has low RAM starting
+    // near 0 (1 MiB after the firmware area), while QEMU virt (aarch64/riscv64)
+    // places RAM at 1 GiB (0x40000000). The synthesized handoff must match the
+    // real layout so the frame allocator hands out frames that physically exist.
+    #[cfg(target_arch = "x86_64")]
+    let ram_base: u64 = 0x0010_0000; // 1 MiB (PC low RAM)
+    #[cfg(target_arch = "aarch64")]
+    let ram_base: u64 = 0x4000_0000; // 1 GiB (QEMU virt aarch64, per its DTB)
+    #[cfg(target_arch = "riscv64")]
+    let ram_base: u64 = 0x8000_0000; // 2 GiB (QEMU virt riscv64, per its DTB)
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    let ram_base: u64 = 0x0010_0000;
     let regions = [MemoryRegion {
-        base: 0x0010_0000,
+        base: ram_base,
         length: 0x0800_0000, // 128 MiB nominal
         kind: MemoryRegionKind::Usable,
     }];
@@ -318,22 +330,30 @@ fn synth_handoff() -> HandoffData {
 /// next step now that the mechanism is proven.
 #[cfg(target_arch = "x86_64")]
 fn bring_up_mmu(handoff: &HandoffData) {
+    bring_up_mmu_generic::<crate::arch::paging::ArchPagingImpl>(handoff);
+}
+
+/// Portable MMU bring-up orchestration, generic over the architecture's paging
+/// hooks ([`crate::bringup::ArchPaging`]). This single function builds the
+/// kernel's page tables, identity-maps low RAM + the arch's device-MMIO ranges,
+/// installs the tables, and proves per-container isolation — identically on every
+/// architecture. Only the `P` hooks (entry encoder, register ops, MMIO ranges)
+/// differ per arch. After the MMU is online it runs the post-MMU phases (NIC +
+/// ring-3) which still borrow the frame allocator this function owns.
+fn bring_up_mmu_generic<P: crate::bringup::ArchPaging>(handoff: &HandoffData) {
     use cibos_kernel::paging::{AddressSpace, Permissions};
     use cibos_kernel::{FrameAllocator, FRAME_SIZE};
     use alloc::vec::Vec;
     use shared::MemoryRegion;
 
-    // Reserve all physical memory below this watermark from the frame allocator:
-    // it covers the firmware's low memory, the kernel image (loaded at 16 MiB),
-    // its 8 MiB BSS heap, and the stack. Page-table frames are drawn from above
-    // it, so building the tables cannot clobber anything in use. 64 MiB is a
-    // generous bound for the current image; the 128 MiB guest leaves room.
-    const RESERVED_BELOW: u64 = 64 * 1024 * 1024;
-    // Identity-map this much physical address space (covers everything the
-    // kernel touches in the 128 MiB guest, plus the VGA buffer at 0xB8000).
-    // Shared with the per-process launcher so every space maps the identical
-    // kernel range.
-    const IDENTITY_MAP_BYTES: u64 = crate::loader::KERNEL_IDENTITY_MAP_BYTES;
+    // Reserve all physical memory below this watermark from the frame allocator
+    // so building the tables cannot clobber the kernel image, heap, or stack.
+    // Arch-supplied: on the PC, RAM starts at 0 and the kernel is low; on QEMU
+    // virt, RAM (and the kernel) start at 1 GiB, so the watermark must clear it.
+    let reserved_below: u64 = P::reserved_below();
+    // Identity-map this much physical address space (arch-supplied; covers
+    // everything the kernel touches plus any low framebuffer).
+    let identity_map_bytes: u64 = P::identity_map_bytes();
 
     // Collect the usable memory map the same way the kernel core does.
     let regions: Vec<MemoryRegion> = match handoff.typed_regions() {
@@ -349,26 +369,25 @@ fn bring_up_mmu(handoff: &HandoffData) {
             return;
         }
     };
-    let frames = FrameAllocator::from_regions(&regions, RESERVED_BELOW);
+    let frames = FrameAllocator::from_regions(&regions, reserved_below);
     kprintln!(
         "CIBOS kernel: frame allocator: {} usable frame(s), {} free above {:#x}",
         frames.usable_frames(),
         frames.free_frames(),
-        RESERVED_BELOW
+        reserved_below
     );
 
-    // The bootloader installed a 0..4 GiB identity map, so physical address P is
-    // currently readable/writable at virtual address P: identity is the map.
+    // The bootloader/firmware installed a low identity map, so physical address P
+    // is currently readable/writable at virtual address P: identity is the map.
     let phys_to_ptr = |phys: u64| phys as *mut u8;
 
     // SAFETY: the identity map above is valid for every frame the allocator
     // hands out (all within mapped physical RAM), and we install the result only
     // after fully mapping the memory the kernel is currently executing from.
     unsafe {
-        // The W^X mappings below set the NX bit on non-executable pages. NX is a
-        // reserved bit until EFER.NXE is enabled (the bootloader sets LME but not
-        // NXE), so enable it before building any table that uses NX.
-        crate::arch::paging::enable_nxe();
+        // Enable any entry features the arch needs before building tables that
+        // use them (x86: EFER.NXE so the NX bit is honored).
+        P::enable_table_features();
 
         let space = match AddressSpace::new(&frames, &phys_to_ptr) {
             Ok(s) => s,
@@ -378,11 +397,11 @@ fn bring_up_mmu(handoff: &HandoffData) {
             }
         };
 
-        let pages = IDENTITY_MAP_BYTES / FRAME_SIZE;
+        let pages = identity_map_bytes / FRAME_SIZE;
         // Kernel-rwx identity map: the kernel runs in supervisor mode, so these
         // are kernel (non-user) pages. Per-boundary user spaces will map user
         // pages with restricted permissions on top of this mechanism.
-        if let Err(e) = space.map_range::<crate::arch::paging::X86PageTable>(
+        if let Err(e) = space.map_range::<P::Encoder>(
             0,
             0,
             pages,
@@ -399,68 +418,74 @@ fn bring_up_mmu(handoff: &HandoffData) {
             return;
         }
 
-        // Map the PCI MMIO hole (i440fx places device BARs here, e.g. the e1000
-        // registers at 0xFEB80000) so MMIO-BAR drivers can reach their registers.
-        // The main identity map only covers low RAM (1 GiB); device MMIO lives
-        // high. Map 0xFEB00000..0xFEC00000 (1 MiB) identity, kernel-rw, NON-
-        // EXECUTABLE. Real hardware register space — any OS must map it.
-        const PCI_MMIO_BASE: u64 = 0xFEB0_0000;
-        const PCI_MMIO_PAGES: u64 = (0x10_0000) / FRAME_SIZE; // 1 MiB
-        if let Err(e) = space.map_range::<crate::arch::paging::X86PageTable>(
-            PCI_MMIO_BASE,
-            PCI_MMIO_BASE,
-            PCI_MMIO_PAGES,
-            Permissions {
-                read: true,
-                write: true,
-                execute: false,
-                user: false,
-            },
-            &frames,
-            &phys_to_ptr,
-        ) {
-            kprintln!("CIBOS kernel: MMU bring-up failed (PCI MMIO map): {e}");
-            return;
+        // Map the arch's device-MMIO ranges (kernel-rw, NON-EXECUTABLE) so
+        // MMIO-BAR drivers can reach their registers. The main identity map only
+        // covers low RAM; device MMIO lives high (x86 PCI hole at 0xFEB.., ARM
+        // GIC/UART, RISC-V PLIC/UART). Real hardware register space — any OS maps it.
+        for &(base, len) in P::mmio_identity_ranges() {
+            let mmio_pages = len / FRAME_SIZE;
+            if let Err(e) = space.map_range::<P::Encoder>(
+                base,
+                base,
+                mmio_pages,
+                Permissions {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: false,
+                },
+                &frames,
+                &phys_to_ptr,
+            ) {
+                kprintln!("CIBOS kernel: MMU bring-up failed (MMIO map {base:#x}): {e}");
+                return;
+            }
         }
 
         kprintln!(
-            "CIBOS kernel: page tables built (identity-mapped {} MiB), installing CR3 {:#x}",
-            IDENTITY_MAP_BYTES / (1024 * 1024),
+            "CIBOS kernel: page tables built (identity-mapped {} MiB), installing root {:#x}",
+            identity_map_bytes / (1024 * 1024),
             space.root().addr()
         );
 
         // The moment of truth: switch to our tables. Execution continuing past
         // this call is the proof that the tables are valid hardware tables.
-        crate::arch::paging::install(space.root());
+        P::install(space.root());
 
         kprintln!(
-            "CIBOS kernel: MMU online — running on kernel-built page tables (CR3 {:#x})",
-            crate::arch::paging::current_root()
+            "CIBOS kernel: MMU online — running on kernel-built page tables (root {:#x})",
+            P::current_root()
         );
 
         // Demonstrate per-container isolation on the proven mechanism: two
         // distinct boundaries get their own page tables; a page mapped in one is
         // physically absent in the other. Uses a borrowed frame allocator so the
         // allocator remains available for the ring-3 payload below.
+        #[cfg(target_arch = "x86_64")]
         verify_container_isolation(&frames, &phys_to_ptr);
 
-        // Probe for a NIC now that the MMU is online: the device's virtqueue DMA
-        // addresses must be stable under the final page tables, so this runs
-        // AFTER the CR3 switch (not before). Production path, like ATA storage;
-        // the virtqueues use physically-contiguous DMA frames (identity-mapped
-        // within the 1 GiB kernel map). Honestly reports what hardware is present.
+        // Post-MMU phases that borrow the frame allocator this function owns.
+        // These are x86-specific TODAY (NIC drivers + ring-3 entry); they will be
+        // generalized the same way (shared orchestration + arch hooks) as the
+        // per-arch sweep reaches them. Until then they run only where built.
         #[cfg(target_arch = "x86_64")]
-        let _nic_present = probe_nic_at_boot(&frames);
+        {
+            // Probe for a NIC now that the MMU is online: the device's virtqueue
+            // DMA addresses must be stable under the final page tables, so this
+            // runs AFTER the switch. Production path, like ATA storage.
+            let _nic_present = probe_nic_at_boot(&frames);
 
-        // Drop to ring 3 and run unprivileged user payloads, each in its own
-        // per-process address space, reaching the kernel only via int 0x80
-        // syscalls — the full user/kernel boundary.
-        start_ring3_runtime(&frames, &phys_to_ptr);
+            // Drop to ring 3 and run unprivileged user payloads, each in its own
+            // per-process address space, reaching the kernel only via int 0x80
+            // syscalls — the full user/kernel boundary.
+            start_ring3_runtime(&frames, &phys_to_ptr);
+        }
 
-        // `space` and `frames` back the live page tables (CR3) for the rest of
-        // this boot. Neither type implements `Drop` and the page-table frames
-        // live in physical RAM independent of these handles, so simply letting
-        // them fall out of scope here leaves the live mappings intact.
+        // `space` and `frames` back the live page tables for the rest of this
+        // boot. Neither type implements `Drop` and the page-table frames live in
+        // physical RAM independent of these handles, so letting them fall out of
+        // scope here leaves the live mappings intact.
+        let _ = &frames;
     }
 }
 
@@ -2649,8 +2674,11 @@ impl ArchBringUp for Arch {
     fn mount_root_fs(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: aarch64 block driver")
     }
-    fn bring_up_mmu(&self, _handoff: &HandoffData) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: aarch64 MMU encoder (TTBR/4KB granule)")
+    fn bring_up_mmu(&self, handoff: &HandoffData) -> PhaseStatus {
+        // The SAME portable orchestration as x86_64, parameterized by the aarch64
+        // paging hooks (VMSAv8-64 encoder + TTBR/TCR/SCTLR install).
+        bring_up_mmu_generic::<crate::arch::paging_aarch64::ArchPagingImpl>(handoff);
+        PhaseStatus::Done
     }
     fn verify_storage(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: aarch64 block driver")
@@ -2672,8 +2700,11 @@ impl ArchBringUp for Arch {
     fn mount_root_fs(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: riscv64 block driver")
     }
-    fn bring_up_mmu(&self, _handoff: &HandoffData) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: riscv64 MMU encoder (Sv39)")
+    fn bring_up_mmu(&self, handoff: &HandoffData) -> PhaseStatus {
+        // The SAME portable orchestration as x86_64/aarch64, parameterized by the
+        // riscv64 Sv48 paging hooks (encoder + satp install).
+        bring_up_mmu_generic::<crate::arch::paging_riscv64::ArchPagingImpl>(handoff);
+        PhaseStatus::Done
     }
     fn verify_storage(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: riscv64 block driver")

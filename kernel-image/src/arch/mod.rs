@@ -40,10 +40,14 @@ pub use x86_64::{
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
+pub mod paging_aarch64;
+#[cfg(target_arch = "aarch64")]
 pub use aarch64::{halt, init_serial, install_exception_vectors, putc};
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
+#[cfg(target_arch = "riscv64")]
+pub mod paging_riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::{halt, init_serial, install_trap_vector, putc};
 

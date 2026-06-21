@@ -2,73 +2,66 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (42 crates) + design notes + fresh ELFs.
 
-This archive: the per-arch BringUp CONTRACT — extracted from the x86_64 reference
-so every architecture follows the IDENTICAL bring-up sequence by construction
-(no drift, no cfg accretion). Built on top of A1 (remote Lattice Links over the
-NIC), the e1000 MMIO fix, and the aarch64/riscv64 core boots.
+This archive: the MMU bring-up GENERALIZED into one shared orchestration + tiny
+per-arch hooks, bringing the MMU online on x86_64, aarch64, AND riscv64 — plus an
+HONEST verification-reality accounting (QEMU vs bare metal).
 
-== THE BRING-UP CONTRACT (this milestone) ==
-The correction: x86_64 is not "one sample to generalize from later" — it is the
-REFERENCE IMPLEMENTATION of the canonical HIP bring-up. So the contract was
-extracted from x86_64 NOW and every other arch implements that SAME contract,
-aligning all four by construction from the first line (rather than growing each
-arch separately and reconciling drift later).
+== MMU: one orchestration, three arches (this milestone) ==
+The earlier concern that bring_up_mmu's coupling forced per-arch reimplementation
+was wrong: the coupling was ORCHESTRATION, not arch. The arch-specific surface was
+tiny and already half-abstracted (cibos_kernel::paging::PageTableEncoder). So:
+  - bring_up_mmu_generic<P: ArchPaging> = ONE portable orchestration (collect
+    regions, frame allocator, build tables, identity-map, install, verify
+    isolation, post-MMU phases). kernel-image/src/bringup.rs defines ArchPaging.
+  - Per-arch hooks (~7 small items): type Encoder, identity_map_bytes,
+    reserved_below, mmio_identity_ranges, enable_table_features, install,
+    current_root.
+  - x86_64 (arch/paging.rs): X86PageTable + CR3 + EFER.NXE + PCI MMIO hole.
+    UNCHANGED — full stack re-verified (MMU online, container isolation, DNS
+    STACK OK, REMOTE LINK OK, boot complete).
+  - aarch64 (arch/paging_aarch64.rs): VMSAv8-64 4KB encoder + TTBR0_EL1/TCR/MAIR/
+    SCTLR. "MMU online — root 0x42000000", boot complete.
+  - riscv64 (arch/paging_riscv64.rs): Sv48 encoder (Sv48 is 4-level, matching the
+    portable geometry; Sv39 is 3-level and would not) + satp. "MMU online — root
+    0x82000000", boot complete. Worked FIRST TRY.
+All three build their own hardware page tables through the SAME code and keep
+executing past the install — the unfakeable proof the tables are valid.
 
-  - kernel-image/src/bringup.rs: trait ArchBringUp + PhaseStatus{Done,Skipped,
-    Failed}. Phases (canonical order): early_traps -> seed_entropy ->
-    mount_root_fs -> bring_up_mmu (owns frames; NIC + ring-3 nested in its scope
-    on x86_64) -> verify_storage. Portable phases (heap, handoff, scheduler core)
-    run directly in kernel_entry on every arch.
-  - boot.rs: FOUR side-by-side `impl ArchBringUp for Arch` (x86_64/aarch64/
-    riscv64/x86). x86_64 delegates to the existing verified functions (NO
-    behavior change). aarch64/riscv64/x86 return Skipped("pending: <phase>") for
-    unbuilt phases — honest, and filled in later by implementing the SAME method,
-    never a new cfg block.
-  - kernel_entry: drives the phases through `Arch` in canonical order with ZERO
-    target_arch cfgs in the boot control flow (was 5+ scattered). The redundant
-    non-x86 bring_up_mmu stub was deleted.
+The arch differences that surfaced were all DATA, not code: RAM base (x86 1 MiB /
+aarch64 1 GiB / riscv64 2 GiB — READ FROM EACH BOARD'S DTB, not guessed),
+reservation watermark, and using Sv48 to match the page-walk geometry. The
+no-drift design proved itself: one path, per-arch data.
 
-VERIFIED:
-  - x86_64 full stack UNCHANGED: MMU online, container isolation, DNS STACK OK,
-    REMOTE LINK OK, boot complete. No "skipped" lines (does every phase).
-  - aarch64 boots core + reports its pending phases through the contract:
-    "entropy seed skipped (pending: aarch64 RNG path)",
-    "MMU bring-up skipped (pending: aarch64 MMU encoder (TTBR/4KB granule))".
-  - riscv64 boots core + reports its pending phases (RNG, Sv39 MMU).
-  The per-arch roadmap is now visible in the boot log itself; building an arch =
-  replacing a Skipped phase with a real impl, x86_64's impl as the spec.
+== HONEST VERIFICATION REALITY (VERIFICATION-REALITY-AND-BARE-METAL.md) ==
+Important and not glossed over:
+  - This sandbox is x86_64-only, NO KVM, NO real aarch64/riscv64 hardware, NO
+    dual-boot. EVERY arch (incl. x86_64) is QEMU EMULATION, not real silicon.
+  - "Verified" = ran correctly against QEMU's faithful ISA MODEL. The
+    architecture-level work (encoders, MMU enable, traps) targets the ISA spec and
+    largely TRANSFERS to real hardware. The PLATFORM specifics (RAM base, device
+    addresses) are currently QEMU-virt constants — correct for QEMU virt (checked
+    against each DTB) but WRONG for other boards.
+  - The bare-metal-correct fix (OUTSTANDING): parse the DTB the firmware passes at
+    runtime (currently ignored) so the kernel reads the real layout and works on
+    QEMU AND real hardware without knowing which. Then real-hardware testing
+    OUTSIDE this sandbox. Neither is done; no real-silicon claim is made.
 
-== UNDERLYING (prior milestones, still verified) ==
-  A1 — remote Lattice Links over the NIC: a Link handle resolves to a local
-  Channel OR a RemoteLink UDP flow; link_send/link_recv dispatch with ZERO
-  surface/ABI change. DNS round-trip via the real Link API: REMOTE LINK OK.
-  e1000 MMIO fix: identity-map the PCI MMIO hole (0xFEB00000..0xFEC00000) so the
-  e1000 BAR0 is reachable. All three NIC paths work (none / virtio-net / e1000).
-  aarch64 boot: FP/SIMD enable (CPACR_EL1) + exception vectors (VBAR_EL1).
-  riscv64 boot: trap vector (stvec); needs OpenSBI (default -bios).
-
-== NO-DRIFT / ALIGNMENT ==
-  cibos-kernel (canonical core) has ZERO target_arch refs — every arch runs the
-  IDENTICAL core. The bring-up contract now extends that guarantee to the
-  arch-specific layer: identical phase sequence, per-arch impls auditable as one.
-  Docs: ARCH-BRINGUP-CONTRACT-DESIGN.md, ARCH-ABSTRACTION-AND-ALIGNMENT.md,
-  AARCH64-BRINGUP-DIAGNOSIS.md, REMAINING-ARC-AND-ARCH-WIFI-PLAN.md.
-
-== Bare-metal-first ==
-  Every backend targets STANDARD interfaces unaware of QEMU (PL011, SBI, 8259
-  PIC, PCI, e1000 MMIO, VBAR_EL1, stvec, CPACR_EL1). QEMU VERIFIES; we never
-  build "for QEMU".
+== Underlying (prior milestones, still verified in QEMU) ==
+  A1 remote Lattice Links over the NIC (REMOTE LINK OK); e1000 MMIO-hole fix;
+  aarch64 boot (FP/SIMD + exception vectors); riscv64 boot (trap vector + OpenSBI);
+  the ArchBringUp contract (canonical phase sequence, zero target_arch cfgs in the
+  boot flow).
 
 == Status ==
   * 370 workspace tests passing, 0 failing.
   * x86_64 (all configs) + aarch64 + riscv64 build clean (0 warnings); i686 via
-    build-std. x86_64 boots full stack (NIC: A1 + e1000); aarch64 + riscv64 boot
-    the core; all three QEMU-verified.
+    build-std. x86_64 full stack + aarch64 MMU online + riscv64 MMU online, all
+    QEMU-verified.
 
 == ELFs ==
   Firmware: cibios-{x86_64,aarch64,riscv64gc,i686}.elf
-  Bootable kernels: kernel-aarch64.elf, kernel-riscv64.elf
+  Bootable kernels (MMU online): kernel-aarch64.elf, kernel-riscv64.elf
 
-Next: implement the Skipped phases per arch against the contract (aarch64 MMU
-[TTBR/4KB] -> storage -> NIC [virtio-mmio] -> ring-3 [EL1->EL0]; riscv64 Sv39 ->
-PLIC -> S->U), each QEMU-verified + archived; then A2 (TCP); then WiFi (Part C).
+Next: DTB parsing (replace QEMU-virt constants with runtime platform data) — the
+key bare-metal-correctness step; then per-arch storage/NIC (virtio-mmio)/ring-3
+against the contract; then real-hardware validation outside the sandbox.

@@ -15,6 +15,58 @@
 
 use shared::protocols::handoff::HandoffData;
 
+/// The per-architecture paging hooks that the (portable) MMU bring-up
+/// orchestration needs. Everything else about building and installing the
+/// kernel's page tables is identical across architectures and lives in the
+/// shared `bring_up_mmu` orchestration; only these few hooks differ.
+///
+/// This is the deeper application of the same no-drift principle as
+/// [`ArchBringUp`]: one shared orchestration, a tiny per-arch surface. An arch
+/// supplies its page-table entry encoder (via the portable
+/// [`cibos_kernel::paging::PageTableEncoder`]) plus the register operations to
+/// enable table features, install a root, and read the active root, plus the
+/// device-MMIO ranges that must be identity-mapped (x86 PCI hole / ARM GIC+UART /
+/// RISC-V PLIC+UART).
+pub trait ArchPaging {
+    /// The architecture's page-table entry encoder.
+    type Encoder: cibos_kernel::paging::PageTableEncoder;
+
+    /// How many bytes of low physical RAM to identity-map for the kernel.
+    fn identity_map_bytes() -> u64;
+
+    /// The physical watermark below which all frames are reserved (never handed
+    /// out by the frame allocator), so building page tables cannot clobber the
+    /// kernel image, heap, or stack. This MUST cover everything the kernel is
+    /// using. On the PC, RAM starts at 0 and the kernel is low, so a small
+    /// watermark suffices; on boards where RAM starts high (QEMU virt: 1 GiB),
+    /// the watermark must clear the kernel's load+heap region.
+    fn reserved_below() -> u64;
+
+    /// Device-MMIO ranges `(base, length)` to identity-map (kernel-rw, non-exec)
+    /// so MMIO-BAR drivers can reach their registers. May be empty.
+    fn mmio_identity_ranges() -> &'static [(u64, u64)];
+
+    /// Enable any page-table entry features the arch needs before installing
+    /// tables that use them (x86: EFER.NXE for the NX bit; others as required).
+    ///
+    /// # Safety
+    /// Modifies control registers/MSRs; call once during single-threaded
+    /// bring-up before installing tables.
+    unsafe fn enable_table_features();
+
+    /// Install `root` as the active page-table root (x86: CR3; aarch64: TTBR0_EL1
+    /// + enable SCTLR_EL1.M; riscv64: satp). Execution continuing past this proves
+    /// the tables are valid hardware tables.
+    ///
+    /// # Safety
+    /// `root` must map at least all memory the kernel currently executes from and
+    /// its stack, or the next fetch faults.
+    unsafe fn install(root: cibos_kernel::PhysFrame);
+
+    /// Read the active page-table root's physical address (x86: CR3; etc.).
+    fn current_root() -> u64;
+}
+
 /// The outcome of one bring-up phase.
 ///
 /// Not every architecture constructs every variant: a fully-built arch (x86_64)

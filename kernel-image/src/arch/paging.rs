@@ -91,6 +91,45 @@ pub unsafe fn enable_nxe() {
 
 /// Read the currently active page-table root from `CR3` (its physical address).
 #[must_use]
+/// The x86_64 implementation of the portable MMU bring-up's paging hooks. Wires
+/// the existing encoder + register operations + the PCI MMIO hole, so the shared
+/// `bring_up_mmu_generic` orchestration runs on x86_64 with no behavior change.
+pub struct ArchPagingImpl;
+
+impl crate::bringup::ArchPaging for ArchPagingImpl {
+    type Encoder = X86PageTable;
+
+    fn identity_map_bytes() -> u64 {
+        crate::loader::KERNEL_IDENTITY_MAP_BYTES
+    }
+
+    fn reserved_below() -> u64 {
+        // The PC loads the kernel at 16 MiB; 64 MiB clears it + the 8 MiB heap +
+        // stack. RAM starts at 0, so page-table frames come from above 64 MiB.
+        64 * 1024 * 1024
+    }
+
+    fn mmio_identity_ranges() -> &'static [(u64, u64)] {
+        // The i440fx PCI MMIO hole (device BARs, e.g. the e1000 at 0xFEB80000).
+        // 0xFEB00000..0xFEC00000 = 1 MiB.
+        &[(0xFEB0_0000, 0x10_0000)]
+    }
+
+    unsafe fn enable_table_features() {
+        // The W^X mappings set NX on non-exec pages; NX is reserved until
+        // EFER.NXE is enabled (the bootloader sets LME but not NXE).
+        enable_nxe();
+    }
+
+    unsafe fn install(root: cibos_kernel::PhysFrame) {
+        install(root);
+    }
+
+    fn current_root() -> u64 {
+        current_root()
+    }
+}
+
 pub fn current_root() -> u64 {
     let cr3: u64;
     // SAFETY: reading CR3 is side-effect free.
