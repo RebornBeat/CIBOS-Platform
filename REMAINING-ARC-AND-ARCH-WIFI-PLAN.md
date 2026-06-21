@@ -154,3 +154,32 @@ A1 (remote UDP Links) -> B1 aarch64 bring-up -> B2 aarch64 virtio-mmio drivers -
 B3/B4 aarch64 platforms+matrix -> repeat B1-B4 for riscv64 -> i686 -> A2 (TCP) ->
 C1-C3 (WiFi: crate + driver + per-platform flow + staged verification) ->
 per-arch WiFi. Bare-metal-first; QEMU verifies; no invariant relaxed anywhere.
+
+---
+
+## A1 — DESIGN (no ABI change, no surface change) — being built now
+
+KEY SEAM (verified in code): a Link is identified at the ABI by a `handle: u64`
+(LinkSend/LinkRecv take a handle). The kernel's ChannelHandleTable maps
+`(boundary, handle) -> Channel`. So a handle can resolve to EITHER a local
+Channel-backed Link OR a remote UDP-backed Link, and link_send/link_recv dispatch
+on which — with ZERO change to the syscall ABI or the SDK Lattice surface. Apps
+call link_send(handle, ...) identically.
+
+BUILD:
+1. net_stack::RemoteLink — a UDP flow {local_port, remote_ip, remote_port} with
+   send(&[u8]) and recv(&mut [u8]) over the stored NIC (udp_send_to / poll_udp).
+2. ChannelHandleTable gains a parallel `remote_links: BTreeMap<(boundary,handle),
+   RemoteLink>`; register_remote() mints a handle in the SAME handle space.
+3. link_send/link_recv: resolve the Channel map first; if absent, the remote map;
+   send/recv over UDP. Identical return semantics (bytes sent / Some(len)/None).
+4. connect_remote(boundary, remote_ip, remote_port) mints a remote Link handle —
+   the kernel-internal entry the addressing model (how an app NAMES a remote
+   gate) will call. The app-facing addressing ABI is the follow-on; this
+   increment proves the TRANSPORT branch end to end (a Link whose bytes traverse
+   the NIC), mirroring how net_stack (transport) was built before its callers.
+
+ALIGNMENT: the Gate/Link/Warden surface is unchanged; the Warden check stays
+total; loopback remains the default; only a Link's backing transport widens to
+the NIC. Matches NETWORKING.md ("only the fabric's backing transport changes").
+Datagram (UDP) Links first; reliable/ordered Links await TCP (A2).

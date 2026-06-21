@@ -37,8 +37,12 @@ global_asm!(include_str!("arch/enter_user.s"));
 global_asm!(include_str!("arch/resume_user.s"));
 #[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot/aarch64.s"));
+#[cfg(target_arch = "aarch64")]
+global_asm!(include_str!("arch/vectors_aarch64.s"));
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("boot/riscv64.s"));
+#[cfg(target_arch = "riscv64")]
+global_asm!(include_str!("arch/vectors_riscv64.s"));
 #[cfg(target_arch = "x86")]
 global_asm!(include_str!("boot/x86.s"));
 
@@ -121,6 +125,20 @@ macro_rules! kprintln {
 #[no_mangle]
 pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
     arch::init_serial();
+    // On aarch64, install the exception vectors before anything that might fault,
+    // so a fault is REPORTED (ESR/ELR/FAR) instead of vanishing to a garbage
+    // address. (FP/SIMD is enabled even earlier, in the boot asm, since the Rust
+    // core library uses SIMD registers.)
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: single-threaded bring-up; sets VBAR_EL1 once.
+    unsafe {
+        arch::install_exception_vectors();
+    }
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: single-threaded bring-up; sets stvec once.
+    unsafe {
+        arch::install_trap_vector();
+    }
     kprintln!("CIBOS kernel: entry");
 
     init_heap();
@@ -386,6 +404,30 @@ fn bring_up_mmu(handoff: &HandoffData) {
             return;
         }
 
+        // Map the PCI MMIO hole (i440fx places device BARs here, e.g. the e1000
+        // registers at 0xFEB80000) so MMIO-BAR drivers can reach their registers.
+        // The main identity map only covers low RAM (1 GiB); device MMIO lives
+        // high. Map 0xFEB00000..0xFEC00000 (1 MiB) identity, kernel-rw, NON-
+        // EXECUTABLE. Real hardware register space — any OS must map it.
+        const PCI_MMIO_BASE: u64 = 0xFEB0_0000;
+        const PCI_MMIO_PAGES: u64 = (0x10_0000) / FRAME_SIZE; // 1 MiB
+        if let Err(e) = space.map_range::<crate::arch::paging::X86PageTable>(
+            PCI_MMIO_BASE,
+            PCI_MMIO_BASE,
+            PCI_MMIO_PAGES,
+            Permissions {
+                read: true,
+                write: true,
+                execute: false,
+                user: false,
+            },
+            &frames,
+            &phys_to_ptr,
+        ) {
+            kprintln!("CIBOS kernel: MMU bring-up failed (PCI MMIO map): {e}");
+            return;
+        }
+
         kprintln!(
             "CIBOS kernel: page tables built (identity-mapped {} MiB), installing CR3 {:#x}",
             IDENTITY_MAP_BYTES / (1024 * 1024),
@@ -550,6 +592,10 @@ fn start_ring3_runtime(
                 cibos_kernel::compiled_profile().unwrap_or(shared::CibosProfile::Balanced),
             ));
             install_channel_table(sched);
+            // Now that the Lattice handle table exists AND the NIC is installed,
+            // prove a remote Link round-trips through the Link API over the NIC.
+            #[cfg(feature = "virtio-net-demo")]
+            lattice_remote_link_selfcheck();
         }
 
         // Ring-3 park/resume demonstration (proves the per-lane context
@@ -1018,6 +1064,60 @@ fn net_stack_udp_selfcheck() {
         core::hint::spin_loop();
     }
     kprintln!("CIBOS kernel: net-stack UDP: no DNS reply within budget");
+}
+
+/// Exercise a REMOTE Lattice Link end to end: create a remote Link (UDP flow to
+/// the QEMU DNS resolver) and round-trip a DNS query THROUGH the Link API
+/// (link_send / link_recv), proving the Lattice's byte transport now rides the
+/// NIC — the Gate/Link/Warden surface is unchanged; only the backing transport
+/// widened. Demo-only; honest reporting.
+#[cfg(all(target_arch = "x86_64", feature = "virtio-net-demo"))]
+fn lattice_remote_link_selfcheck() {
+    use cibos_kernel::SyscallEnv;
+    // No NIC -> nothing to route over; skip cleanly (loopback Links still work).
+    if !nic_present() {
+        return;
+    }
+    let boundary = shared::BoundaryId(0x900);
+    // Create the remote Link in the channel/Lattice table (handle in the same
+    // space as local Links).
+    let handle = {
+        let mut guard = CHANNEL_TABLE.lock();
+        let Some(table) = guard.as_mut() else {
+            kprintln!("CIBOS kernel: lattice remote Link: no handle table");
+            return;
+        };
+        table.connect_remote(boundary.0, cibos_net::Ipv4Addr::new(10, 0, 2, 3), 53, 5400)
+    };
+    // A minimal DNS query for "a.root-servers.net" type A, id 0x4321.
+    let query: &[u8] = &[
+        0x43, 0x21, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, b'a', 0x0c,
+        b'r', b'o', b'o', b't', b'-', b's', b'e', b'r', b'v', b'e', b'r', b's', 0x03, b'n', b'e',
+        b't', 0x00, 0x00, 0x01, 0x00, 0x01,
+    ];
+    let env = KernelSyscallEnv;
+    match env.link_send(boundary, handle, query) {
+        Ok(()) => kprintln!("CIBOS kernel: lattice remote Link: query sent via link_send"),
+        Err(e) => {
+            kprintln!("CIBOS kernel: lattice remote Link: link_send failed: {:?}", e);
+            return;
+        }
+    }
+    for _ in 0..3_000_000u64 {
+        match env.link_recv(boundary, handle) {
+            Ok(bytes) if !bytes.is_empty() => {
+                kprintln!(
+                    "CIBOS kernel: lattice remote Link: reply via link_recv ({} bytes) — REMOTE LINK OK",
+                    bytes.len()
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {} // WouldBlock while polling
+        }
+        core::hint::spin_loop();
+    }
+    kprintln!("CIBOS kernel: lattice remote Link: no reply within budget");
 }
 
 /// Probe for a NIC at boot (production path, like the ATA storage probe). Tries
@@ -1505,6 +1605,11 @@ struct ChannelHandleTable {
     gates: cibos_kernel::gate::GateRegistry,
     /// Monotonic source of ChannelIds for Lattice Links (each Link is one Channel).
     next_channel_id: u64,
+    /// Remote Links: (boundary, handle) -> a NIC-backed UDP flow. A Link handle
+    /// resolves to EITHER a local Channel (in `handles`) or a remote UDP flow
+    /// here; link_send/link_recv dispatch on which. This is how the Lattice's
+    /// byte transport widens to the NIC without any ABI/surface change.
+    remote_links: alloc::collections::BTreeMap<(u64, u64), crate::net_stack::RemoteLink>,
     /// The scheduler used as the channels' KernelInterface for back-pressure
     /// wakeups (the SAME selector that dispatches the ring-3 lanes).
     kernel: alloc::sync::Arc<dyn shared::KernelInterface>,
@@ -1520,6 +1625,7 @@ impl ChannelHandleTable {
             accepted: alloc::collections::BTreeMap::new(),
             gates: cibos_kernel::gate::GateRegistry::new(),
             next_channel_id: 0x1000_0000,
+            remote_links: alloc::collections::BTreeMap::new(),
             kernel,
         }
     }
@@ -1536,6 +1642,37 @@ impl ChannelHandleTable {
     /// Resolve a `(boundary, handle)` to its channel (a cheap clone-handle).
     fn resolve(&self, boundary: u64, handle: u64) -> Option<cibos_kernel::channel::Channel> {
         self.handles.get(&(boundary, handle)).cloned()
+    }
+
+    /// Create a REMOTE Link for `boundary`: a NIC-backed UDP flow to
+    /// `(remote_ip, remote_port)` listening on `local_port`, minting a handle in
+    /// the same handle space as local Links. link_send/link_recv on this handle
+    /// route over the NIC. This is the kernel-internal entry the remote-gate
+    /// addressing model calls; the Gate/Link/Warden surface is unchanged.
+    #[cfg_attr(not(feature = "virtio-net-demo"), allow(dead_code))]
+    fn connect_remote(
+        &mut self,
+        boundary: u64,
+        remote_ip: cibos_net::Ipv4Addr,
+        remote_port: u16,
+        local_port: u16,
+    ) -> u64 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.remote_links.insert(
+            (boundary, handle),
+            crate::net_stack::RemoteLink {
+                local_port,
+                remote_ip,
+                remote_port,
+            },
+        );
+        handle
+    }
+
+    /// Resolve a `(boundary, handle)` to a remote Link, if it is one.
+    fn resolve_remote(&self, boundary: u64, handle: u64) -> Option<crate::net_stack::RemoteLink> {
+        self.remote_links.get(&(boundary, handle)).copied()
     }
 }
 
@@ -2112,11 +2249,34 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
     ) -> Result<(), shared::protocols::syscall::SyscallError> {
         use cibos_kernel::channel::SendStep;
         use shared::protocols::syscall::SyscallError;
-        let link = {
+        // Resolve the handle to a local Channel-backed Link or a remote
+        // NIC-backed Link. Same ABI; the kernel dispatches on which.
+        let (link, remote) = {
             let guard = CHANNEL_TABLE.lock();
             let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
-            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
+            match table.resolve(boundary.0, handle) {
+                Some(ch) => (Some(ch), None),
+                None => (
+                    None,
+                    Some(
+                        table
+                            .resolve_remote(boundary.0, handle)
+                            .ok_or(SyscallError::NotFound)?,
+                    ),
+                ),
+            }
         };
+        if let Some(rl) = remote {
+            // Remote Link: send one UDP datagram over the NIC.
+            return match rl.send(data) {
+                Ok(_) => Ok(()),
+                Err(crate::net_stack::TransportError::Net(_)) => {
+                    Err(SyscallError::InvalidArgument)
+                }
+                Err(_) => Err(SyscallError::WouldBlock),
+            };
+        }
+        let link = link.ok_or(SyscallError::NotFound)?;
         match link.try_send(current_syscall_lane(), data) {
             SendStep::Sent => Ok(()),
             SendStep::Full => Err(SyscallError::WouldBlock),
@@ -2132,11 +2292,31 @@ impl cibos_kernel::SyscallEnv for KernelSyscallEnv {
     ) -> Result<alloc::vec::Vec<u8>, shared::protocols::syscall::SyscallError> {
         use cibos_kernel::channel::RecvStep;
         use shared::protocols::syscall::SyscallError;
-        let link = {
+        let (link, remote) = {
             let guard = CHANNEL_TABLE.lock();
             let table = guard.as_ref().ok_or(SyscallError::NotPermitted)?;
-            table.resolve(boundary.0, handle).ok_or(SyscallError::NotFound)?
+            match table.resolve(boundary.0, handle) {
+                Some(ch) => (Some(ch), None),
+                None => (
+                    None,
+                    Some(
+                        table
+                            .resolve_remote(boundary.0, handle)
+                            .ok_or(SyscallError::NotFound)?,
+                    ),
+                ),
+            }
         };
+        if let Some(rl) = remote {
+            // Remote Link: poll the NIC for one datagram from our peer.
+            let mut buf = [0u8; 1500];
+            return match rl.recv(&mut buf) {
+                Ok(Some(len)) => Ok(buf[..len].to_vec()),
+                Ok(None) => Err(SyscallError::WouldBlock),
+                Err(_) => Err(SyscallError::WouldBlock),
+            };
+        }
+        let link = link.ok_or(SyscallError::NotFound)?;
         match link.try_recv(current_syscall_lane()) {
             RecvStep::Message(bytes) => Ok(bytes),
             RecvStep::Empty => Err(SyscallError::WouldBlock),

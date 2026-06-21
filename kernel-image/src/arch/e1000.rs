@@ -209,15 +209,21 @@ impl E1000 {
 
     /// Read a 16-bit EEPROM word via the EERD register (bit0 = start; bit4 =
     /// done; data in bits 16-31; address in bits 8-15).
-    unsafe fn eeprom_read(&self, word_addr: u8) -> u16 {
+    /// Read a 16-bit EEPROM word via the EERD register (bit0 = start; bit4 =
+    /// done; data in bits 16-31; address in bits 8-15). Returns `None` if the
+    /// EEPROM does not signal "done" within a bounded budget — a real e1000
+    /// always responds, so a timeout means this is not a functioning e1000 (or
+    /// has no EEPROM), and the caller must NOT spin forever on real hardware.
+    unsafe fn eeprom_read(&self, word_addr: u8) -> Option<u16> {
         self.write_reg(REG_EERD, 1 | ((word_addr as u32) << 8));
-        loop {
+        for _ in 0..200_000u32 {
             let v = self.read_reg(REG_EERD);
             if v & (1 << 4) != 0 {
-                return (v >> 16) as u16;
+                return Some((v >> 16) as u16);
             }
             core::hint::spin_loop();
         }
+        None
     }
 
     /// Probe the PCI bus for an e1000, map its registers (identity-mapped),
@@ -260,9 +266,12 @@ impl E1000 {
         let _ = dev.read_reg(REG_ICR);
 
         // Read MAC from EEPROM (words 0,1,2 -> 6 bytes, little-endian per word).
+        // A real e1000 responds; if the EEPROM read times out, this is not a
+        // functioning e1000 — bail out (the caller falls through to "no NIC")
+        // rather than spin forever or trust a bogus device match.
         let mut mac = [0u8; 6];
         for i in 0..3 {
-            let w = dev.eeprom_read(i as u8);
+            let w = dev.eeprom_read(i as u8)?;
             mac[i * 2] = (w & 0xFF) as u8;
             mac[i * 2 + 1] = (w >> 8) as u8;
         }

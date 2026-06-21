@@ -140,9 +140,45 @@ fn resolve(nic: &dyn NetDevice, stack: &mut NetStack, ip: Ipv4Addr) -> Result<Ma
     Err(TransportError::ArpTimeout)
 }
 
-/// Send a UDP datagram to `dst_ip:dst_port` from `src_port`, over the installed
-/// NIC. Resolves the next-hop MAC (ARP), then builds Ethernet/IPv4/UDP and
-/// transmits. Returns the number of payload bytes sent.
+/// A remote Link's backing transport: a UDP flow identified by the local port we
+/// listen on and the remote `(ip, port)` peer. Carries a Lattice Link's bytes
+/// over the NIC instead of the loopback Channel — the Gate/Link/Warden surface
+/// above is unchanged. Datagram semantics: each `send` is one UDP datagram, each
+/// `recv` yields at most one datagram's payload (UDP Links; ordered/reliable
+/// Links await TCP).
+#[derive(Clone, Copy)]
+pub struct RemoteLink {
+    pub local_port: u16,
+    pub remote_ip: Ipv4Addr,
+    pub remote_port: u16,
+}
+
+impl RemoteLink {
+    /// Send `bytes` as one UDP datagram to the peer.
+    ///
+    /// # Errors
+    /// [`TransportError`] on missing NIC/config, ARP timeout, or device failure.
+    pub fn send(&self, bytes: &[u8]) -> Result<usize, TransportError> {
+        udp_send_to(self.remote_ip, self.remote_port, self.local_port, bytes)
+    }
+
+    /// Receive at most one datagram addressed to our local port into `out`.
+    /// Returns `Some(len)` if a datagram from our peer arrived, else `None`.
+    ///
+    /// # Errors
+    /// [`TransportError`] on missing NIC/config or device failure.
+    pub fn recv(&self, out: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        match poll_udp(self.local_port, out)? {
+            Some((src_ip, src_port, len))
+                if src_ip == self.remote_ip && src_port == self.remote_port =>
+            {
+                Ok(Some(len))
+            }
+            // A datagram for our port but from a different peer is not this Link's.
+            _ => Ok(None),
+        }
+    }
+}
 ///
 /// # Errors
 /// [`TransportError`] variants for missing NIC, unconfigured stack, ARP timeout,

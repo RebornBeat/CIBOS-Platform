@@ -1,72 +1,76 @@
 CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
-Full canonical workspace (42 crates) + design notes + fresh firmware ELFs.
+Full canonical workspace (42 crates) + design notes + fresh ELFs.
 
-This archive: the N3-N5 networking sweep (e1000 + from-scratch cibos-net + NIC
-transport), verified end to end, plus the complete remaining-arc / per-arch /
-WiFi capture and refreshed top-level docs.
+This archive: A1 (remote Lattice Links over the NIC) + the e1000 MMIO-hole fix +
+the per-arch sweep bringing aarch64 AND riscv64 to a booting kernel core, with
+the arch-alignment/no-drift assessment captured.
 
-  1. N3 — e1000 driver (kernel-image/src/arch/e1000.rs): real Intel 82540EM
-     (vendor 0x8086, device 0x100E). PCI discovery, MMIO BAR (identity-mapped),
-     EEPROM MAC, legacy RX/TX descriptor rings, polled send/recv. Same NetDevice
-     trait. probe_nic_at_boot tries virtio-net first, then e1000; installs the
-     first present. Always-compiled production.
+== NETWORKING (x86_64) ==
+  A1 — remote Lattice Links over the NIC (VERIFIED): a Link handle now resolves
+  to EITHER a local Channel (loopback) OR a RemoteLink UDP flow, and link_send/
+  link_recv dispatch on which — with ZERO change to the Gate/Link/Warden surface
+  or the syscall ABI. A remote Link round-trips a DNS query through the real
+  link_send/link_recv API over the NIC:
+      lattice remote Link: reply via link_recv (52 bytes) — REMOTE LINK OK
+  This realizes NETWORKING.md's promise: only a Link's backing transport widens.
 
-  2. N4 — cibos-net (NEW workspace crate, no_std, ZERO external crates,
-     forbid(unsafe_code)): from-scratch Ethernet, ARP (+cache), IPv4 (+internet
-     checksum), UDP (+pseudo-header checksum), ICMP echo. 15 unit tests, clippy
-     clean. TCP deferred to its own milestone. (Aligned: the workspace uses
-     outside crates only for cryptography + foundational primitives; a network
-     stack is OS logic, written from scratch.)
+  e1000 MMIO-hole fix (VERIFIED): the Intel 82540EM driver hung because its MMIO
+  BAR0 (0xFEB80000) sat OUTSIDE the kernel's 1 GiB identity map. Fix: identity-map
+  the PCI MMIO hole (0xFEB00000..0xFEC00000). A latent N3 bug (not an A1
+  regression), found via QEMU instruction tracing. All three NIC paths now work:
+  -nic none (clean), virtio-net (full A1 stack), e1000 (real EEPROM MAC + TX/RX).
 
-  3. N5 — net_stack (kernel-image/src/net_stack.rs): NIC-backed UDP transport
-     (udp_send_to / poll_udp) over the stored NIC + cibos-net, with ARP resolve,
-     on-link/gateway next-hop, and inbound ARP-for-us + ICMP-echo answering
-     (the host is pingable). configure(mac) sets the host IP at boot.
+== PER-ARCH SWEEP (the big alignment question) ==
+  Honest four-arch state:
+    x86_64  — FULL stack (ring-3, all drivers, networking, Lattice). The only
+              complete arch; re-verified this session (DNS STACK OK + REMOTE LINK
+              OK + boot complete, no regression from multi-arch work).
+    aarch64 — core BOOTS. Root-caused the silent death via QEMU -d in_asm,int:
+              FP/SIMD was trapped (CPACR_EL1.FPEN) and Rust core uses SIMD ->
+              EC 0x7. Fixes: enable FP/SIMD in boot/aarch64.s; install exception
+              vectors (vectors_aarch64.s + VBAR_EL1 + ESR/ELR/FAR reporter). Now
+              runs heap->handoff->scheduler->init lane->boot complete.
+    riscv64 — core BOOTS. Was NOT broken; the earlier "silent" run used
+              `-bios none` (no OpenSBI console) — a test-harness error, not a
+              kernel bug. Added a trap vector (vectors_riscv64.s + stvec +
+              scause/sepc/stval reporter) for fault visibility parity. Boots to
+              boot complete under default OpenSBI.
+    i686    — builds (firmware + kernel ELF) but the backend (x86.rs) is a
+              COM1 serial + halt STUB, NOT the full x86_64 stack. Boots via the
+              CIBIOS firmware path (cannot -kernel boot: no PVH note). Full i686
+              runtime parity (32-bit IDT/paging + reuse x86 drivers) is a later
+              increment. So "x86 legacy" does NOT fully build the stack yet.
 
-  4. VERIFIED end to end in QEMU (real device + real service):
-        virtio-net TX: ARP request sent
-        virtio-net RX: ARP reply — gw 10.0.2.2 is at 52:55:0a:00:02:02
-        net-stack UDP: DNS query sent to 10.0.2.3:53
-        net-stack UDP: DNS reply from 10.0.2.3:53 (52 bytes) — STACK OK
-        boot complete
-     The DNS round-trip exercises the WHOLE stack (ARP -> Ethernet/IPv4/UDP build
-     -> NIC TX -> NIC RX -> parse -> port match) against QEMU's real resolver.
+== NO-DRIFT / ALIGNMENT ASSESSMENT (ARCH-ABSTRACTION-AND-ALIGNMENT.md) ==
+  - cibos-kernel (canonical core) has ZERO target_arch references — the HIP
+    invariants are arch-free, so every arch runs the IDENTICAL core. aarch64 +
+    riscv64 ran the scheduler/init lane with NO core changes: the no-drift
+    guarantee by construction.
+  - The arch contract (arch/mod.rs) is clean: all arches export halt/init_serial/
+    putc; x86_64 additionally exports its full set; others grow toward parity.
+    Per-arch branching is isolated to boot.rs (28/33 cfgs x86_64-gated, cohesive).
+  - Guardrail: extract a per-arch BringUp contract when the SECOND arch needs the
+    same timer/MMU/ring-3 phases — not now (premature abstraction avoided).
 
-  5. REMAINING-ARC-AND-ARCH-WIFI-PLAN.md (NEW, the master capture):
-     - A1 wire the Lattice connect()/Link path to net_stack for REMOTE UDP Links
-       (surface/APIs unchanged); A2 from-scratch TCP.
-     - PART B: the FULL per-arch build flow with the HONEST current state —
-       CIBIOS firmware builds for all 4 arches and cibos-kernel core is arch-
-       independent, but ring-3 + ALL drivers + interactive surface + networking
-       are x86_64-ONLY today (aarch64 = 38-line serial backend; riscv64 = 34-line
-       SBI console; i686 shares x86 paths). The sweep brings each non-x86 arch
-       from serial+halt to a full runtime (traps, timer, intr controller, MMU,
-       console/input, ring-3) -> per-arch drivers (virtio-mmio) -> platforms ->
-       a per-arch verification matrix.
-     - PART C: WiFi — a from-scratch cibos-wifi 802.11/EAPOL state machine (vetted
-       crypto primitives) behind a Wifi/NetDevice surface, plus the connection
-       flow per platform (CLI wifi app, GUI network panel, mobile touch picker,
-       server declarative config), all behind the Lattice/Warden with encrypted
-       credential storage; staged verification.
+== Bare-metal-first (unchanged) ==
+  Every backend targets STANDARD interfaces, unaware of QEMU: x86 (VGA 0xB8000,
+  COM1 0x3F8, 8259 PIC, PCI 0xCF8, e1000 MMIO), aarch64 (PL011 @ 0x09000000,
+  VBAR_EL1, CPACR_EL1), riscv64 (SBI console, stvec). QEMU presents these standard
+  interfaces, so it VERIFIES the code; we never build "for QEMU". A device tree
+  was used ONLY to confirm the PL011 address is the standard one.
 
-  6. Docs refreshed: README (370 tests; NIC networking now real), PROGRESS-AND-
-     ROADMAP (new 1.0 current-status + forward plan), NETWORKING.md (NIC layer
-     exists; remaining = remote-Link routing).
+== Status at archive time ==
+  * 370 workspace tests passing, 0 failing.
+  * Clippy clean; x86_64 (all configs) + aarch64 + riscv64 build clean (0
+    warnings); i686 builds via build-std.
+  * x86_64 boots full stack with a NIC (A1 + e1000 verified) and without one.
+  * aarch64 + riscv64 boot the kernel core to "boot complete" in QEMU.
 
-Bare-metal-first throughout: e1000 / virtio-pci / 8259 PIC / cibos-net target
-standard interfaces; QEMU only verifies. No QEMU-conditional code; no invariant
-relaxed.
+== ELFs ==
+  Firmware (all 4 arches): cibios-{x86_64,aarch64,riscv64gc,i686}.elf
+  Bootable kernels (boot to core): kernel-aarch64.elf, kernel-riscv64.elf
 
-Status at archive time:
-  * 370 workspace tests passing, 0 failing (+15 cibos-net).
-  * Clippy clean; production(default) + virtio-net-demo + interactive-session +
-    gui-demo + ring3-multilane-demo build clean; aarch64 + riscv64 + i686 build
-    clean (minimal core on non-x86, per the honest per-arch state above).
-  * compute profile boots in QEMU with a NIC (ARP + DNS round-trips verified, no
-    fault) and without one (clean loopback-only boot).
-
-Firmware ELFs (fresh): cibios-{x86_64,aarch64,riscv64gc,i686}.elf.
-
-Next: A1 (remote UDP Links over the Lattice) -> per-arch sweep (B) -> TCP (A2) ->
-WiFi (C), each archived per increment.
+Next: per-arch timer -> interrupt controller -> MMU -> input -> ring-3 ->
+virtio-mmio drivers -> platforms + verification matrix; then A2 (TCP); then WiFi
+(Part C). Each archived per increment.
