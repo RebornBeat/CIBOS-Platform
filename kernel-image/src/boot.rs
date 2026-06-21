@@ -125,20 +125,11 @@ macro_rules! kprintln {
 #[no_mangle]
 pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
     arch::init_serial();
-    // On aarch64, install the exception vectors before anything that might fault,
-    // so a fault is REPORTED (ESR/ELR/FAR) instead of vanishing to a garbage
-    // address. (FP/SIMD is enabled even earlier, in the boot asm, since the Rust
-    // core library uses SIMD registers.)
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: single-threaded bring-up; sets VBAR_EL1 once.
-    unsafe {
-        arch::install_exception_vectors();
-    }
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: single-threaded bring-up; sets stvec once.
-    unsafe {
-        arch::install_trap_vector();
-    }
+    // Phase: early_traps — install fault/trap vectors (and enable FP where the
+    // arch needs it, done in the boot asm) so any fault is REPORTED, not silent.
+    // Driven through the per-arch bring-up contract: identical call on every
+    // arch, no target_arch branching in the boot flow.
+    Arch.early_traps();
     kprintln!("CIBOS kernel: entry");
 
     init_heap();
@@ -201,24 +192,28 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
             // MMU, so this is safe here.
             // Seed the kernel CSPRNG (backs the get_random syscall) from the
             // firmware entropy seed before any app can request randomness.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut seed = [0u8; 32];
-                let n = seed.len().min(shared::protocols::handoff::ENTROPY_SEED_LEN);
-                seed[..n].copy_from_slice(&handoff.entropy_seed[..n]);
-                seed_kernel_rng(seed);
+            // Per-arch bring-up phases, driven through the contract in canonical
+            // order. Each call is identical on every arch; an arch that has not
+            // built a phase reports Skipped(reason) honestly. No target_arch
+            // branching in this control flow.
+            let st = Arch.seed_entropy(&handoff.entropy_seed);
+            if let PhaseStatus::Skipped(r) | PhaseStatus::Failed(r) = st {
+                kprintln!("CIBOS kernel: entropy seed {} ({r})", st.label());
             }
 
-            #[cfg(all(target_arch = "x86_64", any(feature = "storage-selftest", feature = "interactive-session")))]
-            mount_root_fs_early();
+            let st = Arch.mount_root_fs();
+            if let PhaseStatus::Failed(r) = st {
+                kprintln!("CIBOS kernel: root FS mount FAILED ({r})");
+            }
 
-            bring_up_mmu(&handoff);
+            // MMU phase: on x86_64 this also owns the frame allocator and, within
+            // its scope, probes the NIC and drops to ring 3.
+            let st = Arch.bring_up_mmu(&handoff);
+            if let PhaseStatus::Skipped(r) = st {
+                kprintln!("CIBOS kernel: MMU bring-up skipped ({r})");
+            }
 
-            // Bring up real block storage: probe the primary ATA bus and read
-            // back the boot medium to prove block I/O works against actual
-            // hardware (the disk we booted from).
-            #[cfg(target_arch = "x86_64")]
-            verify_storage();
+            let _ = Arch.verify_storage();
 
             // Production GUI surface: the kernel GUI runner (a real display
             // driver — see `crate::gui`/`crate::arch::vga`) renders a
@@ -1513,14 +1508,6 @@ unsafe fn arm_keyboard_input() {
     }
 }
 
-/// On non-x86_64 targets the page-table encoder and CR3 install are not yet
-/// implemented, so MMU bring-up is a no-op (the bootloader/firmware identity map
-/// stays active). The portable model is identical; only the arch encoder differs.
-#[cfg(not(target_arch = "x86_64"))]
-fn bring_up_mmu(_handoff: &HandoffData) {
-    kprintln!("CIBOS kernel: MMU bring-up skipped (arch backend pending)");
-}
-
 /// The kernel's [`SyscallEnv`]: how the portable syscall dispatcher reaches
 /// kernel services and the caller's memory.
 ///
@@ -2585,6 +2572,131 @@ pub fn handle_user_trap(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
     // Otherwise: ordinary syscall semantics (resumes the same lane inline).
     handle_syscall(number, arg0, arg1, arg2)
+}
+
+// ===========================================================================
+// Per-arch bring-up contract implementations.
+//
+// These wire the canonical bring-up phases to each architecture. x86_64
+// delegates to the existing, verified functions (no behavior change — just
+// relocation behind the contract). aarch64/riscv64 implement early_traps (they
+// have vectors) and report the rest as Skipped("pending: ...") honestly, to be
+// filled in — by implementing the SAME method — as each phase is built.
+// ===========================================================================
+
+use crate::bringup::{ArchBringUp, PhaseStatus};
+
+/// The architecture bring-up implementation for the target the kernel is built
+/// for. `kernel_entry` drives the canonical sequence through this single value,
+/// so the boot control flow carries no `target_arch` branching.
+pub(crate) struct Arch;
+
+#[cfg(target_arch = "x86_64")]
+impl ArchBringUp for Arch {
+    fn early_traps(&self) {
+        // x86_64 installs its IDT later (inside the ring-3 bring-up under the
+        // MMU phase); the PIC/serial are already live from the firmware handoff,
+        // so there is no separate early-trap install here. Faults before the IDT
+        // are caught by the firmware's environment.
+    }
+
+    fn seed_entropy(&self, seed: &[u8]) -> PhaseStatus {
+        let mut buf = [0u8; 32];
+        let n = buf.len().min(seed.len());
+        buf[..n].copy_from_slice(&seed[..n]);
+        seed_kernel_rng(buf);
+        PhaseStatus::Done
+    }
+
+    fn mount_root_fs(&self) -> PhaseStatus {
+        #[cfg(any(feature = "storage-selftest", feature = "interactive-session"))]
+        {
+            mount_root_fs_early();
+            PhaseStatus::Done
+        }
+        #[cfg(not(any(feature = "storage-selftest", feature = "interactive-session")))]
+        {
+            PhaseStatus::Skipped("no storage feature enabled")
+        }
+    }
+
+    fn bring_up_mmu(&self, handoff: &HandoffData) -> PhaseStatus {
+        // This phase also owns the frame allocator and, within its scope, probes
+        // the NIC and drops to ring 3 (they borrow the allocator it owns).
+        bring_up_mmu(handoff);
+        PhaseStatus::Done
+    }
+
+    fn verify_storage(&self) -> PhaseStatus {
+        verify_storage();
+        PhaseStatus::Done
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ArchBringUp for Arch {
+    fn early_traps(&self) {
+        // FP/SIMD is enabled in boot/aarch64.s; install the exception vectors
+        // (VBAR_EL1) so faults are reported.
+        // SAFETY: single-threaded bring-up; sets VBAR_EL1 once.
+        unsafe {
+            arch::install_exception_vectors();
+        }
+    }
+    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: aarch64 RNG path")
+    }
+    fn mount_root_fs(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: aarch64 block driver")
+    }
+    fn bring_up_mmu(&self, _handoff: &HandoffData) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: aarch64 MMU encoder (TTBR/4KB granule)")
+    }
+    fn verify_storage(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: aarch64 block driver")
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl ArchBringUp for Arch {
+    fn early_traps(&self) {
+        // Install the S-mode trap vector (stvec) so traps are reported.
+        // SAFETY: single-threaded bring-up; sets stvec once.
+        unsafe {
+            arch::install_trap_vector();
+        }
+    }
+    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: riscv64 RNG path")
+    }
+    fn mount_root_fs(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: riscv64 block driver")
+    }
+    fn bring_up_mmu(&self, _handoff: &HandoffData) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: riscv64 MMU encoder (Sv39)")
+    }
+    fn verify_storage(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: riscv64 block driver")
+    }
+}
+
+#[cfg(target_arch = "x86")]
+impl ArchBringUp for Arch {
+    fn early_traps(&self) {
+        // i686: 32-bit IDT pending; serial is live. No early-trap install yet.
+    }
+    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: i686 RNG path")
+    }
+    fn mount_root_fs(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: i686 block driver")
+    }
+    fn bring_up_mmu(&self, _handoff: &HandoffData) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: i686 32-bit paging")
+    }
+    fn verify_storage(&self) -> PhaseStatus {
+        PhaseStatus::Skipped("pending: i686 block driver")
+    }
 }
 
 #[panic_handler]

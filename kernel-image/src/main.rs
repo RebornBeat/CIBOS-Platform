@@ -17,6 +17,8 @@ mod arch;
 #[cfg(target_os = "none")]
 #[macro_use]
 mod boot;
+#[cfg(target_os = "none")]
+mod bringup;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod loader;
 #[cfg(all(target_os = "none", target_arch = "x86_64", feature = "ring3-multilane-demo"))]
