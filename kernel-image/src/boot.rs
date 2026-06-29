@@ -123,8 +123,19 @@ macro_rules! kprintln {
 /// valid stack. `handoff_ptr` is either a valid, aligned [`HandoffData`] (the
 /// CIBIOS path) or ignored (the `self-boot` path).
 #[no_mangle]
-pub extern "C" fn kernel_entry(handoff_ptr: u64) -> ! {
+pub extern "C" fn kernel_entry(handoff_ptr: u64, dtb_ptr: u64) -> ! {
     arch::init_serial();
+    // Stash the DTB pointer (firmware/QEMU passes a Flattened Device Tree
+    // describing the real platform: RAM base/size, device addresses). On the
+    // self-boot path this lets us read the actual layout at runtime instead of
+    // using compiled-in constants — so the kernel works on QEMU AND real hardware
+    // without knowing which. x86_64 has no DTB (its layout comes from the BIOS
+    // handoff), so the pointer is simply unused there.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        DTB_PTR.store(dtb_ptr, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = dtb_ptr;
     // Phase: early_traps — install fault/trap vectors (and enable FP where the
     // arch needs it, done in the boot asm) so any fault is REPORTED, not silent.
     // Driven through the per-arch bring-up contract: identical call on every
@@ -274,21 +285,37 @@ fn synth_handoff() -> HandoffData {
     };
 
     let topology = CoreTopology::new(1, 1, false).expect("valid topology");
-    // The usable RAM base differs by platform: the x86 PC has low RAM starting
-    // near 0 (1 MiB after the firmware area), while QEMU virt (aarch64/riscv64)
-    // places RAM at 1 GiB (0x40000000). The synthesized handoff must match the
-    // real layout so the frame allocator hands out frames that physically exist.
+    // The usable RAM base differs by platform. x86 has no DTB (its layout comes
+    // from the BIOS handoff). On aarch64/riscv64 the firmware/QEMU passes a DTB
+    // describing the REAL platform RAM — read it at runtime so the same kernel is
+    // correct on QEMU virt AND real boards; fall back to the conventional QEMU
+    // virt base/size only if no DTB was passed or it could not be parsed.
     #[cfg(target_arch = "x86_64")]
-    let ram_base: u64 = 0x0010_0000; // 1 MiB (PC low RAM)
-    #[cfg(target_arch = "aarch64")]
-    let ram_base: u64 = 0x4000_0000; // 1 GiB (QEMU virt aarch64, per its DTB)
-    #[cfg(target_arch = "riscv64")]
-    let ram_base: u64 = 0x8000_0000; // 2 GiB (QEMU virt riscv64, per its DTB)
+    let (ram_base, ram_length): (u64, u64) = (0x0010_0000, 0x0800_0000); // 1 MiB, 128 MiB
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
-    let ram_base: u64 = 0x0010_0000;
+    let (ram_base, ram_length): (u64, u64) = (0x0010_0000, 0x0800_0000);
+    #[cfg(target_arch = "aarch64")]
+    let fallback: (u64, u64) = (0x4000_0000, 0x0800_0000); // 1 GiB, 128 MiB
+    #[cfg(target_arch = "riscv64")]
+    let fallback: (u64, u64) = (0x8000_0000, 0x0800_0000); // 2 GiB, 128 MiB
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    let (ram_base, ram_length): (u64, u64) = match dtb_ram_region() {
+        Some((base, size)) if size > 0 => {
+            kprintln!(
+                "CIBOS kernel: platform RAM from DTB: base {:#x}, size {} MiB",
+                base,
+                size / (1024 * 1024)
+            );
+            (base, size)
+        }
+        _ => {
+            kprintln!("CIBOS kernel: no DTB RAM region; using platform fallback");
+            fallback
+        }
+    };
     let regions = [MemoryRegion {
         base: ram_base,
-        length: 0x0800_0000, // 128 MiB nominal
+        length: ram_length,
         kind: MemoryRegionKind::Usable,
     }];
 
@@ -308,7 +335,7 @@ fn synth_handoff() -> HandoffData {
         cibos_profile,
         mode,
         topology,
-        0x0800_0000,
+        ram_length,
         &regions,
         [0x42u8; ENTROPY_SEED_LEN],
     )
@@ -1546,7 +1573,34 @@ unsafe fn arm_keyboard_input() {
 #[cfg(target_arch = "x86_64")]
 pub(crate) struct KernelSyscallEnv;
 
-/// The kernel's optionally-mounted root filesystem (CIBOSFS over the ATA data
+/// The Flattened Device Tree pointer the firmware/QEMU passed at boot (0 if
+/// none). Read at runtime to discover the real platform layout (RAM, devices)
+/// instead of using compiled-in constants. Only populated on arches that receive
+/// a DTB (aarch64/riscv64); x86_64 gets its layout from the BIOS handoff.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+static DTB_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Parse the firmware DTB (if present and valid) and return the primary RAM
+/// region `(base, size)`. Returns `None` if no DTB was passed or it could not be
+/// parsed — callers then fall back to the platform's conventional layout. This is
+/// the mechanism that lets the same kernel boot on QEMU and real boards.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn dtb_ram_region() -> Option<(u64, u64)> {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: read the FDT header to learn the blob's total size, then bound a
+    // slice to it. The firmware placed a readable FDT here (or 0, handled above).
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let total = cibos_dtb::DeviceTree::totalsize_at(header)?;
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return None; // implausible size; ignore
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
+    dt.ram_region().ok()
+}
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they
 /// report `NotPermitted`. Guarded by a spinlock so the trap path and any setup
 /// code do not race.

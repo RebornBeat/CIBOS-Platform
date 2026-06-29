@@ -31,6 +31,11 @@ _start:
     msr  cpacr_el1, x1
     isb
 
+    // Restore the boot argument and call kernel_entry(x0, x1). On the QEMU
+    // self-boot path x0 is the DTB pointer; on the CIBIOS path x0 is the handoff
+    // pointer. We pass it in both x0 and x1 so the 2-arg kernel_entry signature
+    // (shared with riscv64, where the DTB is the 2nd arg) sees the DTB in x1.
+    mov  x1, x0
     bl   kernel_entry
 3:  wfe
     b    3b

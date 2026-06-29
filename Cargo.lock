@@ -94,6 +94,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cibos-dtb"
+version = "0.1.0"
+
+[[package]]
 name = "cibos-input"
 version = "0.1.0"
 
@@ -275,6 +279,7 @@ name = "kernel-image"
 version = "0.1.0"
 dependencies = [
  "cibos-async-runtime",
+ "cibos-dtb",
  "cibos-input",
  "cibos-kernel",
  "cibos-net",

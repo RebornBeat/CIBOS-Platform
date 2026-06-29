@@ -1,0 +1,16 @@
+[package]
+name = "cibos-dtb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CIBOS from-scratch no_std flattened-device-tree (DTB/FDT) parser — platform discovery"
+
+[lib]
+name = "cibos_dtb"
+path = "src/lib.rs"
+
+[dependencies]
+
+[features]
+std = []

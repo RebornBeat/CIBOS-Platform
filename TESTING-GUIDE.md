@@ -338,3 +338,128 @@ So: x86-64 PC via QEMU or USB is testable now; phones are not.
 * CIBOS does not write to any disk at runtime yet, so booting it on a machine
   does not modify the machine's internal drives — but the act of *writing the
   image to a USB/disk* with `dd` does erase that target medium.
+
+---
+
+# APPENDIX (current) — Multi-arch bring-up testing + capturing logs
+
+This appendix reflects the current state after the per-arch sweep (aarch64 and
+riscv64 now boot the kernel core with their MMU online; the DTB parser discovers
+real platform RAM). Read it together with the honest scope in
+`VERIFICATION-REALITY-AND-BARE-METAL.md` — everything below is verified in QEMU;
+real-silicon validation is what these steps are FOR.
+
+## A. What boots today, per arch
+
+| Arch    | How it boots                         | Reaches                          |
+|---------|--------------------------------------|----------------------------------|
+| x86_64  | BIOS .img (USB) or QEMU drive        | full stack: MMU, NIC, ring-3, FS |
+| aarch64 | QEMU `-kernel` ELF / real: U-Boot    | core + MMU online                |
+| riscv64 | QEMU `-kernel` ELF + OpenSBI / real  | core + MMU online                |
+| i686    | CIBIOS firmware path only            | firmware-stage (kernel is a stub)|
+
+## B. Build the artifacts
+
+```sh
+export RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo PATH=$HOME/.cargo/bin:$PATH
+rustup target add x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf
+
+# x86_64 bootable disk image (for USB):
+EXTRA_KFEATURES="" ./build-bootimage.sh compute x86_64
+#   -> images/cibos-compute-x86_64.img
+
+# aarch64 bootable kernel ELF:
+cargo build -p kernel-image --target aarch64-unknown-none --features self-boot
+#   -> target/aarch64-unknown-none/debug/cibos-kernel
+
+# riscv64 bootable kernel ELF:
+cargo build -p kernel-image --target riscv64gc-unknown-none-elf --features self-boot
+#   -> target/riscv64gc-unknown-none-elf/debug/cibos-kernel
+```
+
+## C. Boot in QEMU (zero-risk, do this first)
+
+```sh
+# x86_64 (serial + VGA):
+qemu-system-x86_64 -drive format=raw,file=images/cibos-compute-x86_64.img,if=ide \
+  -display none -serial stdio -no-reboot
+
+# aarch64 (serial on PL011):
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -display none -serial stdio \
+  -kernel target/aarch64-unknown-none/debug/cibos-kernel
+
+# riscv64 (serial via OpenSBI — DO NOT pass -bios none, you lose the console):
+qemu-system-riscv64 -machine virt -nographic \
+  -kernel target/riscv64gc-unknown-none-elf/debug/cibos-kernel
+```
+Expected last line every time: `CIBOS kernel: boot complete`.
+
+## D. Boot on REAL hardware
+
+### x86_64 via USB
+```sh
+# Identify the USB device (e.g. /dev/sdX) — TRIPLE-CHECK, this ERASES it.
+lsblk
+sudo dd if=images/cibos-compute-x86_64.img of=/dev/sdX bs=4M status=progress conv=fsync
+sync
+```
+Boot the target PC from USB (legacy/BIOS boot, not UEFI-only — the bootloader is
+a from-scratch BIOS bootloader). Output appears on the VGA screen; if the machine
+has a serial port (or you use a PCIe/USB serial header), capture serial too (§E).
+
+### aarch64 / riscv64 on a real board
+These boot via the board firmware (U-Boot / UEFI / OpenSBI), which loads the
+kernel ELF and passes a real DTB. The kernel reads RAM layout from that DTB (the
+`cibos-dtb` parser — validated against a real device tree). Exact load command is
+board-specific (U-Boot `booti`/`bootelf`); this is the step that exercises the
+platform-discovery path on real silicon. NOTE: peripheral drivers beyond the
+console are still being generalized, so expect "core + MMU online", not the full
+x86 stack, on these boards today.
+
+## E. CAPTURING LOGS — this is the important part for sending results back
+
+CIBOS output is **plain text on the serial console** (and mirrored to the VGA
+screen on x86). It is NOT written to a file on the USB stick — the kernel does not
+yet have a writable log file, so **you must capture the serial/console stream as
+it prints**. Options, best first:
+
+1. **Serial capture (best, gives a full text log you can copy back):**
+   - On real x86 hardware: connect the target's serial port (COM1 / a USB-TTL
+     adapter on the header) to your host, then on the host:
+     ```sh
+     # 115200 is typical; CIBOS x86 uses 38400 8N1 — match it:
+     sudo screen /dev/ttyUSB0 38400      # or: minicom -D /dev/ttyUSB0 -b 38400
+     #   screen logging to a file:
+     screen -L -Logfile cibos-serial.log /dev/ttyUSB0 38400
+     ```
+   - In QEMU, just redirect serial to a file:
+     ```sh
+     qemu-system-aarch64 ... -serial file:cibos-aarch64.log
+     # or tee it live:
+     qemu-system-x86_64 ... -serial stdio | tee cibos-x86.log
+     ```
+   The resulting `.log` text file is exactly what to send back.
+
+2. **VGA screen (x86 real hardware with no serial):** the boot text shows on the
+   monitor. There is currently NO scrollback and NO on-disk copy, so capture is by
+   **photographing the screen** or filming the boot. This is lossy (the screen is
+   80x25 and scrolls), which is why serial is strongly preferred.
+
+3. **What to send back:** the full serial `.log` (or clear photos of the screen)
+   from power-on through either `boot complete` or the first error/exception line.
+   On aarch64/riscv64 a fault prints a decoded line (ESR/ELR/FAR or scause/sepc/
+   stval) — include it verbatim; that is exactly what pinpoints a real-hardware
+   issue.
+
+> Honesty note: there is no persistent log store on the USB yet. Adding a
+> kernel log buffer that writes to a file on the data partition is a known future
+> item; until then, serial capture is the reliable channel.
+
+## F. Known real-hardware caveats (read before trusting a pass)
+- All current verification is against QEMU's ISA model. Real silicon may differ in
+  timing, errata, and especially DEVICE ADDRESSES — which is why the DTB parser
+  exists. On a board whose DTB the kernel can read, RAM is discovered correctly;
+  device drivers beyond the console are still arch-generalizing.
+- x86 real-hardware boot has never been validated on metal in this project yet;
+  the BIOS bootloader targets real BIOS but is QEMU-verified only. Treat the first
+  real boot as a test, capture serial, and send the log.
