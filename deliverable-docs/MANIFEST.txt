@@ -2,56 +2,56 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (43 crates) + design notes + fresh ELFs.
 
-This archive: DTB platform discovery (stop hardcoding QEMU-virt values) + a
-current multi-arch bare-metal TESTING GUIDE with log-capture instructions +
-honest answers on the boot visuals. Built on the 3-arch MMU work.
+This archive: PERIPHERAL DTB discovery (the aarch64 console UART base is now
+discovered from the device tree, not hardcoded) on top of RAM-base DTB discovery,
+the 3-arch MMU, and the per-arch bring-up contract.
 
-== DTB PLATFORM DISCOVERY (this milestone) ==
-  - cibos-dtb (NEW from-scratch no_std crate, zero external deps): a flattened-
-    device-tree parser extracting RAM base/size + device bases. 4 tests INCLUDING
-    one against a REAL captured QEMU virt DTB — proves it parses the real-world
-    format (what matters for real hardware).
-  - kernel_entry now (handoff_ptr, dtb_ptr); riscv64 boot.s preserves a1 (DTB per
-    the RISC-V boot protocol), aarch64 passes x0. synth_handoff reads the REAL RAM
-    region from the DTB (dtb_ram_region), falling back to the conventional QEMU-
-    virt base/size if none is passed. So RAM layout is DISCOVERED, not hardcoded.
-  - Honest limitation: QEMU's `-kernel <ELF>` path doesn't pass a DTB pointer
-    (it's 0), so that test path uses the labeled fallback; the MECHANISM is proven
-    against real DTB data and engages whenever a real pointer arrives (CIBIOS
-    firmware / U-Boot / UEFI on real hardware). See DTB-AND-HARDCODED-VALUES.md.
-  - Hardcoded-value inventory (DTB-AND-HARDCODED-VALUES.md): aarch64/riscv64 RAM
-    base now DTB-driven; peripheral bases (PL011/GIC/UART/PLIC/CLINT) FLAGGED to
-    move to DTB device_base next; x86 VGA/COM1/PCI are architecturally fixed (NOT
-    QEMU-specific) and correctly remain constants.
+== PERIPHERAL DTB DISCOVERY (this increment) ==
+  The remaining genuine peripheral hardcode (aarch64 PL011 UART 0x09000000) is now
+  runtime-discovered:
+  - arch/aarch64.rs: UART0 is an AtomicUsize defaulting to the QEMU-virt address
+    (earlycon, so the very first kprintln works before the DTB is parsed), with
+    set_uart_base() to override it. putc reads the atomic.
+  - boot.rs: dtb_device_base(prefix) parses the DTB; kernel_entry overrides the
+    UART base from the DTB's pl011 node right after stashing the pointer, so later
+    output and real boards use the discovered address.
+  - cibos-dtb: real-DTB test finds_pl011_uart_base proves device_base(b"pl011")
+    resolves to 0x09000000 in the REAL captured QEMU DTB (node pl011@9000000).
+  - The two-stage (earlycon default -> DTB override) pattern is the correct
+    bare-metal approach: you cannot read the DTB to find the UART without first
+    having a UART to report DTB errors on. On QEMU `-kernel` (no DTB pointer) the
+    default is used; the override engages when a real DTB arrives (CIBIOS/U-Boot).
+  - riscv64 console uses OpenSBI (SBI calls) — no UART MMIO to discover; correctly
+    left until a PLIC/CLINT driver lands. GIC/PLIC/CLINT are not yet driven by any
+    kernel driver, so nothing is hardcoded-and-used there to fix today (flagged).
+  See PERIPHERAL-DTB-DISCOVERY.md and DTB-AND-HARDCODED-VALUES.md.
 
-== TESTING GUIDE (TESTING-GUIDE.md, new appendix) ==
-  Current per-arch build + boot steps (QEMU and real hardware), and crucially a
-  LOG-CAPTURE section: CIBOS output is plain serial text (mirrored to VGA on x86),
-  NOT written to a file on the USB yet — so capture the serial stream
-  (`screen -L`, `-serial file:`, or `| tee`) and send the .log back; on x86 with
-  no serial, photograph the VGA screen. Fault lines (ESR/ELR/FAR, scause/sepc/
-  stval) are decoded and printed — include them verbatim.
-
-== BOOT VISUALS — honest status ==
-  Today the boot is plain monochrome text, top-to-bottom, on serial + VGA text;
-  no color, no boxes, no scrollback. A colored/boxed console (the brand palette
-  #BBB092/#2E6F6B/#1E2235/#A17A74) is ACHIEVABLE: serial supports ANSI truecolor +
-  box-drawing (exact palette); VGA text supports 16 colors + box-drawing
-  (approximate palette); true RGB + image logo + graphical login need a framebuffer
-  GUI mode (larger future work). A log buffer (for scrollback + on-disk logs) is a
-  known future item.
+== Underlying (prior milestones, still verified in QEMU) ==
+  RAM-base DTB discovery (cibos-dtb parser + real-DTB test); 3-arch MMU online via
+  ONE shared bring_up_mmu_generic + per-arch ArchPaging hooks (x86_64 4-level,
+  aarch64 VMSAv8-64, riscv64 Sv48); the ArchBringUp contract (canonical phase
+  sequence, zero target_arch cfgs in the boot flow); A1 remote Lattice Links;
+  e1000 MMIO fix.
 
 == Status ==
-  * 374 workspace tests passing, 0 failing (+ cibos-dtb incl. real-DTB test).
+  * 375 workspace tests passing, 0 failing (+1 pl011 device_base test).
   * x86_64 (all configs) + aarch64 + riscv64 build clean (0 warnings); i686 via
-    build-std. x86_64 full stack; aarch64 + riscv64 MMU online; all QEMU-verified.
-  * NO real-silicon validation yet (this sandbox is x86_64-only QEMU; see
-    VERIFICATION-REALITY-AND-BARE-METAL.md). The testing guide is FOR that step.
+    build-std. x86_64 full stack (MMU/NIC/A1/ring-3/FS); aarch64 + riscv64 MMU
+    online; all QEMU-verified.
+  * NO real-silicon validation yet (x86_64-only QEMU sandbox; see
+    VERIFICATION-REALITY-AND-BARE-METAL.md). TESTING-GUIDE.md covers that step
+    incl. serial-log capture.
+
+== Boot visuals ==
+  Plain monochrome serial text (mirrored to VGA on x86) today; a colored/boxed
+  console (brand palette) is achievable on serial (ANSI truecolor) and VGA text
+  (16-color); true RGB + image logo + graphical login need a framebuffer GUI mode.
+  A kernel log buffer (scrollback/on-disk logs) is a known future item.
 
 == ELFs ==
   Firmware: cibios-{x86_64,aarch64,riscv64gc,i686}.elf
   Bootable kernels (MMU online): kernel-aarch64.elf, kernel-riscv64.elf
 
-Next: move ARM/RISC-V peripheral bases to DTB device_base; per-arch storage/NIC
-(virtio-mmio)/ring-3 against the contract; optional colored/boxed console; then
-real-hardware validation with serial-log capture.
+Next: aarch64 GIC + riscv64 PLIC/CLINT (read bases from DTB when those drivers are
+built); per-arch storage/NIC (virtio-mmio)/ring-3 against the contract; optional
+colored/boxed console; then real-hardware validation with serial-log capture.

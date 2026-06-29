@@ -42,7 +42,7 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub mod paging_aarch64;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{halt, init_serial, install_exception_vectors, putc};
+pub use aarch64::{halt, init_serial, install_exception_vectors, putc, set_uart_base};
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;

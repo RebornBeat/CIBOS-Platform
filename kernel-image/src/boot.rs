@@ -135,6 +135,16 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64, dtb_ptr: u64) -> ! {
     {
         DTB_PTR.store(dtb_ptr, core::sync::atomic::Ordering::Relaxed);
     }
+    // If the firmware DTB reports a different console UART base than the early
+    // bootstrap default, switch to it now so the rest of boot (and real boards)
+    // use the discovered address. On QEMU virt this is the same address; on a
+    // real board whose UART lives elsewhere, this is what makes output appear.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(base) = dtb_device_base(b"pl011") {
+            arch::set_uart_base(base as usize);
+        }
+    }
     let _ = dtb_ptr;
     // Phase: early_traps — install fault/trap vectors (and enable FP where the
     // arch needs it, done in the boot asm) so any fault is REPORTED, not silent.
@@ -1600,6 +1610,30 @@ fn dtb_ram_region() -> Option<(u64, u64)> {
     let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
     let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
     dt.ram_region().ok()
+}
+
+/// Parse the firmware DTB (if present) and return the base address of the first
+/// device node whose name starts with `prefix` (e.g. `b"pl011"` for the PL011
+/// UART). Returns `None` if no DTB was passed or the device is absent. Lets the
+/// kernel discover peripheral addresses at runtime instead of hardcoding them.
+/// (aarch64 today; riscv64's console goes through OpenSBI/SBI calls, so it has no
+/// MMIO peripheral to discover yet — this will extend there when a PLIC/CLINT
+/// driver lands.)
+#[cfg(target_arch = "aarch64")]
+fn dtb_device_base(prefix: &[u8]) -> Option<u64> {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: read the FDT header for the total size, then bound a slice to it.
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let total = cibos_dtb::DeviceTree::totalsize_at(header)?;
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
+    dt.device_base(prefix).ok()
 }
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they
 /// report `NotPermitted`. Guarded by a spinlock so the trap path and any setup

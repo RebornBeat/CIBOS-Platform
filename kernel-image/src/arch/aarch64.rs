@@ -1,13 +1,26 @@
 //! AArch64 serial (PL011 on QEMU `virt`) and halt for the kernel image.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// PL011 UART base on the QEMU `virt` machine. FLAG: confirm against the board's
-/// device tree for non-QEMU hardware.
-const UART0: usize = 0x0900_0000;
+/// PL011 UART base. Initialized to the QEMU `virt` default so the kernel can
+/// print during the earliest boot (before the DTB is parsed — you cannot read
+/// the DTB to find the UART without first having a UART to report parse errors
+/// on). After the DTB is parsed, [`set_uart_base`] updates this to the address
+/// the firmware actually reports (`pl011` node), so real boards use their own
+/// UART. This is the standard "earlycon then DTB console" pattern.
+static UART0: AtomicUsize = AtomicUsize::new(0x0900_0000);
 const UARTDR: usize = 0x00;
 const UARTFR: usize = 0x18;
 const UARTFR_TXFF: u8 = 1 << 5;
+
+/// Update the PL011 base from the platform device tree (called after the DTB is
+/// parsed). Before this runs, the QEMU-virt default is used so early boot can
+/// print. A no-op-equivalent on QEMU virt (same address); meaningful on real
+/// boards whose UART lives elsewhere.
+pub fn set_uart_base(addr: usize) {
+    UART0.store(addr, Ordering::Relaxed);
+}
 
 unsafe fn mmio_write_u8(addr: usize, val: u8) {
     core::ptr::write_volatile(addr as *mut u8, val);
@@ -22,9 +35,10 @@ pub fn init_serial() {}
 
 /// Write one byte to the UART, waiting for transmit FIFO space.
 pub fn putc(b: u8) {
+    let base = UART0.load(Ordering::Relaxed);
     unsafe {
-        while mmio_read_u8(UART0 + UARTFR) & UARTFR_TXFF != 0 {}
-        mmio_write_u8(UART0 + UARTDR, b);
+        while mmio_read_u8(base + UARTFR) & UARTFR_TXFF != 0 {}
+        mmio_write_u8(base + UARTDR, b);
     }
 }
 
