@@ -62,3 +62,33 @@ QEMU-virt value and the override is DTB-derived.
 - riscv64 PLIC/CLINT: read bases from DTB when those drivers are added.
 These are NOT hardcoded-and-used today (no kernel driver touches them yet), so
 there is nothing currently wrong to fix — they are flagged for when built.
+
+---
+
+## Correctness review (dwelling on this work)
+
+Re-examined the UART-from-DTB change for hazards beyond "it builds":
+
+1. VERIFIED CORRECT for what we can test: on aarch64 QEMU, "boot complete" prints
+   AFTER "MMU online", proving putc writes to the UART base THROUGH the kernel's
+   own page tables — i.e. the UART address is correctly identity-mapped and
+   survives the MMU switch. The two-stage (earlycon default -> DTB override)
+   logic works; the atomic load in putc is on the hot path but Relaxed ordering is
+   fine (single value, no dependent memory).
+
+2. KNOWN REAL-HARDWARE EDGE CASE (documented, not speculatively coded): the
+   override sets the UART base early, but the MMU identity map (0..1.25 GiB) is
+   built later. If a REAL board's DTB reports a UART base ABOVE 1.25 GiB, putc
+   would fault after the MMU comes online (the address would be unmapped). On QEMU
+   virt the UART is at 0x09000000 (well inside the map), so there is no bug today.
+   The robust fix when targeting such a board: have the MMU phase add the
+   DTB-discovered peripheral bases to mmio_identity_ranges() (the hook already
+   exists; aarch64 returns empty only because QEMU's peripherals are within the
+   low map). NOT done now because: (a) no real hardware to test it on, and (b)
+   adding untestable speculative mapping risks a bug we cannot verify — which would
+   violate "don't corrupt anything". Flagged here so it is addressed when a real
+   board with a high UART is actually in hand.
+
+3. No corruption introduced: x86_64 and riscv64 paths are untouched by this change
+   (riscv64 console is SBI, x86 is port-I/O COM1); only aarch64 putc reads the
+   atomic. All 375 tests pass; all three arches boot.

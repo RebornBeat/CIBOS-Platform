@@ -15,6 +15,11 @@ use core::arch::asm;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+/// Page Write-Through (bit 3) and Page Cache Disable (bit 4). Set together for
+/// device (MMIO) memory so accesses are uncached — the CPU must not cache or
+/// defer writes to device registers.
+const PWT: u64 = 1 << 3;
+const PCD: u64 = 1 << 4;
 const NO_EXECUTE: u64 = 1 << 63;
 /// Physical address field of an entry (bits 12..=51).
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -42,11 +47,45 @@ impl PageTableEncoder for X86PageTable {
         if !perms.execute {
             e |= NO_EXECUTE;
         }
+        if perms.device {
+            // Device (MMIO): uncached so the CPU does not cache or defer writes to
+            // device registers.
+            e |= PWT | PCD;
+        }
+        e
+    }
+
+    fn encode_block_leaf(frame: PhysFrame, perms: Permissions, _level: usize) -> u64 {
+        // A large page on x86_64 is a leaf at an interior level with the PS (Page
+        // Size) bit set (bit 7). At L2 that is a 2 MiB page, at L1 a 1 GiB page.
+        // The frame must be aligned to the block size (the low address bits are
+        // part of the entry's reserved/flag area). Same permission bits as a
+        // 4 KiB leaf, plus PS.
+        const PAGE_SIZE_PS: u64 = 1 << 7;
+        let mut e = (frame.addr() & ADDR_MASK) | PRESENT | PAGE_SIZE_PS;
+        if perms.write {
+            e |= WRITABLE;
+        }
+        if perms.user {
+            e |= USER;
+        }
+        if !perms.execute {
+            e |= NO_EXECUTE;
+        }
+        if perms.device {
+            e |= PWT | PCD;
+        }
         e
     }
 
     fn is_present(entry: u64) -> bool {
         entry & PRESENT != 0
+    }
+
+    fn is_block_leaf(entry: u64, _level: usize) -> bool {
+        // A large page on x86_64 is an interior leaf with the PS bit (bit 7) set.
+        const PAGE_SIZE_PS: u64 = 1 << 7;
+        (entry & PRESENT != 0) && (entry & PAGE_SIZE_PS != 0)
     }
 
     fn entry_frame(entry: u64) -> PhysFrame {
@@ -99,20 +138,32 @@ pub struct ArchPagingImpl;
 impl crate::bringup::ArchPaging for ArchPagingImpl {
     type Encoder = X86PageTable;
 
-    fn identity_map_bytes() -> u64 {
-        crate::loader::KERNEL_IDENTITY_MAP_BYTES
-    }
-
-    fn reserved_below() -> u64 {
-        // The PC loads the kernel at 16 MiB; 64 MiB clears it + the 8 MiB heap +
-        // stack. RAM starts at 0, so page-table frames come from above 64 MiB.
+    fn kernel_span() -> u64 {
+        // The PC loads the kernel at 16 MiB; reserve 64 MiB above the RAM base
+        // (which is ~0 on the PC) to clear the image + 8 MiB heap + stack. Frames
+        // come from above that. (Unchanged from the prior 64 MiB watermark, since
+        // the PC RAM base is effectively 0.)
         64 * 1024 * 1024
     }
 
+    fn min_identity_map_bytes() -> u64 {
+        // The PC has RAM low and devices (VGA, PCI hole handled separately) in the
+        // low 4 GiB; keep the established 1 GiB low map as the floor. RAM end will
+        // not exceed this in the target configs, so behavior is unchanged.
+        crate::loader::KERNEL_IDENTITY_MAP_BYTES
+    }
+
     fn mmio_identity_ranges() -> &'static [(u64, u64)] {
-        // The i440fx PCI MMIO hole (device BARs, e.g. the e1000 at 0xFEB80000).
-        // 0xFEB00000..0xFEC00000 = 1 MiB.
-        &[(0xFEB0_0000, 0x10_0000)]
+        // Memory-mapped device windows the kernel touches that must be mapped
+        // explicitly (not left to incidental coverage by the flat low map):
+        //   * VGA text buffer at 0xB8000 (0xB8000..0xB9000, 4 KiB) — the character
+        //     cell framebuffer. It lives below the 1 MiB RAM base, so it must be an
+        //     explicit mapping; this also lets a future per-RAM-region Normal map
+        //     leave non-RAM holes unmapped without losing VGA output.
+        //   * The i440fx PCI MMIO hole (device BARs, e.g. the e1000 at 0xFEB80000):
+        //     0xFEB00000..0xFEC00000 = 1 MiB.
+        // (COM1 serial is port-I/O, not memory-mapped, so it needs no page mapping.)
+        &[(0x000B_8000, 0x1000), (0xFEB0_0000, 0x10_0000)]
     }
 
     unsafe fn enable_table_features() {

@@ -40,11 +40,14 @@ const SH_INNER: u64 = 0b11 << 8;
 const PXN: u64 = 1 << 53; // Privileged eXecute Never (EL1)
 const UXN: u64 = 1 << 54; // Unprivileged eXecute Never (EL0)
 
-// MAIR attribute index (bits [4:2], AttrIndx). Index 0 = Normal write-back (set
-// up in MAIR_EL1 at install time). (A Device-nGnRnE attribute at index 1 is set
-// up in MAIR for a future explicit device-memory mapping path; the current MMIO
-// ranges are within the Normal-mapped low region.)
+// MAIR attribute index (bits [4:2], AttrIndx). Index 0 = Normal write-back
+// (MAIR Attr0 = 0xFF); index 1 = Device-nGnRnE (MAIR Attr1 = 0x00), used for MMIO
+// mappings via perms.device so device-register accesses are not cached, reordered,
+// gathered, or early-acknowledged. Both are programmed in MAIR_EL1 at install.
 const ATTR_NORMAL: u64 = 0 << 2;
+/// MAIR index 1 = Device-nGnRnE (set up in MAIR_EL1 at install). Used for MMIO so
+/// the CPU does not cache/reorder/merge device-register accesses.
+const ATTR_DEVICE: u64 = 1 << 2;
 
 /// The AArch64 VMSAv8-64 (4 KiB granule) page-table entry encoder.
 pub struct Aarch64PageTable;
@@ -59,21 +62,22 @@ impl PageTableEncoder for Aarch64PageTable {
     }
 
     fn encode_leaf(frame: PhysFrame, perms: Permissions) -> u64 {
-        // Level-3 page descriptor: valid + page type + AF + shareability +
-        // attr index + AP + XN. Device vs normal memory is chosen by whether the
-        // mapping is executable kernel RAM (normal) — MMIO is mapped non-exec, so
-        // we treat non-exec kernel pages conservatively as normal too; a dedicated
-        // device mapping path can pass an explicit attribute later. For now: all
-        // RAM is Normal cacheable; the MMIO ranges are mapped non-exec which is
-        // safe under Normal-NC-like behavior in QEMU, but to be correct we select
-        // Device attributes for non-executable kernel pages that are not writable
-        // data... however we cannot distinguish here, so RAM stays Normal.
+        // Level-3 page descriptor: valid + page type + AF + memory-attr + shareab.
+        // + AP + XN. Memory type comes from perms.device: Normal cacheable
+        // (inner-shareable) for RAM, Device-nGnRnE for MMIO so the CPU does not
+        // cache, reorder, prefetch, or merge device-register accesses. (For Device
+        // memory shareability is RES0/ignored, so SH is dropped.)
+        let (attr, sh) = if perms.device {
+            (ATTR_DEVICE, 0)
+        } else {
+            (ATTR_NORMAL, SH_INNER)
+        };
         let mut desc = (frame.addr() & ADDR_MASK)
             | DESC_VALID
             | DESC_TABLE_OR_PAGE // bit1 set => page descriptor at L3
             | DESC_AF
-            | SH_INNER
-            | ATTR_NORMAL;
+            | sh
+            | attr;
 
         // Access permissions from read/write/user.
         desc |= match (perms.write, perms.user) {
@@ -94,8 +98,48 @@ impl PageTableEncoder for Aarch64PageTable {
         desc
     }
 
+    fn encode_block_leaf(frame: PhysFrame, perms: Permissions, _level: usize) -> u64 {
+        // A BLOCK descriptor (at L1 = 1 GiB or L2 = 2 MiB) is identical to a page
+        // descriptor EXCEPT bits[1:0] = 0b01 (valid + block) instead of 0b11
+        // (valid + table/page). So: DESC_VALID set, DESC_TABLE_OR_PAGE (bit1)
+        // CLEAR. All other attribute bits (AF, SH, attr, AP, XN) are the same.
+        // `frame` must be aligned to the block size.
+        let (attr, sh) = if perms.device {
+            (ATTR_DEVICE, 0)
+        } else {
+            (ATTR_NORMAL, SH_INNER)
+        };
+        let mut desc = (frame.addr() & ADDR_MASK)
+            | DESC_VALID // bit0 = 1, bit1 = 0 => block descriptor
+            | DESC_AF
+            | sh
+            | attr;
+
+        desc |= match (perms.write, perms.user) {
+            (true, true) => AP_RW_ALL,
+            (true, false) => AP_RW_EL1,
+            (false, true) => AP_RO_ALL,
+            (false, false) => AP_RO_EL1,
+        };
+
+        if !perms.execute {
+            desc |= PXN | UXN;
+        } else if !perms.user {
+            desc |= UXN;
+        }
+
+        desc
+    }
+
     fn is_present(entry: u64) -> bool {
         entry & DESC_VALID != 0
+    }
+
+    fn is_block_leaf(entry: u64, _level: usize) -> bool {
+        // A block descriptor at an interior level has bits[1:0] = 0b01: valid set
+        // (DESC_VALID), table/page bit (bit 1, DESC_TABLE_OR_PAGE) CLEAR. A table
+        // descriptor has both set (0b11).
+        (entry & DESC_VALID != 0) && (entry & DESC_TABLE_OR_PAGE == 0)
     }
 
     fn entry_frame(entry: u64) -> PhysFrame {
@@ -158,34 +202,32 @@ pub struct ArchPagingImpl;
 impl crate::bringup::ArchPaging for ArchPagingImpl {
     type Encoder = Aarch64PageTable;
 
-    fn identity_map_bytes() -> u64 {
-        // On QEMU virt, RAM starts at 1 GiB (0x40000000) — the kernel, heap, and
-        // stack live just ABOVE 1 GiB (the kernel at 0x40080000), and the
-        // peripherals (PL011 at 0x09000000, GIC at 0x08000000) live below 256
-        // MiB. So the identity map must span from 0 through the RAM the kernel
-        // uses. 1.25 GiB covers the low peripheral region AND the 128 MiB RAM
-        // region at 1 GiB. (Mapping the full 4 GiB as 4 KiB pages is ~1M
-        // iterations — impractically slow in debug; block descriptors are a
-        // future portable-layer enhancement.)
-        (1024 + 256) * 1024 * 1024 // 1.25 GiB
+    fn kernel_span() -> u64 {
+        // Reserve 32 MiB above the RAM base for the kernel image (loaded at
+        // ram_base + 0x80000 on QEMU virt, similar offset elsewhere) + 8 MiB heap
+        // + stack. This is a per-arch constant relative to the RAM base, NOT a
+        // hardcoded platform address — the orchestration adds it to the DISCOVERED
+        // ram_base, so it is correct wherever the board places RAM.
+        32 * 1024 * 1024
     }
 
-    fn reserved_below() -> u64 {
-        // QEMU virt RAM is 128 MiB starting at 1 GiB (0x40000000..0x48000000);
-        // the kernel loads at 0x40080000 with an 8 MiB heap + stack above it.
-        // Reserve through 1 GiB + 32 MiB so the kernel image/heap/stack are
-        // protected, while the rest of the 128 MiB RAM (above 1 GiB + 32 MiB)
-        // stays free for page-table frames. (Reserving the full 1.25 GiB would
-        // reserve ALL 128 MiB of RAM, leaving zero free frames.)
-        1024 * 1024 * 1024 + 32 * 1024 * 1024 // 1 GiB + 32 MiB
+    fn min_identity_map_bytes() -> u64 {
+        // Always map at least the low 1 GiB so the peripheral region (PL011, GIC,
+        // and other low MMIO) is identity-mapped even when RAM sits higher. The
+        // orchestration raises this to cover all of real RAM (max with ram_end),
+        // so the actual map spans 0..max(1 GiB, ram_end) — derived, not hardcoded.
+        1024 * 1024 * 1024
     }
 
     fn mmio_identity_ranges() -> &'static [(u64, u64)] {
-        // On QEMU virt the peripherals (PL011 UART at 0x09000000, GIC at
-        // 0x08000000) live BELOW 256 MiB, so they are already covered by the main
-        // low-RAM identity map (which spans 0..1.25 GiB). Unlike the x86 PCI hole
-        // (which sits ABOVE the 1 GiB map and needs a separate mapping), there are
-        // no extra high-MMIO ranges to map here. Empty.
+        // No STATIC device windows on aarch64: the board-specific peripherals (the
+        // GIC interrupt controller and the PL011 UART) are discovered from the DTB
+        // at boot and registered into the runtime MMIO registry (mmio_registry),
+        // which the MMU phase carves out of the Normal map and maps as Device. This
+        // keeps the address source the PLATFORM (DTB), not a hardcoded board
+        // constant — correct on a Raspberry Pi, a Graviton server, an NXP board,
+        // etc., not just QEMU virt. (A bootstrap fallback to the QEMU-virt window is
+        // used only when no DTB is present, and is registered the same dynamic way.)
         &[]
     }
 

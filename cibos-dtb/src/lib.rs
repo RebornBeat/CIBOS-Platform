@@ -176,6 +176,19 @@ impl<'a> DeviceTree<'a> {
         let reg = self.node_reg(prefix).ok_or(DtbError::NotFound)?;
         be64(reg, 0).ok_or(DtbError::Truncated)
     }
+
+    /// The `(base, size)` of the first device node whose name starts with
+    /// `prefix`, read from its `reg` property (assuming 2 address cells + 2 size
+    /// cells, the standard for the 64-bit `virt` platforms). Used to register a
+    /// discovered device's MMIO window for Device mapping, so the window comes
+    /// from the platform's DTB rather than a hardcoded board constant.
+    pub fn device_reg(&self, prefix: &[u8]) -> Result<(u64, u64), DtbError> {
+        let reg = self.node_reg(prefix).ok_or(DtbError::NotFound)?;
+        let base = be64(reg, 0).ok_or(DtbError::Truncated)?;
+        // size may be absent on some nodes; default to a single page if so.
+        let size = be64(reg, 8).unwrap_or(0x1000);
+        Ok((base, size))
+    }
 }
 
 #[cfg(test)]

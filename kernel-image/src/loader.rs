@@ -184,6 +184,7 @@ pub unsafe fn load_app_image(
         write: seg.writable(),
         execute: seg.executable(),
         user: true,
+        device: false,
     };
 
     for i in 0..image.segment_count() {
@@ -314,6 +315,7 @@ pub unsafe fn run_app_image_isolated(
                 write: true,
                 execute: true,
                 user: false,
+                device: false,
             },
             frames,
             phys_to_ptr,
@@ -432,7 +434,7 @@ pub unsafe fn run_resume_demo(
             0,
             0,
             kernel_pages,
-            Permissions { read: true, write: true, execute: true, user: false },
+            Permissions { read: true, write: true, execute: true, user: false, device: false },
             frames,
             phys_to_ptr,
         )
@@ -569,7 +571,7 @@ pub unsafe fn new_lane_space(
             0,
             0,
             kernel_pages,
-            Permissions { read: true, write: true, execute: true, user: false },
+            Permissions { read: true, write: true, execute: true, user: false, device: false },
             frames,
             phys_to_ptr,
         )

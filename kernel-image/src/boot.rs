@@ -143,6 +143,43 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64, dtb_ptr: u64) -> ! {
     {
         if let Some(base) = dtb_device_base(b"pl011") {
             arch::set_uart_base(base as usize);
+            // Record the UART register window so the MMU phase maps it wherever
+            // the real board places it (the PL011 register file is 4 KiB).
+            register_mmio(base, 0x1000);
+        } else {
+            // No DTB (e.g. QEMU `-kernel`): the bootstrap-default UART is in use;
+            // record ITS window so the MMU maps it even if it falls outside RAM.
+            register_mmio(arch::uart_base() as u64, 0x1000);
+        }
+        // Interrupt controller (GIC) — BOARD-SPECIFIC, so discover its window from
+        // the DTB (node "intc@...") rather than a hardcoded address. The MMU phase
+        // maps whatever the platform reports. Fallback to the QEMU-virt GIC window
+        // only when there is no DTB (bootstrap default, explicitly labeled).
+        if let Some((base, size)) = dtb_device_reg(b"intc") {
+            register_mmio(base, size);
+        } else {
+            // GICv2 on QEMU virt: distributor 0x08000000 + CPU iface 0x08010000,
+            // i.e. a 0x10000 window. Bootstrap fallback only (no DTB present).
+            register_mmio(0x0800_0000, 0x0001_0000);
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Board-specific RV64 peripherals — discover each window from the DTB
+        // (nodes plic@, clint@, serial@) rather than hardcoding. Each falls back to
+        // the QEMU-virt address only when no DTB is present (bootstrap default).
+        // The MMU phase carves these from Normal and maps them Device.
+        match dtb_device_reg(b"plic") {
+            Some((base, size)) => register_mmio(base, size),
+            None => register_mmio(0x0C00_0000, 0x0021_0000),
+        }
+        match dtb_device_reg(b"clint") {
+            Some((base, size)) => register_mmio(base, size),
+            None => register_mmio(0x0200_0000, 0x0001_0000),
+        }
+        match dtb_device_reg(b"serial") {
+            Some((base, size)) => register_mmio(base, size),
+            None => register_mmio(0x1000_0000, 0x0000_1000),
         }
     }
     let _ = dtb_ptr;
@@ -383,16 +420,9 @@ fn bring_up_mmu_generic<P: crate::bringup::ArchPaging>(handoff: &HandoffData) {
     use alloc::vec::Vec;
     use shared::MemoryRegion;
 
-    // Reserve all physical memory below this watermark from the frame allocator
-    // so building the tables cannot clobber the kernel image, heap, or stack.
-    // Arch-supplied: on the PC, RAM starts at 0 and the kernel is low; on QEMU
-    // virt, RAM (and the kernel) start at 1 GiB, so the watermark must clear it.
-    let reserved_below: u64 = P::reserved_below();
-    // Identity-map this much physical address space (arch-supplied; covers
-    // everything the kernel touches plus any low framebuffer).
-    let identity_map_bytes: u64 = P::identity_map_bytes();
-
-    // Collect the usable memory map the same way the kernel core does.
+    // Collect the usable memory map the same way the kernel core does. This is
+    // DTB-derived (the handoff regions come from the platform device tree), so the
+    // RAM base/size below reflect the REAL board, not a compiled-in assumption.
     let regions: Vec<MemoryRegion> = match handoff.typed_regions() {
         Ok(iter) => match iter.collect::<Result<Vec<_>, _>>() {
             Ok(v) => v,
@@ -406,6 +436,39 @@ fn bring_up_mmu_generic<P: crate::bringup::ArchPaging>(handoff: &HandoffData) {
             return;
         }
     };
+
+    // Derive the memory-map geometry from the DISCOVERED RAM (not QEMU constants):
+    //   * ram_base / ram_end come from the platform's usable regions.
+    //   * reserved_below = ram_base + the arch's kernel span (image+heap+stack),
+    //     so the kernel's own memory is protected wherever the board places RAM.
+    //   * identity_map_bytes = max(arch low-device floor, ram_end), so all real
+    //     RAM is identity-mapped wherever it sits, and low device MMIO is always
+    //     covered. (Discovered high-MMIO devices above this are mapped separately
+    //     below.) This is the bare-metal-correct sizing: the page tables follow
+    //     the real platform, with no hardcoded QEMU-virt window.
+    let ram_base: u64 = regions
+        .iter()
+        .filter(|r| matches!(r.kind, shared::MemoryRegionKind::Usable))
+        .map(|r| r.base)
+        .min()
+        .unwrap_or(0);
+    let ram_end: u64 = regions
+        .iter()
+        .filter(|r| matches!(r.kind, shared::MemoryRegionKind::Usable))
+        .map(|r| r.base + r.length)
+        .max()
+        .unwrap_or(0);
+    // Page-align the derived bounds. The handoff/DTB may report RAM bounds that
+    // are not 4 KiB-aligned (QEMU virt happens to report aligned values, but real
+    // firmware need not). The identity map can only map WHOLE pages, so floor
+    // ram_end to a page boundary; mapping must never silently drop a partial page
+    // (that would leave a sliver of RAM unmapped — a fault waiting to happen on
+    // real hardware).
+    let ram_end = ram_end & !(FRAME_SIZE - 1);
+    let reserved_below: u64 = ram_base + P::kernel_span();
+    let identity_map_bytes: u64 =
+        (P::min_identity_map_bytes().max(ram_end)) & !(FRAME_SIZE - 1);
+
     let frames = FrameAllocator::from_regions(&regions, reserved_below);
     kprintln!(
         "CIBOS kernel: frame allocator: {} usable frame(s), {} free above {:#x}",
@@ -434,47 +497,156 @@ fn bring_up_mmu_generic<P: crate::bringup::ArchPaging>(handoff: &HandoffData) {
             }
         };
 
-        let pages = identity_map_bytes / FRAME_SIZE;
-        // Kernel-rwx identity map: the kernel runs in supervisor mode, so these
-        // are kernel (non-user) pages. Per-boundary user spaces will map user
-        // pages with restricted permissions on top of this mechanism.
-        if let Err(e) = space.map_range::<P::Encoder>(
-            0,
-            0,
-            pages,
-            Permissions {
-                read: true,
-                write: true,
-                execute: true,
-                user: false,
-            },
-            &frames,
-            &phys_to_ptr,
-        ) {
-            kprintln!("CIBOS kernel: MMU bring-up failed (identity map): {e}");
-            return;
+        let _ = identity_map_bytes / FRAME_SIZE;
+        // Kernel identity map, memory-type-correct for bare metal.
+        //
+        // A physical address's memory TYPE is a fact of the platform: RAM is
+        // Normal (cacheable), device MMIO is Device (uncached — accesses have side
+        // effects and must not be cached, reordered, gathered, or prefetched).
+        // Mapping MMIO as Normal is tolerated by emulators but BROKEN on silicon.
+        // The kernel must therefore map each page with the type the platform says
+        // it has. We gather EVERY device region the platform exposes — the arch's
+        // fixed device windows (P::mmio_identity_ranges) AND every region the
+        // kernel DISCOVERED from the DTB at runtime (mmio_registry) — then:
+        //   1. map [0, identity_map_bytes) as Normal in segments that CARVE OUT
+        //      every device region, and
+        //   2. map every device region as Device.
+        // The two sets are disjoint and the flat phys==virt invariant holds. The
+        // device set is collected into a heap Vec (the heap is online well before
+        // this phase) so there is NO fixed cap and NO silent drop — a real board
+        // may expose many device nodes, and dropping one would silently map it
+        // Normal cacheable (the very defect this avoids).
+        let map_end = identity_map_bytes;
+        let normal_perms = Permissions {
+            read: true,
+            write: true,
+            execute: true,
+            user: false,
+            device: false,
+        };
+        let device_perms = Permissions {
+            read: true,
+            write: true,
+            execute: false,
+            user: false,
+            device: true,
+        };
+
+        // Gather all device regions, page-rounded, as (start, end). No cap.
+        let mut devices: Vec<(u64, u64)> = Vec::new();
+        let add_device = |base: u64, len: u64, devices: &mut Vec<(u64, u64)>| {
+            if len == 0 {
+                return;
+            }
+            let start = (base / FRAME_SIZE) * FRAME_SIZE;
+            let end = base
+                .saturating_add(len)
+                .div_ceil(FRAME_SIZE)
+                .saturating_mul(FRAME_SIZE);
+            if start < end {
+                devices.push((start, end));
+            }
+        };
+        for &(base, len) in P::mmio_identity_ranges() {
+            add_device(base, len, &mut devices);
+        }
+        // The runtime-discovered registry (e.g. the UART base from the DTB). This
+        // is what makes the map follow real platform discovery, not a constant.
+        for i in 0..mmio_registry::count() {
+            let (rbase, rend) = mmio_registry::region(i);
+            add_device(rbase, rend.saturating_sub(rbase), &mut devices);
+        }
+        // Sort by start and coalesce overlapping/adjacent regions so the carve and
+        // the Device map are both clean (no double-map, no gaps).
+        devices.sort_unstable_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (s, e) in devices {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
         }
 
-        // Map the arch's device-MMIO ranges (kernel-rw, NON-EXECUTABLE) so
-        // MMIO-BAR drivers can reach their registers. The main identity map only
-        // covers low RAM; device MMIO lives high (x86 PCI hole at 0xFEB.., ARM
-        // GIC/UART, RISC-V PLIC/UART). Real hardware register space — any OS maps it.
-        for &(base, len) in P::mmio_identity_ranges() {
-            let mmio_pages = len / FRAME_SIZE;
-            if let Err(e) = space.map_range::<P::Encoder>(
-                base,
-                base,
-                mmio_pages,
-                Permissions {
-                    read: true,
-                    write: true,
-                    execute: false,
-                    user: false,
-                },
-                &frames,
-                &phys_to_ptr,
-            ) {
-                kprintln!("CIBOS kernel: MMU bring-up failed (MMIO map {base:#x}): {e}");
+        // (1) Map RAM as Normal — but ONLY over the actual usable RAM regions the
+        // platform reports, NOT a flat [0, map_end). Each region is mapped Normal
+        // in segments that carve out any device range falling within it. This means
+        // non-RAM holes (gaps between RAM banks, and the sub-ram_base space that is
+        // not a declared device) are left UNMAPPED, so a stray access faults loudly
+        // instead of silently reading garbage from a Normal-cached phantom mapping.
+        // (On a single-contiguous-RAM platform like QEMU virt this produces exactly
+        // one RAM region and is identical to the old flat map minus device carves;
+        // the difference appears on real boards with split RAM or large low device
+        // space.) `merged` is the sorted, coalesced device list.
+        let map_normal_region = |rb: u64, re: u64| -> bool {
+            // Page-align the region inward (only whole pages can be mapped).
+            let rb = (rb + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+            let re = re & !(FRAME_SIZE - 1);
+            if rb >= re {
+                return true;
+            }
+            let mut cursor = rb;
+            for &(d_start, d_end) in &merged {
+                // Clamp the device range to this RAM region.
+                let d_start = d_start.max(rb).min(re);
+                let d_end = d_end.max(rb).min(re);
+                if d_start >= d_end {
+                    continue; // device range does not overlap this region
+                }
+                if cursor < d_start {
+                    let seg_pages = (d_start - cursor) / FRAME_SIZE;
+                    if seg_pages > 0
+                        && space
+                            .map_range::<P::Encoder>(
+                                cursor, cursor, seg_pages, normal_perms, &frames, &phys_to_ptr,
+                            )
+                            .is_err()
+                    {
+                        return false;
+                    }
+                }
+                cursor = cursor.max(d_end);
+            }
+            if cursor < re {
+                let seg_pages = (re - cursor) / FRAME_SIZE;
+                if seg_pages > 0
+                    && space
+                        .map_range::<P::Encoder>(
+                            cursor, cursor, seg_pages, normal_perms, &frames, &phys_to_ptr,
+                        )
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        for region in regions
+            .iter()
+            .filter(|r| matches!(r.kind, shared::MemoryRegionKind::Usable))
+        {
+            // Only map the portion of the region within the identity-map extent.
+            let re = (region.base + region.length).min(map_end);
+            if !map_normal_region(region.base, re) {
+                kprintln!("CIBOS kernel: MMU bring-up failed (identity map)");
+                return;
+            }
+        }
+
+        // (2) Map every device region as Device (uncached). These are disjoint
+        // from the Normal segments above (carved out) and from each other (merged).
+        for &(d_start, d_end) in &merged {
+            let pages = (d_end - d_start) / FRAME_SIZE;
+            if pages == 0 {
+                continue;
+            }
+            if space
+                .map_range::<P::Encoder>(d_start, d_start, pages, device_perms, &frames, &phys_to_ptr)
+                .is_err()
+            {
+                kprintln!("CIBOS kernel: MMU bring-up failed (device MMIO {d_start:#x})");
                 return;
             }
         }
@@ -1590,6 +1762,98 @@ pub(crate) struct KernelSyscallEnv;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 static DTB_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// A runtime registry of device-MMIO regions the kernel has DISCOVERED (e.g. the
+/// UART from the DTB), so the MMU phase maps exactly the register space the real
+/// platform has — wherever the board places it — instead of a compiled-in list.
+///
+/// Fixed-capacity and lock-light so it is usable during the earliest boot, before
+/// the heap and MMU exist. Each slot is a page-rounded `(base, end)` region.
+/// Populated by [`register_mmio`] at device-discovery time; consumed by the MMU
+/// phase via [`registered_mmio`]. Bare-metal-correct: discovery drives mapping.
+///
+/// Read by the MMU phase on every arch; populated today by aarch64 (UART from the
+/// DTB). x86 (PCI BARs) and riscv64 (PLIC/CLINT) will populate it as their device
+/// discovery is wired, so some items are not yet called on those arches.
+#[allow(dead_code)]
+mod mmio_registry {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// Max distinct device MMIO regions discovered BEFORE the MMU is online.
+    /// Early boot discovers a bounded, small set (UART, interrupt controller,
+    /// timer, storage, NIC — typically under a dozen); 32 is generous headroom.
+    /// Devices discovered AFTER the MMU is online (hot-plug, post-enumeration PCI)
+    /// map their own BARs as Device on demand and do not use this early registry.
+    /// Overflow is reported LOUDLY (never silently dropped) so a platform that
+    /// somehow exposes more early device regions than this is caught, not left
+    /// with an unmapped/Normal-mapped device.
+    pub const CAP: usize = 32;
+
+    // Parallel arrays of page-rounded region bounds. A `len` below `CAP` of them
+    // are valid. AtomicU64 so the early single-threaded writes are visible to the
+    // MMU phase without a heap allocation or a lock.
+    pub static BASES: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
+    pub static ENDS: [AtomicU64; CAP] = [const { AtomicU64::new(0) }; CAP];
+    pub static LEN: AtomicUsize = AtomicUsize::new(0);
+
+    const PAGE: u64 = 4096;
+
+    /// Record a discovered MMIO region, page-rounded (floor(base)..ceil(base+size)).
+    /// De-duplicates exact repeats. Returns `false` if the registry is full so the
+    /// caller can warn LOUDLY — a full registry is never silently ignored, because
+    /// dropping a device would leave it unmapped/Normal-cacheable (a real-hardware
+    /// defect).
+    pub fn register(base: u64, size: u64) -> bool {
+        if size == 0 {
+            return true; // nothing to do; not a failure
+        }
+        let start = base & !(PAGE - 1);
+        let end = (base + size + PAGE - 1) & !(PAGE - 1);
+        let n = LEN.load(Ordering::Relaxed);
+        // Skip an exact duplicate region already recorded.
+        for i in 0..n {
+            if BASES[i].load(Ordering::Relaxed) == start
+                && ENDS[i].load(Ordering::Relaxed) == end
+            {
+                return true; // already present
+            }
+        }
+        if n >= CAP {
+            // Out of room — report via the return value so the caller can warn
+            // LOUDLY (never silently drop a device: that would leave it
+            // Normal-cacheable/unmapped, a real-hardware defect).
+            return false;
+        }
+        BASES[n].store(start, Ordering::Relaxed);
+        ENDS[n].store(end, Ordering::Relaxed);
+        LEN.store(n + 1, Ordering::Relaxed);
+        true
+    }
+
+    /// The number of registered regions.
+    pub fn count() -> usize {
+        LEN.load(Ordering::Relaxed).min(CAP)
+    }
+
+    /// The page-rounded `(base, end)` of registered region `i`.
+    pub fn region(i: usize) -> (u64, u64) {
+        (
+            BASES[i].load(Ordering::Relaxed),
+            ENDS[i].load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Record a discovered device-MMIO region so the MMU phase maps it. Called at
+/// device-discovery time (e.g. when the UART base is resolved from the DTB).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn register_mmio(base: u64, size: u64) {
+    if !mmio_registry::register(base, size) {
+        kprintln!(
+            "CIBOS kernel: WARNING device MMIO registry full; region {base:#x} NOT mapped (raise CAP)"
+        );
+    }
+}
+
 /// Parse the firmware DTB (if present and valid) and return the primary RAM
 /// region `(base, size)`. Returns `None` if no DTB was passed or it could not be
 /// parsed — callers then fall back to the platform's conventional layout. This is
@@ -1635,6 +1899,26 @@ fn dtb_device_base(prefix: &[u8]) -> Option<u64> {
     let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
     dt.device_base(prefix).ok()
 }
+
+/// The `(base, size)` MMIO window of a DTB device node by name prefix, so a
+/// board-specific peripheral (interrupt controller, timer, ...) is mapped from the
+/// platform's actual device tree rather than a hardcoded board constant. Returns
+/// `None` if there is no DTB (e.g. QEMU `-kernel`) or the node is absent.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn dtb_device_reg(prefix: &[u8]) -> Option<(u64, u64)> {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let total = cibos_dtb::DeviceTree::totalsize_at(header)?;
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
+    dt.device_reg(prefix).ok()
+}
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they
 /// report `NotPermitted`. Guarded by a spinlock so the trap path and any setup
 /// code do not race.
@@ -1677,7 +1961,9 @@ pub fn nic_present() -> bool {
 
 /// The kernel CSPRNG backing the `get_random` syscall, seeded from the firmware
 /// entropy seed in the handoff at bring-up. `None` until seeded.
-#[cfg(target_arch = "x86_64")]
+/// The kernel CSPRNG, seeded once from the firmware entropy seed. Backs the
+/// `get_random` syscall and the scheduler's weighted-entropy seed. Portable — the
+/// CSPRNG has no architecture-specific code, so it is seeded on every arch.
 static KERNEL_RNG: cibos_kernel::sync::SpinLock<Option<cibos_kernel::entropy::Csprng>> =
     cibos_kernel::sync::SpinLock::new(None);
 
@@ -1806,9 +2092,21 @@ pub fn clear_channel_table() {
 }
 
 /// Seed the kernel CSPRNG from the firmware entropy seed. Called once at boot.
-#[cfg(target_arch = "x86_64")]
+/// Portable across all arches — the CSPRNG is pure `cibos_kernel` code.
 fn seed_kernel_rng(seed: [u8; 32]) {
     *KERNEL_RNG.lock() = Some(cibos_kernel::entropy::Csprng::from_seed(seed));
+}
+
+/// The portable body of the `seed_entropy` bring-up phase: copy up to 32 bytes of
+/// the firmware entropy seed and initialize the kernel CSPRNG. Identical on every
+/// arch (the RNG has no architecture-specific code), so all `ArchBringUp` impls
+/// call this rather than duplicating it.
+fn seed_entropy_portable(seed: &[u8]) -> crate::bringup::PhaseStatus {
+    let mut buf = [0u8; 32];
+    let n = buf.len().min(seed.len());
+    buf[..n].copy_from_slice(&seed[..n]);
+    seed_kernel_rng(buf);
+    crate::bringup::PhaseStatus::Done
 }
 
 /// Draw a 32-byte entropy seed from the kernel RNG for the multilane selector
@@ -2714,11 +3012,7 @@ impl ArchBringUp for Arch {
     }
 
     fn seed_entropy(&self, seed: &[u8]) -> PhaseStatus {
-        let mut buf = [0u8; 32];
-        let n = buf.len().min(seed.len());
-        buf[..n].copy_from_slice(&seed[..n]);
-        seed_kernel_rng(buf);
-        PhaseStatus::Done
+        seed_entropy_portable(seed)
     }
 
     fn mount_root_fs(&self) -> PhaseStatus {
@@ -2756,8 +3050,9 @@ impl ArchBringUp for Arch {
             arch::install_exception_vectors();
         }
     }
-    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: aarch64 RNG path")
+    fn seed_entropy(&self, seed: &[u8]) -> PhaseStatus {
+        // The CSPRNG is portable; the same seeding runs on every arch.
+        seed_entropy_portable(seed)
     }
     fn mount_root_fs(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: aarch64 block driver")
@@ -2782,8 +3077,9 @@ impl ArchBringUp for Arch {
             arch::install_trap_vector();
         }
     }
-    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: riscv64 RNG path")
+    fn seed_entropy(&self, seed: &[u8]) -> PhaseStatus {
+        // The CSPRNG is portable; the same seeding runs on every arch.
+        seed_entropy_portable(seed)
     }
     fn mount_root_fs(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: riscv64 block driver")
@@ -2804,8 +3100,10 @@ impl ArchBringUp for Arch {
     fn early_traps(&self) {
         // i686: 32-bit IDT pending; serial is live. No early-trap install yet.
     }
-    fn seed_entropy(&self, _seed: &[u8]) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: i686 RNG path")
+    fn seed_entropy(&self, seed: &[u8]) -> PhaseStatus {
+        // Identical portable CSPRNG seeding as every other arch — no i686-specific
+        // code. The RNG is pure cibos_kernel.
+        seed_entropy_portable(seed)
     }
     fn mount_root_fs(&self) -> PhaseStatus {
         PhaseStatus::Skipped("pending: i686 block driver")

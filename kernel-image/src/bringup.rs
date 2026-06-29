@@ -31,16 +31,22 @@ pub trait ArchPaging {
     /// The architecture's page-table entry encoder.
     type Encoder: cibos_kernel::paging::PageTableEncoder;
 
-    /// How many bytes of low physical RAM to identity-map for the kernel.
-    fn identity_map_bytes() -> u64;
+    /// How many bytes above the RAM base to reserve for the kernel's own image,
+    /// heap, and stack, so the frame allocator never hands those out for page
+    /// tables. This is a per-arch constant (it depends on the kernel's load
+    /// offset within RAM + heap size), NOT a platform address — the actual
+    /// reservation watermark is computed by the orchestration as
+    /// `ram_base + kernel_span()`, so it is correct wherever the board places RAM.
+    fn kernel_span() -> u64;
 
-    /// The physical watermark below which all frames are reserved (never handed
-    /// out by the frame allocator), so building page tables cannot clobber the
-    /// kernel image, heap, or stack. This MUST cover everything the kernel is
-    /// using. On the PC, RAM starts at 0 and the kernel is low, so a small
-    /// watermark suffices; on boards where RAM starts high (QEMU virt: 1 GiB),
-    /// the watermark must clear the kernel's load+heap region.
-    fn reserved_below() -> u64;
+    /// A floor for how many bytes of low physical address space to identity-map,
+    /// regardless of where RAM is. The orchestration maps
+    /// `max(min_identity_map_bytes(), ram_base + ram_size)` so that (a) all of
+    /// real RAM is covered wherever it sits, and (b) at least this much low space
+    /// (covering low device MMIO) is always mapped. On the PC, RAM starts near 0
+    /// so this floor is the whole map; on boards with high RAM it guarantees the
+    /// low device region is mapped even though RAM is elsewhere.
+    fn min_identity_map_bytes() -> u64;
 
     /// Device-MMIO ranges `(base, length)` to identity-map (kernel-rw, non-exec)
     /// so MMIO-BAR drivers can reach their registers. May be empty.

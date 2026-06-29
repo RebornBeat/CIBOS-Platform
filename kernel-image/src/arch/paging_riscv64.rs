@@ -52,7 +52,30 @@ impl PageTableEncoder for Sv48PageTable {
 
     fn encode_leaf(frame: PhysFrame, perms: Permissions) -> u64 {
         // Leaf PTE: valid + A + D + the requested R/W/X/U. Reads are always
-        // allowed for a present leaf; W and X follow perms.
+        // allowed for a present leaf; W and X follow perms. NOTE: perms.device
+        // (MMIO/uncached) has NO PTE encoding in the base RISC-V ISA — memory
+        // attributes come from the platform's PMAs (fixed in hardware/DT), not the
+        // page table. So device is intentionally a no-op here; the Svpbmt
+        // extension (if present) would add per-PTE memory types in a future step.
+        let mut pte = ppn_field(frame) | PTE_V | PTE_R | PTE_A | PTE_D;
+        if perms.write {
+            pte |= PTE_W;
+        }
+        if perms.execute {
+            pte |= PTE_X;
+        }
+        if perms.user {
+            pte |= PTE_U;
+        }
+        pte
+    }
+
+    fn encode_block_leaf(frame: PhysFrame, perms: Permissions, _level: usize) -> u64 {
+        // On RISC-V a "superpage" is simply a LEAF PTE (R/W/X != 0) placed at a
+        // non-final level — the encoding is IDENTICAL to a 4 KiB leaf; what makes
+        // it a block is the LEVEL it sits at (L2 => 2 MiB, L1 => 1 GiB). The PPN
+        // must be aligned to the superpage size (the walker guarantees this). So
+        // this is the same bits as encode_leaf.
         let mut pte = ppn_field(frame) | PTE_V | PTE_R | PTE_A | PTE_D;
         if perms.write {
             pte |= PTE_W;
@@ -68,6 +91,13 @@ impl PageTableEncoder for Sv48PageTable {
 
     fn is_present(entry: u64) -> bool {
         entry & PTE_V != 0
+    }
+
+    fn is_block_leaf(entry: u64, _level: usize) -> bool {
+        // On RISC-V a PTE is a LEAF (superpage when at a non-final level) iff it
+        // is valid AND has any of R/W/X set. An interior table pointer has
+        // R=W=X=0. So at an interior level, valid + (R|W|X) => block leaf.
+        (entry & PTE_V != 0) && (entry & (PTE_R | PTE_W | PTE_X) != 0)
     }
 
     fn entry_frame(entry: u64) -> PhysFrame {
@@ -114,26 +144,32 @@ pub struct ArchPagingImpl;
 impl crate::bringup::ArchPaging for ArchPagingImpl {
     type Encoder = Sv48PageTable;
 
-    fn identity_map_bytes() -> u64 {
-        // QEMU virt RAM starts at 0x80000000 (2 GiB); OpenSBI occupies the low
-        // part and the kernel loads above it. Identity-map through the RAM the
-        // kernel uses. 2.25 GiB covers 0..0x90000000 (the low devices, OpenSBI,
-        // and the kernel+heap region just above 2 GiB).
-        (2048 + 256) * 1024 * 1024 // 2.25 GiB
+    fn kernel_span() -> u64 {
+        // RISC-V S-mode: OpenSBI occupies the low ~2 MiB of RAM (ram_base ..
+        // ram_base+0x200000) and the kernel loads just above it (0x80200000 on
+        // QEMU virt) with an 8 MiB heap + stack. Reserve 32 MiB above the RAM base
+        // to clear OpenSBI + kernel + heap. A per-arch constant relative to the
+        // DISCOVERED ram_base, not a hardcoded platform address.
+        32 * 1024 * 1024
     }
 
-    fn reserved_below() -> u64 {
-        // QEMU virt RV64 RAM starts at 2 GiB (0x80000000); OpenSBI sits at the
-        // base and the kernel is loaded above it. Reserve through 2 GiB + 32 MiB
-        // so the frame allocator never hands out OpenSBI's or the kernel's memory
-        // for page tables; frames come from RAM above that.
-        2u64 * 1024 * 1024 * 1024 + 32 * 1024 * 1024 // 2 GiB + 32 MiB
+    fn min_identity_map_bytes() -> u64 {
+        // Map at least the low 1 GiB so the peripherals (UART 0x10000000, PLIC
+        // 0x0C000000, CLINT 0x02000000 — all below 256 MiB) are identity-mapped
+        // even when RAM sits at 2 GiB. The orchestration raises this to cover all
+        // of real RAM (max with ram_end), so the map spans 0..max(1 GiB, ram_end).
+        1024 * 1024 * 1024
     }
 
     fn mmio_identity_ranges() -> &'static [(u64, u64)] {
-        // QEMU virt RV64 peripherals (UART 0x10000000, PLIC 0x0C000000, CLINT
-        // 0x02000000) all live below 2 GiB and are covered by the main identity
-        // map. No extra high-MMIO ranges.
+        // No STATIC device windows on riscv64: the board-specific peripherals
+        // (PLIC interrupt controller, CLINT timer/IPI, and the NS16550 UART) are
+        // discovered from the DTB at boot (nodes plic@/clint@/serial@) and
+        // registered into the runtime MMIO registry, which the MMU phase carves
+        // from Normal and maps Device. The address source is the PLATFORM (DTB),
+        // not a hardcoded constant — correct on SiFive, StarFive, etc., not just
+        // QEMU virt. A bootstrap fallback to the QEMU-virt windows is registered the
+        // same dynamic way only when no DTB is present.
         &[]
     }
 

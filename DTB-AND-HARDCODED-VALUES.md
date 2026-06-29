@@ -49,3 +49,28 @@ Architecturally FIXED (correctly hardcoded — NOT QEMU-specific):
 2. Get a real DTB pointer on the QEMU test path too (load via -dtb / read QEMU's
    placed DTB) OR rely on the CIBIOS firmware path for real-hardware discovery.
 3. Then no platform address is compiled in for ARM/RISC-V — true bare-metal-first.
+
+---
+
+## Re-scrutiny (this session): is the synth_handoff fallback a QEMU shortcut?
+Verified the boot paths. There are TWO obtain_handoff impls:
+  - `self-boot` feature build: synth_handoff() — the path with the QEMU-virt
+    fallback constants. This build exists ONLY for standalone QEMU `-kernel`
+    testing.
+  - firmware build (no self-boot): core::ptr::read(ptr) — reads the REAL handoff
+    that CIBIOS firmware passes. On real hardware the kernel comes up via CIBIOS,
+    so it gets the real, firmware-discovered RAM layout — NEVER the fallback.
+Within the self-boot path, aarch64/riscv64 still try dtb_ram_region() FIRST and
+only use the fallback (logged "using platform fallback") when no DTB is present
+(which is the QEMU `-kernel` case; real boards booted via U-Boot/UEFI provide a
+DTB and use the dynamic path).
+CONCLUSION: the fallback is genuinely TEST-ONLY, not a bare-metal shortcut. The
+production/real-hardware path is fully dynamic (firmware handoff or DTB). No
+change needed; documented so it's not mistaken for a shortcut later.
+
+## i686 boot.s 2-arg fix (this session) — verified correct
+kernel_entry is extern "C" (i386 cdecl on i686). The fix pushes both u64 args
+right-to-left (dtb high/low, handoff high/low) so arg0=handoff_ptr lands at
+top-of-stack — ABI-correct. i686 never reads dtb_ptr (it's gated to aarch64/
+riscv64), so the value is harmlessly ignored; the fix removes the prior latent
+stack-misread (old asm pushed only one u64 while kernel_entry reads two).

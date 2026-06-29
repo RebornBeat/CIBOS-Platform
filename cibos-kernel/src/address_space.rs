@@ -264,8 +264,28 @@ mod tests {
             }
             e
         }
+        fn encode_block_leaf(frame: PhysFrame, perms: Permissions, _level: usize) -> u64 {
+            // Test encoder: a block leaf is a leaf with bit 7 (PS) set, so tests
+            // can distinguish a block mapping from a 4 KiB page mapping.
+            const PS: u64 = 1 << 7;
+            let mut e = (frame.addr() & ADDR_MASK) | PRESENT | PS;
+            if perms.write {
+                e |= WRITE;
+            }
+            if perms.user {
+                e |= USER;
+            }
+            if !perms.execute {
+                e |= NX;
+            }
+            e
+        }
         fn is_present(entry: u64) -> bool {
             entry & PRESENT != 0
+        }
+        fn is_block_leaf(entry: u64, _level: usize) -> bool {
+            const PS: u64 = 1 << 7;
+            (entry & PRESENT != 0) && (entry & PS != 0)
         }
         fn entry_frame(entry: u64) -> PhysFrame {
             PhysFrame::containing(entry & ADDR_MASK)
