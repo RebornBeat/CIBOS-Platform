@@ -168,8 +168,8 @@ impl crate::bringup::ArchPaging for ArchPagingImpl {
         // registered into the runtime MMIO registry, which the MMU phase carves
         // from Normal and maps Device. The address source is the PLATFORM (DTB),
         // not a hardcoded constant — correct on SiFive, StarFive, etc., not just
-        // QEMU virt. A bootstrap fallback to the QEMU-virt windows is registered the
-        // same dynamic way only when no DTB is present.
+        // QEMU virt. There is NO fallback: the DTB is always present (real firmware
+        // and QEMU via OpenSBI), and a missing node is reported, not papered over.
         &[]
     }
 

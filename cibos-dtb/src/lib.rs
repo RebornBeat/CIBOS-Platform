@@ -189,6 +189,53 @@ impl<'a> DeviceTree<'a> {
         let size = be64(reg, 8).unwrap_or(0x1000);
         Ok((base, size))
     }
+
+    /// Whether the first node whose name starts with `prefix` has a property named
+    /// `prop` (presence check, for boolean DTB properties like `dma-coherent`).
+    /// Used to verify a platform guarantee (e.g. DMA coherency) rather than assume
+    /// it — on a non-coherent platform the property is absent and the driver must
+    /// do cache maintenance instead of relying on a barrier alone.
+    pub fn node_has_prop(&self, prefix: &[u8], prop: &[u8]) -> bool {
+        let mut pos = self.struct_off;
+        let end = self.struct_off + self.struct_size;
+        let mut in_target = false;
+        while pos < end {
+            let Some(token) = be32(self.blob, pos) else {
+                return false;
+            };
+            pos += 4;
+            match token {
+                FDT_BEGIN_NODE => {
+                    let name_start = pos;
+                    let mut e = name_start;
+                    while e < self.blob.len() && self.blob[e] != 0 {
+                        e += 1;
+                    }
+                    let name = &self.blob[name_start..e];
+                    in_target = name.starts_with(prefix);
+                    pos = (e + 1 + 3) & !3;
+                }
+                FDT_PROP => {
+                    let Some(len) = be32(self.blob, pos) else {
+                        return false;
+                    };
+                    let Some(nameoff) = be32(self.blob, pos + 4) else {
+                        return false;
+                    };
+                    let data_start = pos + 8;
+                    pos = (data_start + len as usize + 3) & !3;
+                    if in_target && self.prop_name(nameoff as usize) == prop {
+                        return true;
+                    }
+                }
+                FDT_END_NODE => in_target = false,
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => return false,
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]

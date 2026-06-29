@@ -141,45 +141,71 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64, dtb_ptr: u64) -> ! {
     // real board whose UART lives elsewhere, this is what makes output appear.
     #[cfg(target_arch = "aarch64")]
     {
+        // The DTB is ALWAYS provided on this arch: real firmware/U-Boot passes it
+        // in x0, and our ARM64 image header makes QEMU do the same. So we discover
+        // the console UART (pl011@) and interrupt controller (intc@/GIC) windows
+        // from the DTB with NO hardcoded fallback — if a node is absent that is a
+        // real platform/DTB fault we report, not something we paper over with a
+        // QEMU-virt address (which would be wrong on any other board).
         if let Some(base) = dtb_device_base(b"pl011") {
             arch::set_uart_base(base as usize);
-            // Record the UART register window so the MMU phase maps it wherever
-            // the real board places it (the PL011 register file is 4 KiB).
+            // Record the UART register window so the MMU phase maps it wherever the
+            // real board places it (the PL011 register file is 4 KiB).
             register_mmio(base, 0x1000);
         } else {
-            // No DTB (e.g. QEMU `-kernel`): the bootstrap-default UART is in use;
-            // record ITS window so the MMU maps it even if it falls outside RAM.
-            register_mmio(arch::uart_base() as u64, 0x1000);
+            kprintln!("CIBOS kernel: WARNING: no pl011 UART node in DTB");
         }
-        // Interrupt controller (GIC) — BOARD-SPECIFIC, so discover its window from
-        // the DTB (node "intc@...") rather than a hardcoded address. The MMU phase
-        // maps whatever the platform reports. Fallback to the QEMU-virt GIC window
-        // only when there is no DTB (bootstrap default, explicitly labeled).
+        // Interrupt controller (GIC) — board-specific; discover its window from the
+        // DTB "intc@..." node. The MMU phase carves it from Normal and maps Device.
         if let Some((base, size)) = dtb_device_reg(b"intc") {
             register_mmio(base, size);
         } else {
-            // GICv2 on QEMU virt: distributor 0x08000000 + CPU iface 0x08010000,
-            // i.e. a 0x10000 window. Bootstrap fallback only (no DTB present).
-            register_mmio(0x0800_0000, 0x0001_0000);
+            kprintln!("CIBOS kernel: WARNING: no intc/GIC node in DTB");
         }
     }
     #[cfg(target_arch = "riscv64")]
     {
         // Board-specific RV64 peripherals — discover each window from the DTB
-        // (nodes plic@, clint@, serial@) rather than hardcoding. Each falls back to
-        // the QEMU-virt address only when no DTB is present (bootstrap default).
-        // The MMU phase carves these from Normal and maps them Device.
-        match dtb_device_reg(b"plic") {
-            Some((base, size)) => register_mmio(base, size),
-            None => register_mmio(0x0C00_0000, 0x0021_0000),
+        // (nodes plic@, clint@, serial@). The DTB is ALWAYS provided on this arch:
+        // real hardware passes it via firmware/U-Boot, and QEMU passes it via
+        // OpenSBI in a1. There is NO fallback: if a node is absent, that is a real
+        // platform/DTB problem and we report it rather than silently using a
+        // hardcoded QEMU-virt address (which would mask the fault and is wrong on
+        // any non-QEMU board). The MMU phase carves these from Normal and maps them
+        // Device.
+        if let Some((base, size)) = dtb_device_reg(b"plic") {
+            register_mmio(base, size);
+        } else {
+            kprintln!("CIBOS kernel: WARNING: no PLIC node in DTB");
         }
-        match dtb_device_reg(b"clint") {
-            Some((base, size)) => register_mmio(base, size),
-            None => register_mmio(0x0200_0000, 0x0001_0000),
+        if let Some((base, size)) = dtb_device_reg(b"clint") {
+            register_mmio(base, size);
+        } else {
+            kprintln!("CIBOS kernel: WARNING: no CLINT node in DTB");
         }
-        match dtb_device_reg(b"serial") {
-            Some((base, size)) => register_mmio(base, size),
-            None => register_mmio(0x1000_0000, 0x0000_1000),
+        if let Some((base, size)) = dtb_device_reg(b"serial") {
+            register_mmio(base, size);
+        } else {
+            kprintln!("CIBOS kernel: WARNING: no UART node in DTB");
+        }
+    }
+    // virtio-MMIO transport slots (block, net, ...) — present on both virtio-MMIO
+    // arches. QEMU virt and many ARM/RISC-V boards expose a contiguous array of
+    // fixed-size slots; discover the first `virtio_mmio@` node from the DTB and
+    // record a window covering the slot array so the MMU phase maps it Device. The
+    // base is stored for the post-MMU virtio-blk probe.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if let Some((base, size)) = dtb_device_reg(b"virtio_mmio") {
+            // One node describes one slot; the slots are contiguous. Cover a
+            // generous window of 32 slots (the QEMU virt count) from the first
+            // slot's base so every slot is mapped Device. `size` is one slot.
+            let slot = if size == 0 { 0x200 } else { size };
+            VIRTIO_MMIO_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+            VIRTIO_MMIO_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
+            register_mmio(base, slot * 32);
+        } else {
+            kprintln!("CIBOS kernel: WARNING: no virtio_mmio node in DTB");
         }
     }
     let _ = dtb_ptr;
@@ -333,18 +359,13 @@ fn synth_handoff() -> HandoffData {
 
     let topology = CoreTopology::new(1, 1, false).expect("valid topology");
     // The usable RAM base differs by platform. x86 has no DTB (its layout comes
-    // from the BIOS handoff). On aarch64/riscv64 the firmware/QEMU passes a DTB
-    // describing the REAL platform RAM — read it at runtime so the same kernel is
-    // correct on QEMU virt AND real boards; fall back to the conventional QEMU
-    // virt base/size only if no DTB was passed or it could not be parsed.
+    // from the BIOS handoff, synthesized here for self-boot). aarch64/riscv64 read
+    // the REAL platform RAM from the DTB at runtime (below), so the same kernel is
+    // correct on QEMU virt AND real boards — with no hardcoded fallback.
     #[cfg(target_arch = "x86_64")]
     let (ram_base, ram_length): (u64, u64) = (0x0010_0000, 0x0800_0000); // 1 MiB, 128 MiB
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
     let (ram_base, ram_length): (u64, u64) = (0x0010_0000, 0x0800_0000);
-    #[cfg(target_arch = "aarch64")]
-    let fallback: (u64, u64) = (0x4000_0000, 0x0800_0000); // 1 GiB, 128 MiB
-    #[cfg(target_arch = "riscv64")]
-    let fallback: (u64, u64) = (0x8000_0000, 0x0800_0000); // 2 GiB, 128 MiB
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let (ram_base, ram_length): (u64, u64) = match dtb_ram_region() {
         Some((base, size)) if size > 0 => {
@@ -355,10 +376,12 @@ fn synth_handoff() -> HandoffData {
             );
             (base, size)
         }
-        _ => {
-            kprintln!("CIBOS kernel: no DTB RAM region; using platform fallback");
-            fallback
-        }
+        // No QEMU fallback: on these arches the DTB is ALWAYS present (real
+        // firmware/U-Boot, and QEMU via the ARM64 image header / OpenSBI). A
+        // missing or sizeless memory node is a real platform fault — fail loudly
+        // rather than limp on a hardcoded QEMU-virt address that would be wrong on
+        // any other board and would silently mask the DTB problem.
+        _ => panic!("no usable RAM region in the platform DTB"),
     };
     let regions = [MemoryRegion {
         base: ram_base,
@@ -689,6 +712,15 @@ fn bring_up_mmu_generic<P: crate::bringup::ArchPaging>(handoff: &HandoffData) {
             // syscalls — the full user/kernel boundary.
             start_ring3_runtime(&frames, &phys_to_ptr);
         }
+
+        // Post-MMU storage probe for the virtio-MMIO arches: discover a virtio-blk
+        // device from the platform's virtio-mmio slots and verify it, now that the
+        // MMU is online (the virtqueue DMA addresses must be stable under the final
+        // page tables). The slots come from the DTB (virtio_mmio@ nodes), not a
+        // hardcoded address. Runs in this scope because it borrows the frame
+        // allocator (for the virtqueue DMA region).
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        verify_virtio_blk(&frames);
 
         // `space` and `frames` back the live page tables for the rest of this
         // boot. Neither type implements `Drop` and the page-table frames live in
@@ -1398,6 +1430,80 @@ fn probe_nic_at_boot(frames: &cibos_kernel::FrameAllocator) -> bool {
     false
 }
 
+/// Discover a virtio-blk device across the platform's virtio-MMIO slots and
+/// verify it by reading its capacity and LBA 0. Runs after the MMU is online (the
+/// virtqueue DMA addresses must be stable under the final tables). The slot array
+/// base came from the DTB; here we walk the slots and probe each.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn verify_virtio_blk(frames: &cibos_kernel::FrameAllocator) {
+    use cibos_kernel::block::{BlockDevice, BLOCK_SIZE};
+    use core::sync::atomic::Ordering;
+
+    let base = VIRTIO_MMIO_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        kprintln!("CIBOS kernel: storage — no virtio-mmio slots discovered (skipping)");
+        VIRTIO_BLK_RESULT.store(2, Ordering::Relaxed);
+        return;
+    }
+    let slot = VIRTIO_MMIO_SLOT.load(Ordering::Relaxed).max(0x200);
+
+    // The polled driver orders CPU/device accesses with a memory barrier and does
+    // NO explicit cache maintenance — which is correct ONLY if the platform keeps
+    // DMA coherent with the CPU caches. Verify that guarantee from the DTB rather
+    // than assume it: a coherent platform marks the virtio-mmio node `dma-coherent`.
+    // If it is absent (a non-coherent board), warn LOUDLY — the driver would need
+    // cache clean/invalidate around DMA, which is the honest follow-up, not a
+    // silent wrong assumption.
+    if !dtb_node_has_prop(b"virtio_mmio", b"dma-coherent") {
+        kprintln!(
+            "CIBOS kernel: WARNING: virtio-mmio not marked dma-coherent — \
+             the barrier-only DMA path assumes coherency; cache maintenance \
+             would be required on a non-coherent platform"
+        );
+    }
+
+    // Walk the slot array, probing each for a virtio-blk device.
+    let mut disk = None;
+    for i in 0..32u64 {
+        let slot_base = (base + i * slot) as usize;
+        // SAFETY: the slot window is mapped Device (registered from the DTB); the
+        // probe reads the virtio-MMIO registers and, on a block device, sets up a
+        // virtqueue from `frames` (identity-mapped DMA).
+        if let Some(d) =
+            unsafe { crate::arch::virtio_blk_mmio::VirtioBlkMmio::probe(slot_base, frames) }
+        {
+            kprintln!(
+                "CIBOS kernel: virtio-blk online at slot {} ({:#x}) — {} sectors ({} MiB)",
+                i,
+                slot_base,
+                d.block_count(),
+                d.block_count() * BLOCK_SIZE as u64 / (1024 * 1024)
+            );
+            disk = Some(d);
+            break;
+        }
+    }
+    let Some(disk) = disk else {
+        kprintln!("CIBOS kernel: storage — no virtio-blk device in any slot (skipping)");
+        VIRTIO_BLK_RESULT.store(2, Ordering::Relaxed);
+        return;
+    };
+
+    // Verify by reading LBA 0 (the MBR / boot sector).
+    let mut sector = [0u8; BLOCK_SIZE];
+    match disk.read_blocks(0, 1, &mut sector) {
+        Ok(()) => {
+            let sig_ok = sector[510] == 0x55 && sector[511] == 0xAA;
+            kprintln!(
+                "CIBOS kernel: virtio-blk read LBA 0 — boot signature {}",
+                if sig_ok { "OK (0x55AA)" } else { "absent" }
+            );
+            VIRTIO_BLK_RESULT.store(1, Ordering::Relaxed);
+        }
+        Err(e) => kprintln!("CIBOS kernel: virtio-blk LBA 0 read failed: {:?}", e),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn verify_storage() {
     use cibos_kernel::block::{BlockDevice, BLOCK_SIZE};
@@ -1762,6 +1868,20 @@ pub(crate) struct KernelSyscallEnv;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 static DTB_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Base address of the first virtio-MMIO slot (from the DTB), and the per-slot
+/// stride. Used by the post-MMU virtio-blk probe. Zero base = not present.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+static VIRTIO_MMIO_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+static VIRTIO_MMIO_SLOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x200);
+
+/// Outcome of the post-MMU virtio-blk verification, so the `verify_storage`
+/// contract phase (which runs after the MMU phase that owns the allocator) can
+/// report truthfully: 0 = not run, 1 = a disk was found and read OK, 2 = ran but
+/// no disk was present.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+static VIRTIO_BLK_RESULT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// A runtime registry of device-MMIO regions the kernel has DISCOVERED (e.g. the
 /// UART from the DTB), so the MMU phase maps exactly the register space the real
 /// platform has — wherever the board places it — instead of a compiled-in list.
@@ -1918,6 +2038,29 @@ fn dtb_device_reg(prefix: &[u8]) -> Option<(u64, u64)> {
     let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
     let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
     dt.device_reg(prefix).ok()
+}
+
+/// Whether the first DTB node matching `prefix` has the boolean property `prop`
+/// (e.g. `dma-coherent`). Returns false if there is no DTB. Lets a driver VERIFY a
+/// platform guarantee rather than assume it.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn dtb_node_has_prop(prefix: &[u8], prop: &[u8]) -> bool {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return false;
+    }
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let Some(total) = cibos_dtb::DeviceTree::totalsize_at(header) else {
+        return false;
+    };
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return false;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    match cibos_dtb::DeviceTree::new(blob) {
+        Ok(dt) => dt.node_has_prop(prefix, prop),
+        Err(_) => false,
+    }
 }
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they
 /// report `NotPermitted`. Guarded by a spinlock so the trap path and any setup
@@ -3055,7 +3198,7 @@ impl ArchBringUp for Arch {
         seed_entropy_portable(seed)
     }
     fn mount_root_fs(&self) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: aarch64 block driver")
+        PhaseStatus::Skipped("virtio-blk verified in MMU phase; root-fs mount pending")
     }
     fn bring_up_mmu(&self, handoff: &HandoffData) -> PhaseStatus {
         // The SAME portable orchestration as x86_64, parameterized by the aarch64
@@ -3064,7 +3207,14 @@ impl ArchBringUp for Arch {
         PhaseStatus::Done
     }
     fn verify_storage(&self) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: aarch64 block driver")
+        // Storage was probed+verified in the bring_up_mmu phase (which owns the
+        // frame allocator the virtqueue DMA needs). Report that outcome truthfully
+        // rather than a blanket Skipped.
+        match VIRTIO_BLK_RESULT.load(core::sync::atomic::Ordering::Relaxed) {
+            1 => PhaseStatus::Done, // a disk was found and read back OK
+            2 => PhaseStatus::Skipped("no virtio-blk device present"),
+            _ => PhaseStatus::Skipped("virtio-blk probe did not run"),
+        }
     }
 }
 
@@ -3082,7 +3232,7 @@ impl ArchBringUp for Arch {
         seed_entropy_portable(seed)
     }
     fn mount_root_fs(&self) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: riscv64 block driver")
+        PhaseStatus::Skipped("virtio-blk verified in MMU phase; root-fs mount pending")
     }
     fn bring_up_mmu(&self, handoff: &HandoffData) -> PhaseStatus {
         // The SAME portable orchestration as x86_64/aarch64, parameterized by the
@@ -3091,7 +3241,14 @@ impl ArchBringUp for Arch {
         PhaseStatus::Done
     }
     fn verify_storage(&self) -> PhaseStatus {
-        PhaseStatus::Skipped("pending: riscv64 block driver")
+        // Storage was probed+verified in the bring_up_mmu phase (which owns the
+        // frame allocator the virtqueue DMA needs). Report that outcome truthfully
+        // rather than a blanket Skipped.
+        match VIRTIO_BLK_RESULT.load(core::sync::atomic::Ordering::Relaxed) {
+            1 => PhaseStatus::Done, // a disk was found and read back OK
+            2 => PhaseStatus::Skipped("no virtio-blk device present"),
+            _ => PhaseStatus::Skipped("virtio-blk probe did not run"),
+        }
     }
 }
 

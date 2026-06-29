@@ -35,8 +35,11 @@ qemu-system-x86_64 \
 AArch64 (`virt`, entered at EL1; PL011 serial):
 
 ```sh
-qemu-system-aarch64 -machine virt -cpu cortex-a53 -m 256M \
-  -kernel target/aarch64-unknown-none/debug/cibos-kernel \
+# aarch64 boots as a raw ARM64 Image (the kernel carries the standard ARM64 image
+# header), so QEMU passes the DTB pointer in x0 exactly as real firmware/U-Boot do.
+# Build the Image first: ./build-arm64-image.sh
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 256M \
+  -kernel target/aarch64-unknown-none/debug/Image \
   -serial stdio -display none
 ```
 

@@ -3,6 +3,7 @@ ENTRY(_start)
 
 SECTIONS {
     . = 0x40080000;                 /* FLAG: QEMU virt kernel load address */
+    _image_start = .;
 
     .text : ALIGN(4K) {
         *(.text.boot)
@@ -21,6 +22,9 @@ SECTIONS {
     __stack_bottom = .;
     . += 0x20000;                   /* 128 KiB boot stack */
     __stack_top = .;
+
+    _image_end = .;
+    _image_size = _image_end - _image_start;
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
 }

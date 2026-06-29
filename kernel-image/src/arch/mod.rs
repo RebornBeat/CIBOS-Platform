@@ -42,7 +42,13 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub mod paging_aarch64;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{halt, init_serial, install_exception_vectors, putc, set_uart_base, uart_base};
+pub use aarch64::{halt, init_serial, install_exception_vectors, putc, set_uart_base};
+
+/// virtio-blk over the virtio-MMIO transport — the block device for the arches
+/// that present virtio devices as MMIO register banks (aarch64/riscv64 `virt` and
+/// real ARM/RISC-V boards).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub mod virtio_blk_mmio;
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;

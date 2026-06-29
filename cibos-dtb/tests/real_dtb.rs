@@ -52,3 +52,21 @@ fn finds_riscv_peripherals() {
     let (uart, _) = dt.device_reg(b"serial").expect("serial node");
     assert_eq!(uart, 0x1000_0000, "UART base from real DTB");
 }
+
+#[test]
+fn detects_dma_coherent_property() {
+    // node_has_prop must detect the dma-coherent boolean on the ARM virtio-mmio
+    // node (present) and its ABSENCE on the RISC-V virtio-mmio node — a real
+    // platform difference the block driver must honor (barrier-only DMA is only
+    // safe when the platform guarantees coherency).
+    let arm = DeviceTree::new(REAL_DTB).expect("parse ARM DTB");
+    assert!(
+        arm.node_has_prop(b"virtio_mmio", b"dma-coherent"),
+        "ARM virtio-mmio is dma-coherent"
+    );
+    let rv = DeviceTree::new(REAL_RISCV_DTB).expect("parse RISC-V DTB");
+    assert!(
+        !rv.node_has_prop(b"virtio_mmio", b"dma-coherent"),
+        "RISC-V virtio-mmio is NOT dma-coherent"
+    );
+}

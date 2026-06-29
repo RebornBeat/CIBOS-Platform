@@ -2,58 +2,60 @@ CIBOS / CIBIOS / HIP — sandbox archive
 =======================================
 Full canonical workspace (43 crates) + design notes + fresh ELFs.
 
-This increment: resolved the legitimate "static vs dynamic" concern by separating
-device addresses into THREE tiers and making the board-specific tier DYNAMIC
-(DTB-derived) for ARM and RISC-V — keeping only the irreducible bootstrap + true
-architectural constants static.
+This increment: (1) DWELL — found+fixed a real ARM64 image-header bug; (2)
+virtio-blk STORAGE for aarch64/riscv64 (a real block device), with DMA coherency
+VERIFIED not assumed (which surfaced a real riscv64-vs-aarch64 platform gap); (3)
+contract reconciled honestly.
 
-== The principle (STATIC-VS-DYNAMIC-DEVICE-DISCOVERY.md) ==
-  Tier 1 — IRREDUCIBLE BOOTSTRAP (must be static): earlycon UART default + the
-    firmware/DTB handoff. Required to read anything; universal; every real OS has
-    it. KEEP static.
-  Tier 2 — ARCHITECTURAL CONSTANTS (legitimately static): x86 VGA 0xB8000, COM1
-    0x3F8 — fixed by the PC/VGA architecture on every compatible machine. KEEP
-    static (discovering them is pointless; they cannot vary).
-  Tier 3 — BOARD-SPECIFIC (must be dynamic): GIC/PLIC/CLINT/board-UART (DTB), x86
-    PCI BARs. Hardcoding these = the QEMU-era shortcut. MADE DYNAMIC this increment.
+== Dwell: ARM64 image-header flags bug (real-HW correctness) ==
+  The header had flags=0xa (bit3=1 = "place kernel anywhere"), but the kernel is
+  position-DEPENDENT (linked at a fixed 0x40080000 with absolute symbol refs). A
+  conforming real loader honoring bit3 could relocate us and break. QEMU happened
+  to place us correctly, hiding it. FIXED to flags=0x2 (text_offset HONORED, bit3
+  clear). Verified header bytes + all 3 boot.
 
-== Tier-3 made dynamic (ARM + RISC-V) ==
-  * cibos-dtb: new device_reg(prefix) -> (base, size) reads a node's reg window.
-  * aarch64: GIC discovered via dtb_device_reg(b"intc"); static range now EMPTY.
-  * riscv64: PLIC (plic@), CLINT (clint@), UART (serial@) discovered; static range
-    now EMPTY.
-  * Each has a LABELED bootstrap fallback to the QEMU-virt address used ONLY when
-    no DTB is present (QEMU -kernel) — registered the same dynamic way, not a
-    primary path. Real hardware with a real DTB uses the discovered values.
-  * Discovered windows flow into the existing mmio_registry -> carve -> Device map
-    (no cap, loud fail). The address SOURCE is now the platform, not a constant.
+== virtio-blk over virtio-MMIO (aarch64/riscv64 storage) ==
+  New kernel-image/src/arch/virtio_blk_mmio.rs: real virtio-MMIO transport +
+  device-init handshake + split virtqueue + virtio-blk 3-descriptor request
+  protocol, implementing the existing BlockDevice trait (MMIO analogue of x86 ATA).
+  - Slot array base discovered from the DTB (virtio_mmio@ nodes), NOT hardcoded;
+    the driver walks slots and probes each (DeviceID==2). Slot window mapped Device.
+  - DMA COHERENCY VERIFIED not assumed: the barrier-only polled path is correct
+    only on a coherent platform, so the driver checks the node's `dma-coherent`
+    DTB property and WARNS LOUDLY if absent.
+    REAL FINDING: aarch64 virt IS dma-coherent; riscv64 virt is NOT — so on real
+    RISC-V hardware cache maintenance is required. QEMU TCG models coherent memory
+    regardless, so this was an invisible QEMU-era shortcut WITHOUT the check; now
+    it is loud. (RISC-V cache-maintenance path is the documented follow-up.)
   VERIFIED:
-   - Real-DTB unit tests (captured QEMU DTBs): intc=0x08000000 (ARM); plic=
-     0x0C000000, clint=0x02000000, serial=0x10000000 (RISC-V). Discovery proven on
-     real platform data, not just fallback.
-   - All 3 boot (aarch64/riscv64 MMU online + boot complete; x86 full stack all
-     milestones); aarch64 UART works via dynamic/fallback registration.
-   - 380 tests pass (+2 DTB discovery tests); all 3 build clean.
+   - aarch64 (ARM64 Image, real DTB): virtio-blk online at a discovered slot, 2048
+     sectors, LBA 0 read returns the EXACT 0x55AA signature written to disk
+     (byte-accurate virtqueue DMA read).
+   - riscv64 (OpenSBI DTB): same + the correct dma-coherent WARNING.
+   - WRITE path: a temporary write+readback of LBA 1 returned BYTE-IDENTICAL data.
+   - No-disk case degrades gracefully; x86 ATA path unaffected (full stack OK).
+   - 381 tests pass (+1 dma-coherent detection test vs both real DTBs); clean.
 
-== What remains static — and why it's correct ==
-  Tier 1 (bootstrap) + Tier 2 (x86 VGA/COM1 architectural constants) only. The x86
-  PCI hole is the remaining Tier-3 static item; the honest next step is to
-  enumerate the actual device BARs from PCI config space (we already touch PCI for
-  the NIC) and register that window, using the same discover->register->carve
-  pattern proven here for ARM/RISC-V.
+== Contract reconciled (honesty) ==
+  The probe runs in bring_up_mmu (owns the FrameAllocator the virtqueue DMA needs),
+  after MMU-on (stable DMA addresses). verify_storage now reports its real outcome:
+  Done when a disk was found+read OK, else Skipped("no virtio-blk device present")
+  — not a blanket "pending block driver". mount_root_fs notes the driver exists and
+  root-fs mount is the next step.
 
 == Status ==
-  * 380 workspace tests passing, 0 failing.
-  * x86_64 + aarch64 + riscv64 build clean and BOOT (x86 full stack; aarch64/
-    riscv64 MMU online + boot complete) with board-specific devices now DTB-derived.
-    i686 firmware + kernel image build; entropy + boot.s at parity; MMU/storage/
-    ring-3 pending per I686-COMPLETION-ROADMAP.md.
-  * NO real-silicon validation yet (x86_64-only QEMU sandbox). TESTING-GUIDE.md
-    covers real-hardware boot + serial-log capture.
+  * 381 workspace tests passing, 0 failing.
+  * x86_64 + aarch64 + riscv64: build clean, BOOT; aarch64/riscv64 now have a
+    verified block device. i686 firmware + kernel image build; entropy + boot.s at
+    parity; MMU/storage/ring-3 pending per I686-COMPLETION-ROADMAP.md.
+  * NO real-silicon validation yet (x86_64-only QEMU sandbox). The dma-coherent
+    finding is a concrete real-HW item now made explicit.
 
-== ELFs ==
+== Deliverables ==
   Firmware: cibios-{x86_64,aarch64,riscv64gc,i686}.elf
-  Bootable kernels: kernel-aarch64.elf, kernel-riscv64.elf
+  Bootable kernels: kernel-aarch64-Image (raw ARM64 Image), kernel-aarch64.elf,
+  kernel-riscv64.elf
 
-Next: x86 PCI-BAR enumeration (last Tier-3 static -> dynamic); i686 roadmap;
-aarch64/riscv64 storage/NIC/ring-3 phases; real-hardware validation.
+Next: RISC-V DMA cache maintenance; mount CIBOSFS on virtio-blk (aarch64/riscv64
+root fs); aarch64/riscv64 NIC (virtio-net-mmio) + ring-3; i686 roadmap; colored/
+boxed console; real-hardware validation with serial-log capture.

@@ -101,3 +101,44 @@ VERIFIED:
     is to enumerate the actual device BARs from PCI config space (we already touch
     PCI for the NIC) and register THAT window, replacing the i440fx constant. The
     ARM/RISC-V pattern (discover -> register -> carve/Device) is the template.
+
+---
+
+## ALL FALLBACKS REMOVED — no QEMU fallback anywhere
+Per the directive "remove all fallbacks; if it works without the fallback, the
+fallback is wrong design and can hide bugs." Measured first (don't assume):
+  - riscv64: QEMU passes a REAL DTB via OpenSBI (probed dtb_ptr = 0x87e00000). So
+    discovery already used the real path; the fallback was dead. REMOVED.
+  - aarch64: QEMU `-kernel <ELF>` passed x0 = 0 (no DTB) — the ELF lacked the ARM64
+    image header, so QEMU did not treat it as a Linux image. FIXED PROPERLY by
+    adding the standard ARM64 image header to the kernel and booting it as a raw
+    Image (build-arm64-image.sh -> objcopy -O binary). A conforming loader (real
+    U-Boot/UEFI AND QEMU) then passes the DTB in x0. Probed: dtb_ptr = 0x44000000,
+    RAM from DTB. So the fallback became unnecessary. REMOVED.
+
+What was removed:
+  - aarch64 UART + GIC device fallbacks (now DTB-only; warn if a node is absent).
+  - riscv64 PLIC/CLINT/UART device fallbacks (now DTB-only; warn if absent).
+  - aarch64 + riscv64 RAM-region fallback in synth_handoff (now panics loudly if
+    the DTB has no usable RAM node — a real platform fault, not something to limp
+    past on a QEMU-virt constant).
+  - the unused uart_base() getter (only the fallback used it).
+
+What legitimately remains (NOT fallbacks):
+  - Tier-1 earlycon: aarch64 UART0 default 0x09000000, used ONLY to print before
+    the DTB pl011 base is read, then overridden. The irreducible bootstrap console.
+  - Tier-2 architectural constants: x86 VGA 0xB8000, COM1 0x3F8 (PC standard).
+  - x86 self-boot synth RAM (0x100000/128 MiB): x86 has NO DTB; this is the x86
+    self-boot bootstrap (real x86 uses the CIBIOS firmware handoff). Not a QEMU
+    device fallback.
+
+Why this is correct for bare metal: a fallback to QEMU-virt addresses implies "no
+DTB" is a supported real scenario (it is not — real boards always provide a DTB via
+firmware/U-Boot, or go through CIBIOS), and it silently masks a DTB-parsing bug by
+limping on hardcoded values. Removing it means a DTB problem FAILS LOUDLY, and the
+QEMU path exercises the SAME real-DTB code path as hardware.
+
+VERIFIED: 380 tests pass; all 3 build clean; all 3 boot with NO fallbacks (aarch64
+via the ARM64 Image reading the real DTB; riscv64 via OpenSBI's DTB; x86 full stack
+via the CIBIOS/self-boot handoff). The ARM64 image header also makes aarch64 boot
+the SAME way on real hardware as in QEMU — a strict improvement in real-HW fidelity.

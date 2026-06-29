@@ -22,11 +22,6 @@ pub fn set_uart_base(addr: usize) {
     UART0.store(addr, Ordering::Relaxed);
 }
 
-/// The current PL011 base (the bootstrap default until the DTB overrides it).
-pub fn uart_base() -> usize {
-    UART0.load(Ordering::Relaxed)
-}
-
 unsafe fn mmio_write_u8(addr: usize, val: u8) {
     core::ptr::write_volatile(addr as *mut u8, val);
 }
