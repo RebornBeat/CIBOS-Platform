@@ -70,3 +70,42 @@ fn detects_dma_coherent_property() {
         "RISC-V virtio-mmio is NOT dma-coherent"
     );
 }
+
+#[test]
+fn device_reg_lowest_picks_lowest_base() {
+    // The RISC-V virt DTB lists virtio_mmio@ nodes in DESCENDING address order
+    // (@10008000 first). device_reg_lowest must return the LOWEST base
+    // (0x10001000), not the first node — a driver walking the slot array upward
+    // from the base must start at the bottom or it runs past the array and faults.
+    let rv = DeviceTree::new(REAL_RISCV_DTB).expect("parse RISC-V DTB");
+    let (base, _) = rv.device_reg_lowest(b"virtio_mmio").expect("virtio_mmio node");
+    assert_eq!(base, 0x1000_1000, "lowest virtio_mmio base on RISC-V virt");
+    // And the count must be the real number of slots (8 on riscv64 virt).
+    assert_eq!(rv.count_nodes(b"virtio_mmio"), 8, "riscv64 virt virtio_mmio slot count");
+}
+
+#[test]
+fn walkers_handle_truncated_blob() {
+    // A truncated DTB must make the structure walkers return safely (0 / None /
+    // false), never panic or loop — real firmware could pass a damaged blob.
+    // Truncate the valid RISC-V DTB partway through its structure block.
+    let full = REAL_RISCV_DTB;
+    let cut = &full[..full.len() / 2];
+    // DeviceTree::new may reject it; if it parses, the walkers must be safe.
+    if let Ok(dt) = DeviceTree::new(cut) {
+        let _ = dt.count_nodes(b"virtio_mmio");
+        let _ = dt.device_reg_lowest(b"virtio_mmio");
+        let _ = dt.find_prop_u32(b"riscv,cbom-block-size");
+        let _ = dt.node_has_prop(b"virtio_mmio", b"dma-coherent");
+    }
+    // Also a blob that is just the header with a bogus struct size: must not hang.
+    let mut bad = full.to_vec();
+    // Corrupt totalsize/struct fields lightly by zeroing the tail.
+    for b in bad.iter_mut().skip(full.len() / 2) {
+        *b = 0;
+    }
+    if let Ok(dt) = DeviceTree::new(&bad) {
+        let _ = dt.count_nodes(b"virtio_mmio");
+        let _ = dt.device_reg_lowest(b"virtio_mmio");
+    }
+}

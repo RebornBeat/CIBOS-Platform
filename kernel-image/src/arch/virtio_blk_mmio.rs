@@ -294,6 +294,19 @@ impl VirtioBlkMmio {
         self.queue.set_avail_ring(idx, 0);
         self.queue.publish_avail(idx.wrapping_add(1));
 
+        // On a non-coherent platform (RISC-V without DMA coherency), clean (write
+        // back) the buffers the DEVICE will READ — the request header, the ring
+        // region, and, for a WRITE, the data — so the device sees current data.
+        // No-op when cache maintenance is not configured (coherent platforms).
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::arch::cache_riscv64::clean_range(self.req_region, 17);
+            crate::arch::cache_riscv64::clean_range(self.queue.base, 4096);
+            if write {
+                crate::arch::cache_riscv64::clean_range(data, len as usize);
+            }
+        }
+
         // Notify the device.
         mmio_w(self.base, MMIO_QUEUE_NOTIFY, 0);
 
@@ -308,6 +321,18 @@ impl VirtioBlkMmio {
             core::hint::spin_loop();
         }
         fence(Ordering::SeqCst);
+
+        // The device has written the used ring and the status byte, and for a READ
+        // the data buffer. Invalidate those before the CPU reads them, so we do not
+        // see stale cached data. No-op on coherent platforms.
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::arch::cache_riscv64::invalidate_range(self.queue.base, 4096);
+            crate::arch::cache_riscv64::invalidate_range(self.req_region, 17);
+            if !write {
+                crate::arch::cache_riscv64::invalidate_range(data, len as usize);
+            }
+        }
 
         match core::ptr::read_volatile(status_ptr) {
             VIRTIO_BLK_S_OK => Ok(()),

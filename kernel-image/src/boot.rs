@@ -196,14 +196,16 @@ pub extern "C" fn kernel_entry(handoff_ptr: u64, dtb_ptr: u64) -> ! {
     // base is stored for the post-MMU virtio-blk probe.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
-        if let Some((base, size)) = dtb_device_reg(b"virtio_mmio") {
-            // One node describes one slot; the slots are contiguous. Cover a
-            // generous window of 32 slots (the QEMU virt count) from the first
-            // slot's base so every slot is mapped Device. `size` is one slot.
+        if let Some((base, size)) = dtb_device_reg_lowest(b"virtio_mmio") {
+            // Use the LOWEST slot base (DTB node order is not address order — QEMU
+            // riscv64 lists slots descending), and size the array from the actual
+            // node count, so the upward walk stays inside the real device region.
             let slot = if size == 0 { 0x200 } else { size };
+            let count = dtb_count_nodes(b"virtio_mmio").max(1) as u64;
             VIRTIO_MMIO_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
             VIRTIO_MMIO_SLOT.store(slot, core::sync::atomic::Ordering::Relaxed);
-            register_mmio(base, slot * 32);
+            VIRTIO_MMIO_COUNT.store(count, core::sync::atomic::Ordering::Relaxed);
+            register_mmio(base, slot * count);
         } else {
             kprintln!("CIBOS kernel: WARNING: no virtio_mmio node in DTB");
         }
@@ -1451,10 +1453,31 @@ fn verify_virtio_blk(frames: &cibos_kernel::FrameAllocator) {
     // NO explicit cache maintenance — which is correct ONLY if the platform keeps
     // DMA coherent with the CPU caches. Verify that guarantee from the DTB rather
     // than assume it: a coherent platform marks the virtio-mmio node `dma-coherent`.
-    // If it is absent (a non-coherent board), warn LOUDLY — the driver would need
-    // cache clean/invalidate around DMA, which is the honest follow-up, not a
-    // silent wrong assumption.
-    if !dtb_node_has_prop(b"virtio_mmio", b"dma-coherent") {
+    let coherent = dtb_node_has_prop(b"virtio_mmio", b"dma-coherent");
+    if !coherent {
+        // Non-coherent platform: the driver MUST do cache maintenance around DMA.
+        // On RISC-V that is the Zicbom extension; read its cache-block size from
+        // the DTB (`riscv,cbom-block-size`). If present, configure maintenance so
+        // the driver cleans/invalidates buffers; if absent, warn LOUDLY that DMA
+        // is unsafe here (we will not silently corrupt data).
+        #[cfg(target_arch = "riscv64")]
+        {
+            match dtb_find_prop_u32(b"riscv,cbom-block-size") {
+                Some(bs) if bs > 0 => {
+                    crate::arch::cache_riscv64::set_cbom_block_size(bs);
+                    kprintln!(
+                        "CIBOS kernel: virtio-mmio non-coherent — Zicbom cache \
+                         maintenance enabled (block size {} bytes)",
+                        bs
+                    );
+                }
+                _ => kprintln!(
+                    "CIBOS kernel: WARNING: virtio-mmio non-coherent and no Zicbom \
+                     cache-block size in DTB — DMA may be UNSAFE on this platform"
+                ),
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
         kprintln!(
             "CIBOS kernel: WARNING: virtio-mmio not marked dma-coherent — \
              the barrier-only DMA path assumes coherency; cache maintenance \
@@ -1462,9 +1485,11 @@ fn verify_virtio_blk(frames: &cibos_kernel::FrameAllocator) {
         );
     }
 
-    // Walk the slot array, probing each for a virtio-blk device.
+    // Walk exactly the slots the platform exposes (from the DTB node count). Going
+    // past the real device region would fault.
+    let count = VIRTIO_MMIO_COUNT.load(Ordering::Relaxed).max(1);
     let mut disk = None;
-    for i in 0..32u64 {
+    for i in 0..count {
         let slot_base = (base + i * slot) as usize;
         // SAFETY: the slot window is mapped Device (registered from the DTB); the
         // probe reads the virtio-MMIO registers and, on a block device, sets up a
@@ -1501,6 +1526,32 @@ fn verify_virtio_blk(frames: &cibos_kernel::FrameAllocator) {
             VIRTIO_BLK_RESULT.store(1, Ordering::Relaxed);
         }
         Err(e) => kprintln!("CIBOS kernel: virtio-blk LBA 0 read failed: {:?}", e),
+    }
+
+    // Prove the full CIBOSFS stack works on the virtio-blk device, exactly as x86
+    // does on its ATA data disk: format -> mkdir -> write -> read-back, then remount
+    // and re-read to prove the data is on the medium (not just in RAM). This is the
+    // same arch-independent Fs<D: BlockDevice> layer; only the device differs.
+    {
+        use cibos_kernel::fs::Fs;
+        let r = (|| -> Result<bool, cibos_kernel::fs::FsError> {
+            let mut fs = Fs::format(disk, 64)?;
+            fs.mkdir(b"/etc")?;
+            fs.write_file(b"/etc/hello", b"CIBOSFS on virtio-blk")?;
+            let live = fs.read_file(b"/etc/hello")? == b"CIBOSFS on virtio-blk";
+            // Remount on the same device to prove persistence to the medium.
+            let dev = fs.into_device();
+            let fs2 = Fs::mount(dev)?;
+            let persist = fs2.read_file(b"/etc/hello")? == b"CIBOSFS on virtio-blk";
+            Ok(live && persist)
+        })();
+        match r {
+            Ok(true) => kprintln!(
+                "CIBOS kernel: CIBOSFS on virtio-blk — format/write/read-back/remount OK"
+            ),
+            Ok(false) => kprintln!("CIBOS kernel: CIBOSFS on virtio-blk — DATA MISMATCH"),
+            Err(e) => kprintln!("CIBOS kernel: CIBOSFS on virtio-blk failed: {:?}", e),
+        }
     }
 }
 
@@ -1875,6 +1926,12 @@ static VIRTIO_MMIO_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 static VIRTIO_MMIO_SLOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x200);
 
+/// Number of virtio-MMIO slots the platform exposes (from the DTB node count).
+/// The probe walks exactly this many — walking past the real device region would
+/// fault on hardware (and on QEMU).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+static VIRTIO_MMIO_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Outcome of the post-MMU virtio-blk verification, so the `verify_storage`
 /// contract phase (which runs after the MMU phase that owns the allocator) can
 /// report truthfully: 0 = not run, 1 = a disk was found and read OK, 2 = ran but
@@ -2040,6 +2097,24 @@ fn dtb_device_reg(prefix: &[u8]) -> Option<(u64, u64)> {
     dt.device_reg(prefix).ok()
 }
 
+/// The first `u32` value of DTB property `prop` found anywhere in the tree, or
+/// `None`. Used for tree-global scalars like `riscv,cbom-block-size`.
+#[cfg(target_arch = "riscv64")]
+fn dtb_find_prop_u32(prop: &[u8]) -> Option<u32> {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let total = cibos_dtb::DeviceTree::totalsize_at(header)?;
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
+    dt.find_prop_u32(prop)
+}
+
 /// Whether the first DTB node matching `prefix` has the boolean property `prop`
 /// (e.g. `dma-coherent`). Returns false if there is no DTB. Lets a driver VERIFY a
 /// platform guarantee rather than assume it.
@@ -2060,6 +2135,47 @@ fn dtb_node_has_prop(prefix: &[u8], prop: &[u8]) -> bool {
     match cibos_dtb::DeviceTree::new(blob) {
         Ok(dt) => dt.node_has_prop(prefix, prop),
         Err(_) => false,
+    }
+}
+
+/// The `(base, size)` of the LOWEST-addressed node matching `prefix`. DTB node
+/// order is not address order, so a driver walking a contiguous slot array upward
+/// must start at the lowest base or it walks off the end and faults.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn dtb_device_reg_lowest(prefix: &[u8]) -> Option<(u64, u64)> {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let total = cibos_dtb::DeviceTree::totalsize_at(header)?;
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    let dt = cibos_dtb::DeviceTree::new(blob).ok()?;
+    dt.device_reg_lowest(prefix).ok()
+}
+
+/// Number of DTB nodes whose name starts with `prefix` (0 if no DTB). Lets a
+/// driver size a slot scan from the platform's real count.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn dtb_count_nodes(prefix: &[u8]) -> usize {
+    let ptr = DTB_PTR.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr == 0 {
+        return 0;
+    }
+    let header = unsafe { core::slice::from_raw_parts(ptr as *const u8, 40) };
+    let Some(total) = cibos_dtb::DeviceTree::totalsize_at(header) else {
+        return 0;
+    };
+    if total < 40 || total > 16 * 1024 * 1024 {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+    match cibos_dtb::DeviceTree::new(blob) {
+        Ok(dt) => dt.count_nodes(prefix),
+        Err(_) => 0,
     }
 }
 /// disk). When mounted, the filesystem syscalls operate on it; when absent they

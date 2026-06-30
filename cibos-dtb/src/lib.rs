@@ -99,8 +99,13 @@ impl<'a> DeviceTree<'a> {
     }
 
     /// Read a NUL-terminated property name from the strings block at `nameoff`.
+    /// Bounds-checked: a corrupt `nameoff` (from a malformed/truncated blob) yields
+    /// an empty name rather than panicking — the kernel must not crash on a bad DTB.
     fn prop_name(&self, nameoff: usize) -> &'a [u8] {
         let start = self.strings_off + nameoff;
+        if start >= self.blob.len() {
+            return &[];
+        }
         let mut end = start;
         while end < self.blob.len() && self.blob[end] != 0 {
             end += 1;
@@ -188,6 +193,132 @@ impl<'a> DeviceTree<'a> {
         // size may be absent on some nodes; default to a single page if so.
         let size = be64(reg, 8).unwrap_or(0x1000);
         Ok((base, size))
+    }
+
+    /// The first `u32` value of a property named `prop` found ANYWHERE in the tree
+    /// (big-endian). Used for tree-global scalars like `riscv,cbom-block-size`
+    /// (the cache-block size needed for CBO cache-maintenance). `None` if absent.
+    /// Like [`device_reg`](Self::device_reg) but returns the `(base, size)` of the
+    /// node with the LOWEST base address among those whose name starts with
+    /// `prefix`. DTB node order is not address order (e.g. QEMU's riscv64 lists
+    /// `virtio_mmio@` slots in descending address order), so a driver that walks a
+    /// contiguous slot array UPWARD from the base must start at the lowest one — or
+    /// it walks off the end of the array and faults.
+    pub fn device_reg_lowest(&self, prefix: &[u8]) -> Result<(u64, u64), DtbError> {
+        let mut pos = self.struct_off;
+        let end = self.struct_off + self.struct_size;
+        let mut in_target = false;
+        let mut best: Option<(u64, u64)> = None;
+        while pos < end {
+            let token = be32(self.blob, pos).ok_or(DtbError::Truncated)?;
+            pos += 4;
+            match token {
+                FDT_BEGIN_NODE => {
+                    let name_start = pos;
+                    let mut e = name_start;
+                    while e < self.blob.len() && self.blob[e] != 0 {
+                        e += 1;
+                    }
+                    in_target = self.blob[name_start..e].starts_with(prefix);
+                    pos = (e + 1 + 3) & !3;
+                }
+                FDT_PROP => {
+                    let len = be32(self.blob, pos).ok_or(DtbError::Truncated)? as usize;
+                    let nameoff = be32(self.blob, pos + 4).ok_or(DtbError::Truncated)? as usize;
+                    let data_start = pos + 8;
+                    pos = (data_start + len + 3) & !3;
+                    if in_target && self.prop_name(nameoff) == b"reg" {
+                        if let Some(reg) = self.blob.get(data_start..data_start + len) {
+                            if let Some(base) = be64(reg, 0) {
+                                let size = be64(reg, 8).unwrap_or(0x1000);
+                                if best.map_or(true, |(b, _)| base < b) {
+                                    best = Some((base, size));
+                                }
+                            }
+                        }
+                    }
+                }
+                FDT_END_NODE => in_target = false,
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => return Err(DtbError::Truncated),
+            }
+        }
+        best.ok_or(DtbError::NotFound)
+    }
+
+    /// The number of nodes whose name starts with `prefix`. Lets a driver size a
+    /// device-slot array from the platform's ACTUAL count (e.g. how many
+    /// `virtio_mmio@` slots the board exposes) rather than assuming a fixed number
+    /// — assuming too many would walk past the device region and fault on real
+    /// hardware.
+    pub fn count_nodes(&self, prefix: &[u8]) -> usize {
+        let mut pos = self.struct_off;
+        let end = self.struct_off + self.struct_size;
+        let mut count = 0usize;
+        while pos < end {
+            let Some(token) = be32(self.blob, pos) else {
+                break;
+            };
+            pos += 4;
+            match token {
+                FDT_BEGIN_NODE => {
+                    let name_start = pos;
+                    let mut e = name_start;
+                    while e < self.blob.len() && self.blob[e] != 0 {
+                        e += 1;
+                    }
+                    if self.blob[name_start..e].starts_with(prefix) {
+                        count += 1;
+                    }
+                    pos = (e + 1 + 3) & !3;
+                }
+                FDT_PROP => {
+                    let Some(len) = be32(self.blob, pos) else {
+                        break;
+                    };
+                    pos = (pos + 8 + len as usize + 3) & !3;
+                }
+                FDT_END_NODE | FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
+        count
+    }
+
+    /// The first `u32` value of a property named `prop` found ANYWHERE in the tree
+    /// (big-endian). Used for tree-global scalars like `riscv,cbom-block-size`.
+    pub fn find_prop_u32(&self, prop: &[u8]) -> Option<u32> {
+        let mut pos = self.struct_off;
+        let end = self.struct_off + self.struct_size;
+        while pos < end {
+            let token = be32(self.blob, pos)?;
+            pos += 4;
+            match token {
+                FDT_BEGIN_NODE => {
+                    let mut e = pos;
+                    while e < self.blob.len() && self.blob[e] != 0 {
+                        e += 1;
+                    }
+                    pos = (e + 1 + 3) & !3;
+                }
+                FDT_PROP => {
+                    let len = be32(self.blob, pos)? as usize;
+                    let nameoff = be32(self.blob, pos + 4)? as usize;
+                    let data_start = pos + 8;
+                    pos = (data_start + len + 3) & !3;
+                    if self.prop_name(nameoff) == prop && len >= 4 {
+                        return be32(self.blob, data_start);
+                    }
+                }
+                FDT_END_NODE => {}
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Whether the first node whose name starts with `prefix` has a property named

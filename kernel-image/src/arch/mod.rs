@@ -50,6 +50,10 @@ pub use aarch64::{halt, init_serial, install_exception_vectors, putc, set_uart_b
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod virtio_blk_mmio;
 
+/// RISC-V DMA cache maintenance (Zicbom CBO) for non-coherent platforms.
+#[cfg(target_arch = "riscv64")]
+pub mod cache_riscv64;
+
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
